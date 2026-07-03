@@ -1,0 +1,40 @@
+# systemd unit for the Sovereign block explorer on a small VPS.
+#
+# Install:
+#   sudo useradd --system --create-home --home-dir /opt/sov-explorer explorer  # or reuse
+#   sudo git clone https://github.com/cloudzombie/sov-explorer /opt/sov-explorer/app
+#   # edit the RPC env vars below to point at your nodes, then:
+#   sudo cp /opt/sov-explorer/app/deploy/sovereign-explorer.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sovereign-explorer
+#   journalctl -u sovereign-explorer -f
+#
+# Holds no state (indexes on boot), so Restart=always is safe. Serves HTTP + WS on PORT.
+
+[Unit]
+Description=Sovereign block explorer
+Documentation=https://github.com/cloudzombie/sov-explorer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=explorer
+Group=explorer
+WorkingDirectory=/opt/sov-explorer/app
+ExecStart=/usr/bin/node src/server.js
+
+# Which networks to index. Point these at your nodes. Leave MAINNET empty until the
+# mainnet node exists — the UI shows "launching soon" and never queries it; set it and
+# restart to light mainnet up with no other change.
+Environment=PORT=8730
+Environment=SOVEREIGN_TESTNET_RPC=http://159.203.109.204:8645
+Environment=SOVEREIGN_MAINNET_RPC=
+
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sovereign-explorer
+
+[Install]
+WantedBy=multi-user.target
