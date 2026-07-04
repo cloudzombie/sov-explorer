@@ -13,6 +13,22 @@ function clamp(v, lo, hi, dflt) {
   return Math.max(lo, Math.min(hi, Math.trunc(n)));
 }
 
+// A block-list summary built from a node `sov_getBlockDigest`, for historical blocks
+// outside the in-memory index window. Matches the fields the Blocks page renders.
+// `proposer` is the coinbase miner (absent on the zero-reward genesis block); `final`
+// is derived from depth (6-confirmation rule) rather than an extra RPC round-trip.
+function digestSummary(height, d, tip) {
+  return {
+    height,
+    hash: d.hash,
+    proposer: d.coinbase?.recipients?.[0]?.account ?? null,
+    txCount: Array.isArray(d.txIds) ? d.txIds.length : 0,
+    coinbase: d.coinbase ?? null,
+    timestampMs: d.timestampMs,
+    final: tip - height >= 6,
+  };
+}
+
 export async function handleRest(method, pathname, query, ctx) {
   if (!pathname.startsWith('/api/')) return null;
   if (method !== 'GET') return json(405, { error: 'GET only' });
@@ -27,8 +43,27 @@ export async function handleRest(method, pathname, query, ctx) {
       case 'status':
         return json(200, store.stats());
 
-      case 'blocks':
-        return json(200, store.recentBlocks(clamp(query.get('limit'), 1, 200, 25)));
+      case 'blocks': {
+        // Paged, newest-first. Recent blocks come from the in-memory index; older
+        // ones (outside the retained window) are fetched from the node on demand, so
+        // the page walks all the way back to genesis on a long chain. `?before=<height>`
+        // sets the cursor (omit for the latest page); `?limit` bounds the page.
+        const limit = clamp(query.get('limit'), 1, 200, 25);
+        const tip = store.tipHeight;
+        const beforeRaw = query.get('before');
+        const startRaw = beforeRaw !== null && beforeRaw !== '' ? Number(beforeRaw) : tip;
+        const start = Number.isFinite(startRaw) ? Math.min(startRaw, tip) : tip;
+        const out = [];
+        for (let h = start; h >= 0 && out.length < limit; h--) {
+          let b = store.block(h);
+          if (!b) {
+            const d = await rpc.blockDigest(h).catch(() => null);
+            if (d) b = digestSummary(h, d, tip);
+          }
+          if (b) out.push(b);
+        }
+        return json(200, out);
+      }
 
       case 'txs':
         return json(200, store.recentTxs(clamp(query.get('limit'), 1, 200, 25)));

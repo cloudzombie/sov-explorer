@@ -312,13 +312,80 @@ function emptyRow(cols) {
   return `<tr><td colspan="${cols}" class="empty">No data yet — waiting for blocks.</td></tr>`;
 }
 
-async function renderBlocks() {
+// A human date + time (local), e.g. "Jul 3, 2026, 04:24:19".
+function fmtDateTime(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const d = new Date(Number(ms));
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}
+// Relative age, e.g. "3m ago".
+function fmtAge(ms) {
+  if (ms === null || ms === undefined) return '';
+  const s = Math.max(0, Math.floor((Date.now() - Number(ms)) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+const PAGE_SIZE = 50;
+
+async function renderBlocks(before) {
   setView('<div class="loading">Loading blocks…</div>');
-  const blocks = await api('/blocks?limit=60');
+  const cursor = before !== undefined && before !== '' ? Number(before) : null;
+  const qs = `?limit=${PAGE_SIZE}` + (cursor !== null ? `&before=${cursor}` : '');
+  let blocks, tip;
+  try {
+    const [status, list] = await Promise.all([api('/status'), api('/blocks' + qs)]);
+    tip = Math.max(0, status.tipHeight);
+    blocks = list;
+  } catch (e) {
+    return errView(e.message);
+  }
+  const highest = blocks.length ? blocks[0].height : 0;
+  const lowest = blocks.length ? blocks[blocks.length - 1].height : 0;
+  const hasNewer = cursor !== null && highest < tip; // blocks exist above this page
+  const hasOlder = lowest > 0; // genesis (0) not yet on the page
+
+  const btn = (href, label, on) =>
+    on
+      ? `<a class="pager-btn" href="${href}">${label}</a>`
+      : `<span class="pager-btn is-disabled">${label}</span>`;
+  const newerHref = highest + PAGE_SIZE >= tip ? '#/blocks' : `#/blocks/${highest + PAGE_SIZE}`;
+  const pager = `<div class="pager">
+    ${btn('#/blocks', '⏮ Latest', hasNewer)}
+    ${btn(newerHref, '◀ Newer', hasNewer)}
+    <span class="pager-info">${blocks.length ? `#${fmtNum(lowest)} – #${fmtNum(highest)}` : '—'} of ${fmtNum(tip)}</span>
+    ${btn(`#/blocks/${lowest - 1}`, 'Older ▶', hasOlder)}
+    ${btn(`#/blocks/${PAGE_SIZE - 1}`, 'Genesis ⏭', hasOlder)}
+  </div>`;
+
   setView(`
     <h1>Blocks</h1>
-    <div class="panel"><table><thead><tr><th>Height</th><th>Hash</th><th>Miner</th><th class="right">Txs</th><th class="right">Coinbase</th><th>Timestamp</th><th></th></tr></thead>
-    <tbody>${blocks.map((b) => `<tr><td>${blockLink(b.height)}</td><td>${blockHashLink(b.hash)}</td><td>${acctLinkShort(b.proposer)}</td><td class="right num">${b.txCount}</td><td class="right num">${b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>'}</td><td class="dim">${new Date(b.timestampMs).toLocaleString()}</td><td>${finalBadge(b.final)}</td></tr>`).join('') || emptyRow(7)}</tbody></table></div>
+    ${pager}
+    <div class="panel"><table><thead><tr><th>Height</th><th>Hash</th><th>Miner</th><th class="right">Txs</th><th class="right">Coinbase</th><th>Date &amp; time</th><th class="right">Age</th><th></th></tr></thead>
+    <tbody>${
+      blocks
+        .map(
+          (b) => `<tr>
+      <td>${blockLink(b.height)}</td>
+      <td>${blockHashLink(b.hash)}</td>
+      <td>${b.proposer ? acctLinkShort(b.proposer) : '<span class="dim">genesis</span>'}</td>
+      <td class="right num">${b.txCount}</td>
+      <td class="right num">${b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>'}</td>
+      <td class="time" title="${new Date(Number(b.timestampMs)).toISOString?.() || ''} · ${esc(b.timestampMs)} ms">${fmtDateTime(b.timestampMs)}</td>
+      <td class="right dim">${fmtAge(b.timestampMs)}</td>
+      <td>${finalBadge(b.final)}</td></tr>`,
+        )
+        .join('') || emptyRow(8)
+    }</tbody></table></div>
+    ${pager}
   `);
 }
 
@@ -611,7 +678,7 @@ function route() {
   const [, head, arg] = hash.split('/');
   setActiveNav(hash);
   if (!head) return renderOverview();
-  if (head === 'blocks') return renderBlocks();
+  if (head === 'blocks') return renderBlocks(arg);
   if (head === 'block') return renderBlock(arg);
   if (head === 'tx') return renderTx(arg);
   if (head === 'account') return renderAccount(arg);

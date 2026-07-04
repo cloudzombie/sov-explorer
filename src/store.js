@@ -124,12 +124,30 @@ export class Store {
   }
 
   recentBlocks(limit = 20) {
+    return this.blocksBefore(null, limit);
+  }
+
+  /**
+   * A page of blocks at height ≤ `before` (or the tip when `before` is null),
+   * newest-first, up to `limit`. The paged Blocks page uses this to walk backward
+   * toward genesis: each page's lowest height − 1 is the next page's `before`.
+   */
+  blocksBefore(before, limit = 50) {
     const out = [];
-    for (let h = this.tipHeight; h >= this.minHeight && out.length < limit; h--) {
+    const start =
+      before === null || before === undefined || !Number.isFinite(before)
+        ? this.tipHeight
+        : Math.min(before, this.tipHeight);
+    for (let h = start; h >= this.minHeight && out.length < limit; h--) {
       const b = this.blocksByHeight.get(h);
       if (b) out.push(b);
     }
     return out;
+  }
+
+  /** The oldest block height currently retained in the index (0 once genesis is in). */
+  oldestHeight() {
+    return this.minHeight;
   }
 
   recentTxs(limit = 20) {
