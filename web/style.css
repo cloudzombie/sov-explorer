@@ -256,6 +256,18 @@ td.time {
   font-variant-numeric: tabular-nums;
 }
 
+/* A row that just arrived over the live feed — flash, then settle. */
+@keyframes live-in {
+  0% { background: color-mix(in srgb, var(--blue, #4a6bff) 34%, transparent); }
+  100% { background: transparent; }
+}
+tr.live-new > td {
+  animation: live-in 1.6s ease-out;
+}
+tr.live-new > td:first-child {
+  box-shadow: inset 3px 0 0 var(--blue, #4a6bff);
+}
+
 .conn {
   display: flex;
   align-items: center;

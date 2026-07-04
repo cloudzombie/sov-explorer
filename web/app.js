@@ -167,6 +167,26 @@ function errView(msg) {
   setView(`<div class="empty">⚠ ${esc(msg)}<br /><span class="dim">Is a Sovereign node running and reachable?</span></div>`);
 }
 
+// ---- live view hooks ------------------------------------------------------
+// The current view registers what to do when a block/tx arrives over the WS
+// feed, so the page updates in place — no refresh. Cleared on every navigation.
+const live = { onBlock: null, onTx: null };
+function liveReset() {
+  live.onBlock = null;
+  live.onTx = null;
+}
+// Prepend a freshly-arrived row to a table body, flash it, and cap the length.
+function livePrepend(tbodyId, rowHtml, cap) {
+  const tb = $(tbodyId);
+  if (!tb) return;
+  const empty = tb.querySelector('td.empty');
+  if (empty) empty.closest('tr').remove();
+  tb.insertAdjacentHTML('afterbegin', rowHtml);
+  const row = tb.firstElementChild;
+  if (row) row.classList.add('live-new');
+  while (tb.children.length > cap) tb.lastChild.remove();
+}
+
 // ---- links + render helpers -----------------------------------------------
 
 const blockLink = (h) => `<a href="#/block/${h}" class="mono">#${fmtNum(h)}</a>`;
@@ -299,6 +319,9 @@ async function renderOverview() {
       </div>
     </div>
   `);
+  // Live: new blocks and txs stream into their tables in place.
+  live.onBlock = (b) => livePrepend('ov-blocks', blockRow(b), 12);
+  live.onTx = (t) => livePrepend('ov-txs', txRow({ ...t, timestampMs: t.timestampMs ?? Date.now() }), 12);
 }
 
 function blockRow(b) {
@@ -370,23 +393,23 @@ async function renderBlocks(before) {
     <h1>Blocks</h1>
     ${pager}
     <div class="panel"><table><thead><tr><th>Height</th><th>Hash</th><th>Miner</th><th class="right">Txs</th><th class="right">Coinbase</th><th>Date &amp; time</th><th class="right">Age</th><th></th></tr></thead>
-    <tbody>${
-      blocks
-        .map(
-          (b) => `<tr>
-      <td>${blockLink(b.height)}</td>
-      <td>${blockHashLink(b.hash)}</td>
-      <td>${b.proposer ? acctLinkShort(b.proposer) : '<span class="dim">genesis</span>'}</td>
-      <td class="right num">${b.txCount}</td>
-      <td class="right num">${b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>'}</td>
-      <td class="time" title="${new Date(Number(b.timestampMs)).toISOString?.() || ''} · ${esc(b.timestampMs)} ms">${fmtDateTime(b.timestampMs)}</td>
-      <td class="right dim">${fmtAge(b.timestampMs)}</td>
-      <td>${finalBadge(b.final)}</td></tr>`,
-        )
-        .join('') || emptyRow(8)
-    }</tbody></table></div>
+    <tbody id="blocks-tbody">${blocks.map(blocksListRow).join('') || emptyRow(8)}</tbody></table></div>
     ${pager}
   `);
+  // Live: on the latest page (no cursor), new blocks stream in at the top.
+  if (cursor === null) live.onBlock = (b) => livePrepend('blocks-tbody', blocksListRow(b), PAGE_SIZE);
+}
+
+function blocksListRow(b) {
+  return `<tr>
+    <td>${blockLink(b.height)}</td>
+    <td>${blockHashLink(b.hash)}</td>
+    <td>${b.proposer ? acctLinkShort(b.proposer) : '<span class="dim">genesis</span>'}</td>
+    <td class="right num">${b.txCount}</td>
+    <td class="right num">${b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>'}</td>
+    <td class="time" title="${new Date(Number(b.timestampMs)).toISOString?.() || ''} · ${esc(b.timestampMs)} ms">${fmtDateTime(b.timestampMs)}</td>
+    <td class="right dim">${fmtAge(b.timestampMs)}</td>
+    <td>${finalBadge(b.final)}</td></tr>`;
 }
 
 async function renderBlock(ref) {
@@ -668,6 +691,7 @@ async function resolveSearch(q) {
 // ---- router ---------------------------------------------------------------
 
 function route() {
+  liveReset(); // the incoming view re-registers its own live hooks
   // A not-yet-live network (e.g. mainnet pre-launch) shows a launching-soon panel
   // instead of querying a node that doesn't exist.
   if (NET_LIVE[NET] === false) {
@@ -783,15 +807,10 @@ function connectWs() {
     } else if (msg.type === 'block') {
       const b = msg.block;
       pushTicker(`<b>Block #${fmtNum(b.height)}</b> · ${b.txCount} tx`);
-      if ((location.hash.replace(/^#/, '') || '/') === '/') {
-        const tb = $('ov-blocks');
-        if (tb) {
-          tb.insertAdjacentHTML('afterbegin', blockRow(b));
-          while (tb.children.length > 12) tb.lastChild.remove();
-        }
-      }
+      live.onBlock?.(b);
     } else if (msg.type === 'tx') {
       pushTicker(`tx <b>${esc(msg.tx.action?.type || 'tx')}</b> · ${shortHash(msg.tx.id)}`);
+      live.onTx?.(msg.tx);
     }
   };
 }
