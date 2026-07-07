@@ -3,6 +3,8 @@
 // balance-sensitive reads (accounts, supply) hit the node directly; historical
 // reads (blocks, transactions) come from the index.
 
+import { normalizeBlock } from './indexer.js';
+
 function json(status, body) {
   return { status, body: JSON.stringify(body) };
 }
@@ -92,8 +94,31 @@ export async function handleRest(method, pathname, query, ctx) {
 
       case 'tx': {
         if (!arg) return json(400, { error: 'missing transaction id' });
-        const tx = store.tx(arg.toLowerCase());
-        if (!tx) return json(404, { error: 'transaction not indexed' });
+        const id = arg.toLowerCase();
+        let tx = store.tx(id);
+        if (!tx) {
+          // Not in the indexed window. If the node holds a RECEIPT for this id,
+          // the transaction IS on-chain — pull its block and lift the record out,
+          // so fresh links (clicked before the indexer caught up) and old ones
+          // (evicted from the window) both resolve.
+          const r = await rpc.receipt(id).catch(() => null);
+          if (r && Number.isFinite(r.height)) {
+            const [block, digest] = await Promise.all([
+              rpc.blockByHeight(r.height).catch(() => null),
+              rpc.blockDigest(r.height).catch(() => null),
+            ]);
+            if (block && digest) {
+              const rec = normalizeBlock(block, digest, store.tipHeight - r.height >= 6);
+              tx = rec.transactions.find((t) => t.id === id) ?? null;
+            }
+          }
+          if (!tx) {
+            // No receipt anywhere: either it was just submitted and hasn't been
+            // mined yet, or the id is unknown. Tell the client it may be pending
+            // so it can wait-and-retry instead of declaring failure.
+            return json(404, { error: 'transaction not yet mined', pending: true });
+          }
+        }
         // Enrich with the live execution receipt (success / exact failure reason,
         // gas, contract events) and depth-derived confirmations — both are real
         // chain data read from the node, not stored copies.

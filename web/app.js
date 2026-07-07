@@ -514,7 +514,27 @@ async function renderTx(id) {
   setView('<div class="loading">Loading transaction…</div>');
   let t;
   try {
-    t = await api('/tx/' + encodeURIComponent(id));
+    const res = await fetch('/api/' + NET + '/tx/' + encodeURIComponent(id));
+    const body = await res.json();
+    if (!res.ok) {
+      // A just-submitted transaction has no receipt yet — show a live waiting
+      // state and re-check every 5s while this page stays open, so the payout
+      // link a wallet/faucet hands out "just works" once the block lands.
+      if (body.pending) {
+        const here = location.hash;
+        setTimeout(() => { if (location.hash === here) renderTx(id); }, 5000);
+        return setView(`
+          <div class="crumb">Transaction</div>
+          <h1>Waiting to be mined… <span class="badge pending">Pending</span></h1>
+          <div class="panel"><table class="kv">
+            <tr><td class="k">Id</td><td class="v">${esc(id)}</td></tr>
+            <tr><td class="k">Status</td><td class="v">Not in a block yet — mainnet targets a block every 2.5 minutes. This page checks again automatically every few seconds.</td></tr>
+          </table></div>
+        `);
+      }
+      throw new Error(body.error || `HTTP ${res.status}`);
+    }
+    t = body;
   } catch (e) {
     return errView(e.message);
   }
