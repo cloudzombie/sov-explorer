@@ -72,15 +72,34 @@ export async function handleRest(method, pathname, query, ctx) {
         if (arg === undefined) return json(400, { error: 'missing block reference' });
         const ref = /^\d+$/.test(arg) ? Number(arg) : arg.toLowerCase();
         const block = store.block(ref);
-        return block
-          ? json(200, block)
-          : json(404, { error: 'block not in the indexed window' });
+        if (block) return json(200, block);
+        // Outside the in-memory window (e.g. genesis on a long chain): fetch the
+        // block from the node so permalinks — height or hash — never go dark.
+        const node =
+          typeof ref === 'number'
+            ? await rpc.blockDigest(ref).catch(() => null)
+            : await rpc.blockByHash(ref).catch(() => null);
+        if (node) {
+          const height = typeof ref === 'number' ? ref : node.header?.height ?? node.height;
+          const d = typeof ref === 'number' ? node : await rpc.blockDigest(height).catch(() => null);
+          if (d) {
+            const s = digestSummary(height, d, store.tipHeight);
+            return json(200, { ...s, prevHash: d.prevHash, stateRoot: d.stateRoot, txRoot: d.txRoot ?? null, receiptsRoot: d.receiptsRoot ?? null, transactions: [] });
+          }
+        }
+        return json(404, { error: 'block not found on the chain' });
       }
 
       case 'tx': {
         if (!arg) return json(400, { error: 'missing transaction id' });
         const tx = store.tx(arg.toLowerCase());
-        return tx ? json(200, tx) : json(404, { error: 'transaction not indexed' });
+        if (!tx) return json(404, { error: 'transaction not indexed' });
+        // Enrich with the live execution receipt (success / exact failure reason,
+        // gas, contract events) and depth-derived confirmations — both are real
+        // chain data read from the node, not stored copies.
+        const receipt = await rpc.receipt(tx.id).catch(() => null);
+        const confirmations = Math.max(0, store.tipHeight - tx.blockHeight + 1);
+        return json(200, { ...tx, receipt, confirmations, final: confirmations >= 6 });
       }
 
       case 'account': {

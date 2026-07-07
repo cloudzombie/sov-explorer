@@ -37,6 +37,9 @@ export class SovereignRpc {
   difficulty() { return this.call('sov_getDifficulty'); }
   stateRoot() { return this.call('sov_getStateRoot'); }
   isFinal(hash) { return this.call('sov_isFinal', { hash }); }
+  // The recorded outcome of a transaction: success or the exact failure reason,
+  // plus gas used and any contract events. Null if no active block contains it.
+  receipt(txId) { return this.call('sov_getReceipt', { txId }); }
   miners() { return this.call('sov_getMiners'); }
   mempoolSize() { return this.call('sov_getMempoolSize'); }
 

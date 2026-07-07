@@ -102,8 +102,8 @@ function statItem(label, value, sub = '') {
 // /networks (e.g. mainnet before its node exists) shows a launching-soon panel and
 // is never queried — so wiring mainnet in later is a server env var, no UI change.
 
-let NET = localStorage.getItem('sov-net') || 'testnet';
-const NET_LIVE = { testnet: true, mainnet: false };
+let NET = localStorage.getItem('sov-net-v2') || 'mainnet';
+const NET_LIVE = { testnet: true, mainnet: true };
 
 function setNetToggleUI() {
   for (const b of document.querySelectorAll('#netsw button')) {
@@ -117,7 +117,7 @@ function setNetToggleUI() {
 async function switchNet(net) {
   if (net === NET) return;
   NET = net;
-  localStorage.setItem('sov-net', net);
+  localStorage.setItem('sov-net-v2', net);
   document.title = `Sovereign Explorer — ${net}`;
   setNetToggleUI();
   connectWs();
@@ -130,11 +130,12 @@ async function loadNetworks() {
     const list = await fetch('/networks').then((r) => r.json());
     for (const n of list) NET_LIVE[n.name] = !!n.live;
   } catch {
-    /* leave defaults (testnet live) */
+    /* leave defaults (both live) */
   }
+  // Fall back to whichever network IS live if the selected one isn't.
   if (NET_LIVE[NET] === false) {
-    NET = 'testnet';
-    localStorage.setItem('sov-net', NET);
+    NET = NET === 'mainnet' ? 'testnet' : 'mainnet';
+    localStorage.setItem('sov-net-v2', NET);
   }
   document.title = `Sovereign Explorer — ${NET}`;
   setNetToggleUI();
@@ -471,6 +472,44 @@ function coinbasePanel(cb) {
     <tbody>${rows || emptyRow(3)}</tbody></table></div>`;
 }
 
+/** The XUS value a transaction moves, when its action carries one. */
+function actionValue(action) {
+  if (!action) return null;
+  switch (action.type) {
+    case 'transfer':
+    case 'htlc_lock':
+      return action.amount;
+    default:
+      return null;
+  }
+}
+
+/** Execution outcome badge + detail, from the node's receipt (null = unavailable).
+ * The node serializes the status as a tagged object: {status:"success"} or
+ * {status:"failed", reason:"…"}. */
+function receiptStatus(r) {
+  if (!r) return `<span class="badge pending">Unknown</span> <span class="dim">receipt unavailable (node did not return one)</span>`;
+  const s = r.status?.status ?? r.status;
+  if (s === 'success') return `<span class="badge ok">✓ Success</span>`;
+  return `<span class="badge fail">✗ Failed</span> — ${esc(r.status?.reason || 'execution rejected')}`;
+}
+
+/** Render event bytes (serde Vec<u8> → number array) as UTF-8 when printable, else hex. */
+function fmtEventBytes(bytes) {
+  if (!Array.isArray(bytes) || !bytes.length) return '<span class="dim">—</span>';
+  const printable = bytes.every((b) => b >= 32 && b < 127);
+  if (printable) return esc(String.fromCharCode(...bytes));
+  return '0x' + bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** A long raw hex blob (hybrid PQ keys/signatures run to kilobytes) shown
+ * abbreviated with a click-to-expand full value. */
+function rawBlob(value) {
+  const v = String(value ?? '');
+  if (v.length <= 80) return esc(v);
+  return `<details class="raw"><summary class="mono">${esc(shortHash(v, 26, 12))} · ${fmtBytes(Math.floor(v.replace(/^.*?0x/, '').length / 2))} — expand</summary><pre class="mono">${esc(v)}</pre></details>`;
+}
+
 async function renderTx(id) {
   setView('<div class="loading">Loading transaction…</div>');
   let t;
@@ -479,20 +518,37 @@ async function renderTx(id) {
   } catch (e) {
     return errView(e.message);
   }
+  const r = t.receipt;
+  const value = actionValue(t.action);
+  const events = r?.events || [];
+  const returnData = r?.return_data || r?.returnData || [];
   setView(`
     <div class="crumb">Transaction</div>
-    <h1>Transaction ${actionBadge(t.action)}</h1>
+    <h1>Transaction ${actionBadge(t.action)} ${finalBadge(t.final)}</h1>
     <div class="panel"><table class="kv">
       <tr><td class="k">Id</td><td class="v">${esc(t.id)}</td></tr>
+      <tr><td class="k">Status</td><td class="v">${receiptStatus(r)}</td></tr>
       <tr><td class="k">Block</td><td class="v">${blockLink(t.blockHeight)} · ${blockHashLink(t.blockHash)}</td></tr>
+      <tr><td class="k">Confirmations</td><td class="v">${fmtNum(t.confirmations)} ${t.final ? '<span class="dim">— final (buried past the 6-confirmation Nakamoto depth)</span>' : '<span class="dim">— pending finality (6 required)</span>'}</td></tr>
       <tr><td class="k">Position</td><td class="v">#${t.index} in block</td></tr>
+      <tr><td class="k">Timestamp</td><td class="v">${new Date(t.timestampMs).toLocaleString()} <span class="dim">(${timeAgo(t.timestampMs)})</span></td></tr>
       <tr><td class="k">Signer</td><td class="v">${acctLink(t.signer)}</td></tr>
       <tr><td class="k">Nonce</td><td class="v">${fmtNum(t.nonce)}</td></tr>
       <tr><td class="k">Action</td><td class="v">${esc(t.action?.type)} — ${actionSummary(t.action)}</td></tr>
-      <tr><td class="k">Public key</td><td class="v">${esc(t.publicKey)}</td></tr>
-      <tr><td class="k">Signature</td><td class="v">${esc(t.signature)}</td></tr>
-      <tr><td class="k">Timestamp</td><td class="v">${new Date(t.timestampMs).toLocaleString()}</td></tr>
+      ${value !== null ? `<tr><td class="k">Value</td><td class="v"><b>${fmtCoin(value)}</b> ${COIN_SYMBOL}</td></tr>` : ''}
+      ${r ? `<tr><td class="k">Gas used</td><td class="v">${fmtNum(r.gas_used ?? r.gasUsed ?? 0)}</td></tr>` : ''}
+      <tr><td class="k">Public key</td><td class="v">${rawBlob(t.publicKey)}</td></tr>
+      <tr><td class="k">Signature</td><td class="v">${rawBlob(t.signature)}</td></tr>
     </table></div>
+    ${events.length ? `
+    <h2>Events <span class="dim">— emitted during execution, committed under the receipts root</span></h2>
+    <div class="panel"><table><thead><tr><th>#</th><th>Topic</th><th>Data</th></tr></thead>
+    <tbody>${events.map((ev, i) => `<tr><td class="num">${i}</td><td class="mono">${fmtEventBytes(ev.topic)}</td><td class="mono">${fmtEventBytes(ev.data)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+    ${Array.isArray(returnData) && returnData.length ? `
+    <h2>Return data</h2>
+    <div class="panel"><pre class="mono" style="margin:0;overflow-wrap:anywhere;white-space:pre-wrap">${fmtEventBytes(returnData)}</pre></div>` : ''}
+    <h2>Raw action</h2>
+    <div class="panel"><details class="raw" open><summary>decoded action payload (as indexed from the block)</summary><pre class="mono">${esc(JSON.stringify(t.action, null, 2))}</pre></details></div>
   `);
 }
 
