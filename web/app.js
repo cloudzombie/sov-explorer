@@ -502,6 +502,21 @@ function fmtEventBytes(bytes) {
   return '0x' + bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** Pretty-print an action for the Raw panel: byte arrays (serde Vec<u8> — e.g. a
+ * shielded bundle or WASM code) become compact hex strings instead of thousands
+ * of JSON numbers, one per line. */
+function fmtActionJson(action) {
+  const compact = (v) => {
+    if (Array.isArray(v) && v.length > 8 && v.every((b) => Number.isInteger(b) && b >= 0 && b <= 255)) {
+      return `0x${v.map((b) => b.toString(16).padStart(2, '0')).join('')} (${fmtBytes(v.length)})`;
+    }
+    if (Array.isArray(v)) return v.map(compact);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, compact(x)]));
+    return v;
+  };
+  return JSON.stringify(compact(action), null, 2);
+}
+
 /** A long raw hex blob (hybrid PQ keys/signatures run to kilobytes) shown
  * abbreviated with a click-to-expand full value. */
 function rawBlob(value) {
@@ -568,7 +583,7 @@ async function renderTx(id) {
     <h2>Return data</h2>
     <div class="panel"><pre class="mono" style="margin:0;overflow-wrap:anywhere;white-space:pre-wrap">${fmtEventBytes(returnData)}</pre></div>` : ''}
     <h2>Raw action</h2>
-    <div class="panel"><details class="raw" open><summary>decoded action payload (as indexed from the block)</summary><pre class="mono">${esc(JSON.stringify(t.action, null, 2))}</pre></details></div>
+    <div class="panel"><details class="raw" open><summary>decoded action payload (as indexed from the block)</summary><pre class="mono">${esc(fmtActionJson(t.action))}</pre></details></div>
   `);
 }
 
