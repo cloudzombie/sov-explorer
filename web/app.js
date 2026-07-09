@@ -283,7 +283,7 @@ async function renderOverview() {
         ${statItem('Market dominance', all.marketDominance === null || all.marketDominance === undefined ? '—' : pct(all.marketDominance), 'market feed not configured')}
         ${statItem('Blockchain size', fmtBytes(all.blockchainSizeBytes), 'indexed window')}
         ${statItem('Network nodes', all.networkNodes === null || all.networkNodes === undefined ? '—' : fmtNum(all.networkNodes), 'miner registry entries')}
-        ${statItem('Difficulty', all.difficulty === null || all.difficulty === undefined ? '—' : esc(fmtNum(all.difficulty)), 'SHA-256d')}
+        ${statItem('Difficulty', all.difficulty === null || all.difficulty === undefined ? '—' : esc(fmtNum(all.difficulty)), esc(all.difficultyAlgo === 'Sha256d' ? 'SHA-256d' : (all.difficultyAlgo || 'PoW')))}
       </section>
 
       <section class="stat-card">

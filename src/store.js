@@ -33,7 +33,7 @@ export class Store {
     this.proposers = new Map(); // header proposer/miner account -> { blocks, lastHeight }
     this.miners = [];
     this.supply = null; // { total, mined } (decimal-grain strings)
-    this.difficulty = null; // { sha256d } (the difficulty scalar; mainnet seal is RandomX)
+    this.difficulty = null; // { sha256d, algo, hashrate, targetBlockMs } from sov_getDifficulty
     this.mempoolSize = 0;
     this.supplySeries = []; // [{ height, total, mined, timestampMs }]
     this.totalTxIndexed = 0;
@@ -289,6 +289,9 @@ export class Store {
         blockchainSizeBytes: this.totalBlockBytesIndexed,
         networkNodes: this.miners.length || null,
         difficulty: this.difficulty?.sha256d ?? null,
+        // The PoW seal actually in force (RandomX on mainnet, SHA-256d on dev/test) —
+        // reported by the node's sov_getDifficulty `algo`, not assumed.
+        difficultyAlgo: this.difficulty?.algo ?? null,
       },
       last24h,
       mempool: {
