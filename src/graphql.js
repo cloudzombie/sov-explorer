@@ -1,13 +1,22 @@
 // A compact, dependency-free GraphQL query engine for the explorer's schema.
 //
 // Supports queries with field arguments (string / int / boolean / enum / null),
-// arbitrarily nested selection sets, and aliases. It deliberately does NOT
+// bounded nested selection sets, and aliases. It deliberately does NOT
 // implement mutations, variables, fragments, or directives — the explorer is
 // read-only, and those features are documented as out of scope rather than faked.
+
+const MAX_SOURCE_CHARS = 64 * 1024;
+const MAX_TOKENS = 4096;
+const MAX_DEPTH = 12;
+const MAX_SELECTIONS = 200;
+const MAX_ROOT_FIELDS = 25;
+const MAX_RESULT_CHARS = 4 * 1024 * 1024;
 
 // ---- lexer ----------------------------------------------------------------
 
 function lex(src) {
+  if (typeof src !== 'string') throw new Error('query must be a string');
+  if (src.length > MAX_SOURCE_CHARS) throw new Error('query exceeds 64 KiB limit');
   const toks = [];
   let i = 0;
   const punct = '{}():!,[]';
@@ -33,6 +42,7 @@ function lex(src) {
         s += src[j];
         j++;
       }
+      if (j >= src.length) throw new Error('unterminated string');
       toks.push({ t: 'str', v: s });
       i = j + 1;
       continue;
@@ -44,7 +54,9 @@ function lex(src) {
         s += src[j];
         j++;
       }
-      toks.push({ t: 'num', v: Number(s) });
+      const value = Number(s);
+      if (!Number.isFinite(value)) throw new Error('number is not finite');
+      toks.push({ t: 'num', v: value });
       i = j;
       continue;
     }
@@ -61,6 +73,9 @@ function lex(src) {
     }
     throw new Error(`unexpected character '${c}'`);
   }
+  if (toks.length > MAX_TOKENS) {
+    throw new Error(`query exceeds ${MAX_TOKENS} token limit`);
+  }
   return toks;
 }
 
@@ -69,6 +84,7 @@ function lex(src) {
 function parse(src) {
   const toks = lex(src);
   let p = 0;
+  let selectionsSeen = 0;
   const peek = () => toks[p];
   const eat = (t) => {
     const tok = toks[p];
@@ -103,10 +119,15 @@ function parse(src) {
     return args;
   }
 
-  function parseSelectionSet() {
+  function parseSelectionSet(depth = 1) {
+    if (depth > MAX_DEPTH) throw new Error(`query exceeds maximum depth ${MAX_DEPTH}`);
     eat('{');
     const sels = [];
     while (peek() && peek().t !== '}') {
+      selectionsSeen += 1;
+      if (selectionsSeen > MAX_SELECTIONS) {
+        throw new Error(`query exceeds ${MAX_SELECTIONS} selected fields`);
+      }
       let name = eat('name').v;
       let alias = name;
       if (peek() && peek().t === ':') {
@@ -116,7 +137,7 @@ function parse(src) {
       }
       const args = parseArgs();
       let selectionSet = null;
-      if (peek() && peek().t === '{') selectionSet = parseSelectionSet();
+      if (peek() && peek().t === '{') selectionSet = parseSelectionSet(depth + 1);
       sels.push({ name, alias, args, selectionSet });
     }
     eat('}');
@@ -129,6 +150,8 @@ function parse(src) {
     if (peek() && peek().t === 'name') eat('name');
   }
   const set = parseSelectionSet();
+  if (set.length > MAX_ROOT_FIELDS) throw new Error(`query exceeds ${MAX_ROOT_FIELDS} root fields`);
+  if (p !== toks.length) throw new Error(`unexpected token '${toks[p]?.t ?? 'EOF'}'`);
   return set;
 }
 
@@ -154,6 +177,7 @@ export async function executeGraphql(source, ctx, roots) {
   }
   const data = {};
   const errors = [];
+  let resultChars = 0;
   for (const sel of selections) {
     const resolver = roots[sel.name];
     if (!resolver) {
@@ -163,7 +187,13 @@ export async function executeGraphql(source, ctx, roots) {
     }
     try {
       const value = await resolver(sel.args, ctx);
-      data[sel.alias] = await project(value, sel.selectionSet);
+      const projected = await project(value, sel.selectionSet);
+      const encoded = JSON.stringify(projected);
+      if (resultChars + encoded.length > MAX_RESULT_CHARS) {
+        throw new Error('query result exceeds 4 MiB limit; request fewer fields');
+      }
+      resultChars += encoded.length;
+      data[sel.alias] = projected;
     } catch (e) {
       errors.push({ message: `${sel.name}: ${e.message}` });
       data[sel.alias] = null;
@@ -190,7 +220,10 @@ export const schemaRoots = {
       unlockHeight: acc.unlock_height,
       key: acc.key,
       isContract: !!acc.code,
-      transactions: store.accountTxs(a.id, Number(a.limit ?? 25)),
+      transactions: store.accountTxs(
+        a.id,
+        Math.max(0, Math.min(100, Number.isFinite(Number(a.limit)) ? Math.trunc(Number(a.limit)) : 25)),
+      ),
     };
   },
   supply: (_a, { store }) => store.supply,

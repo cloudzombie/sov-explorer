@@ -46,3 +46,20 @@ test('syntax errors are reported, not thrown', async () => {
   const r = await executeGraphql('{ block(height: ', {}, roots);
   assert.ok(r.errors[0].message.startsWith('Syntax error'));
 });
+
+test('rejects excessive query depth', async () => {
+  const query = `{ root ${'{ child '.repeat(13)} value ${'}'.repeat(13)} }`;
+  const result = await executeGraphql(query, {}, { root: () => ({}) });
+  assert.match(result.errors[0].message, /maximum depth/);
+});
+
+test('rejects excessive root-field fanout', async () => {
+  const query = `{ ${Array.from({ length: 26 }, (_, i) => `v${i}: value`).join(' ')} }`;
+  const result = await executeGraphql(query, {}, { value: () => 1 });
+  assert.match(result.errors[0].message, /root fields/);
+});
+
+test('rejects oversized query source', async () => {
+  const result = await executeGraphql(`{ value }${' '.repeat(70_000)}`, {}, { value: () => 1 });
+  assert.match(result.errors[0].message, /64 KiB/);
+});

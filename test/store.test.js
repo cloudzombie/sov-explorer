@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store, txCounterparty } from '../src/store.js';
+import { Store, transactionCrypto, txCounterparty } from '../src/store.js';
 
 const hx = (n) => '0x' + BigInt(n).toString(16).padStart(64, '0');
 
@@ -46,6 +46,26 @@ test('counterparty extraction', () => {
   assert.equal(txCounterparty({ type: 'mine' }), null);
 });
 
+test('hybrid65 key and signature evidence is measured from retained transactions', () => {
+  const hybrid = tx(hx(9001), 'pq.sovereign', { type: 'mine' });
+  hybrid.publicKey = `hybrid65:0x${'11'.repeat(1984)}`;
+  hybrid.signature = `hybrid65:0x${'22'.repeat(3373)}`;
+  assert.deepEqual(transactionCrypto(hybrid), {
+    scheme: 'hybrid65',
+    keyBytes: 1984,
+    signatureBytes: 3373,
+  });
+
+  const s = new Store({ maxBlocks: 1 });
+  s.addBlock(block(0, [hybrid]));
+  assert.equal(s.latestTransaction().id, hybrid.id);
+  assert.equal(s.cryptographyStats().hybridCoverage, 1);
+  assert.equal(s.cryptographyStats().signatureBytesRetained, 3373);
+  s.addBlock(block(1));
+  assert.equal(s.latestTransaction(), null);
+  assert.equal(s.cryptographyStats().retainedTransactions, 0);
+});
+
 test('indexes blocks, transactions, and both account sides', () => {
   const s = new Store();
   const t = tx(hx(1001), 'usa.reserve.sovereign', { type: 'transfer', to: 'ecb.reserve.sovereign', amount: '10000000000' });
@@ -70,6 +90,7 @@ test('search classifies height, hash, tx id, and account', () => {
   assert.equal(s.search(hx(1001)).kind, 'tx'); // by tx id
   assert.equal(s.search('a.sovereign').kind, 'account');
   assert.equal(s.search(hx(424242)).kind, 'hash'); // unknown 0x-hash
+  assert.equal(s.search('9'.repeat(80)).kind, 'invalid');
   assert.equal(s.search('').kind, 'empty');
 });
 
@@ -89,8 +110,52 @@ test('ring eviction drops oldest blocks and their txs', () => {
   assert.equal(s.tx(hx(2000)), null, 'evicted block tx removed');
   assert.ok(s.block(2), 'newest retained');
   assert.equal(s.totalBlockBytesIndexed, 4096, 'evicted block bytes removed');
-  // The evicted tx id is filtered out of the account index on read.
+  // The evicted tx id is removed from the account index, not retained forever.
   assert.equal(s.accountTxs('a.sovereign').length, 0);
+  assert.equal(s.txIdsByAccount.has('a.sovereign'), false);
+});
+
+test('byte ceiling evicts records even below the block-count ceiling', () => {
+  const s = new Store({ maxBlocks: 100, maxBytes: 4096 });
+  s.addBlock(block(0));
+  s.addBlock(block(1));
+  s.addBlock(block(2));
+  assert.equal(s.blocksByHeight.size, 2);
+  assert.equal(s.block(0), null);
+  assert.ok(s.totalBlockBytesIndexed <= 4096);
+});
+
+test('an oversized newest block remains a coherent one-block index', () => {
+  const s = new Store({ maxBlocks: 100, maxBytes: 4096 });
+  const large = block(7);
+  large.sizeBytes = 8192;
+  s.addBlock(large);
+  assert.equal(s.blocksByHeight.size, 1);
+  assert.equal(s.tipHeight, 7);
+  assert.equal(s.minHeight, 7);
+  assert.ok(s.block(7));
+});
+
+test('status distinguishes node height from indexed height while syncing', () => {
+  const s = new Store();
+  s.addBlock(block(5));
+  s.setSyncStatus({ nodeHeight: 10, syncing: true, ready: false, phase: 'bootstrap' });
+  const status = s.stats().sync;
+  assert.equal(status.nodeHeight, 10);
+  assert.equal(status.indexedHeight, 5);
+  assert.equal(status.behindBlocks, 5);
+  assert.equal(status.ready, false);
+});
+
+test('status aggregation is cached until chain state changes', () => {
+  const s = new Store();
+  s.addBlock(block(1));
+  const first = s.stats();
+  assert.equal(s.stats(), first);
+  s.setSyncStatus({ nodeHeight: 2 });
+  const updated = s.stats();
+  assert.notEqual(updated, first);
+  assert.equal(updated.sync.nodeHeight, 2);
 });
 
 test('stats expose blockchair-style explorer parameters', () => {

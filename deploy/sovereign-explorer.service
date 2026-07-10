@@ -8,7 +8,9 @@
 #   sudo systemctl daemon-reload && sudo systemctl enable --now sovereign-explorer
 #   journalctl -u sovereign-explorer -f
 #
-# Holds no state (indexes on boot), so Restart=always is safe. Serves HTTP + WS on PORT.
+# Holds no authoritative state (indexes on boot), so Restart=always is safe. Bind it
+# to loopback and publish through a TLS reverse proxy with its own request/connection
+# limits; the process also enforces bounded requests as a second line of defense.
 
 [Unit]
 Description=Sovereign block explorer
@@ -23,18 +25,44 @@ Group=explorer
 WorkingDirectory=/opt/sov-explorer/app
 ExecStart=/usr/bin/node src/server.js
 
-# Which networks to index. Point these at your nodes. Leave MAINNET empty until the
-# mainnet node exists — the UI shows "launching soon" and never queries it; set it and
-# restart to light mainnet up with no other change.
+# Which networks to index. Point these at your nodes. Set
+# SOVEREIGN_<NETWORK>_DISABLED=1 in the env file to disable one explicitly.
 Environment=PORT=8730
-Environment=SOVEREIGN_TESTNET_RPC=http://159.203.109.204:8645
-Environment=SOVEREIGN_MAINNET_RPC=
+Environment=HOST=127.0.0.1
+Environment=SOVEREIGN_TESTNET_RPCS=http://159.203.109.204:8645
+Environment="SOVEREIGN_MAINNET_RPCS=http://64.225.10.34:8645,http://137.184.83.91:8645"
+Environment=TRUST_PROXY=1
+# Optional local overrides without editing the unit:
+EnvironmentFile=-/etc/sov-explorer.env
 
 Restart=always
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sovereign-explorer
+
+# Service sandboxing. Node/V8 needs executable JIT memory, so MemoryDenyWriteExecute
+# is intentionally not enabled.
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+UMask=0077
+LimitNOFILE=65536
+TasksMax=128
+MemoryHigh=640M
+MemoryMax=768M
 
 [Install]
 WantedBy=multi-user.target

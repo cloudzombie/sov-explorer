@@ -3,6 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#07080d" />
     <title>Sovereign Explorer</title>
     <meta
       name="description"
@@ -11,6 +13,7 @@
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
+    <a class="skip-link" href="#view">Skip to chain data</a>
     <header class="masthead">
       <a class="brand" href="#/">
         <svg class="seal" viewBox="0 0 64 64" width="42" height="42" aria-hidden="true">
@@ -26,6 +29,7 @@
         <input
           id="q"
           type="text"
+          aria-label="Search blocks, transactions, or accounts"
           placeholder="Search by block height, block / tx hash (0x…), or account…"
           spellcheck="false"
         />
@@ -34,30 +38,33 @@
 
       <nav class="nav" id="nav">
         <a href="#/">Overview</a>
+        <a href="#/proof">Proof</a>
         <a href="#/blocks">Blocks</a>
         <a href="#/miners">Miners</a>
         <a href="#/sns">SNS</a>
         <a href="#/analytics">Analytics</a>
-        <a href="#/validity">Validity</a>
+        <a href="#/validity">Finality</a>
         <a href="https://faucet.sovxus.org" target="_blank" rel="noopener noreferrer" class="nav-faucet" title="Free mainnet XUS — USA only">Faucet 🇺🇸</a>
       </nav>
 
       <div class="netsw" id="netsw" role="group" aria-label="Network">
-        <button type="button" data-net="testnet">Testnet</button>
-        <button type="button" data-net="mainnet" class="is-active">Mainnet</button>
+        <button type="button" data-net="testnet" aria-pressed="false">Testnet</button>
+        <button type="button" data-net="mainnet" class="is-active" aria-pressed="true">Mainnet</button>
       </div>
 
-      <div class="conn" id="conn" title="Live feed">
+      <div class="conn" id="conn" title="Chain and relay status" role="status" aria-live="polite">
         <span class="dot"></span><span id="conn-text">connecting…</span>
       </div>
     </header>
 
-    <div class="ticker" id="ticker" hidden>
+    <div class="syncbar" id="syncbar" role="status" aria-live="polite" hidden></div>
+
+    <div class="ticker" id="ticker" role="log" aria-live="polite" aria-label="New blocks and transactions" hidden>
       <span class="ticker-label">LIVE</span>
       <div class="ticker-items" id="ticker-items"></div>
     </div>
 
-    <main id="view"><div class="loading">Connecting to the chain…</div></main>
+    <main id="view" tabindex="-1" aria-busy="true"><div class="loading">Connecting to the chain…</div></main>
 
     <footer class="foot">
       <span

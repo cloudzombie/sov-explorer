@@ -3,7 +3,7 @@
 // balance-sensitive reads (accounts, supply) hit the node directly; historical
 // reads (blocks, transactions) come from the index.
 
-import { normalizeBlock } from './indexer.js';
+import { confirmationCount, finalAtDepth, normalizeBlock } from './indexer.js';
 
 function json(status, body) {
   return { status, body: JSON.stringify(body) };
@@ -13,6 +13,48 @@ function clamp(v, lo, hi, dflt) {
   const n = Number(v);
   if (!Number.isFinite(n)) return dflt;
   return Math.max(lo, Math.min(hi, Math.trunc(n)));
+}
+
+const HASH_RE = /^0x[0-9a-f]{64}$/i;
+const ACCOUNT_RE = /^[a-z0-9._-]{1,128}$/i;
+const HISTORY_CACHE_TTL_MS = 15_000;
+const HISTORY_CACHE_MAX = 100;
+const historyCache = new Map();
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+async function cachedHistory(key, load) {
+  const existing = historyCache.get(key);
+  if (existing && existing.expires > Date.now()) return existing.value;
+  const value = await load();
+  historyCache.set(key, { expires: Date.now() + HISTORY_CACHE_TTL_MS, value });
+  while (historyCache.size > HISTORY_CACHE_MAX) {
+    historyCache.delete(historyCache.keys().next().value);
+  }
+  return value;
+}
+
+async function mapBatches(values, width, mapper) {
+  const out = [];
+  for (let i = 0; i < values.length; i += width) {
+    out.push(...await Promise.all(values.slice(i, i + width).map(mapper)));
+  }
+  return out;
+}
+
+async function blockPair(rpc, height) {
+  if (typeof rpc.blockWithDigest === 'function') return rpc.blockWithDigest(height);
+  const [block, digest] = await Promise.all([
+    rpc.blockByHeight(height),
+    rpc.blockDigest(height),
+  ]);
+  return block && digest ? { block, digest } : null;
 }
 
 // A block-list summary built from a node `sov_getBlockDigest`, for historical blocks
@@ -27,7 +69,7 @@ function digestSummary(height, d, tip) {
     txCount: Array.isArray(d.txIds) ? d.txIds.length : 0,
     coinbase: d.coinbase ?? null,
     timestampMs: d.timestampMs,
-    final: tip - height >= 6,
+    final: finalAtDepth(tip, height),
   };
 }
 
@@ -38,7 +80,8 @@ export async function handleRest(method, pathname, query, ctx) {
   const { store, rpc } = ctx;
   const parts = pathname.split('/').filter(Boolean); // ['api', <sub>, <arg>]
   const sub = parts[1];
-  const arg = parts[2] !== undefined ? decodeURIComponent(parts[2]) : undefined;
+  const arg = parts[2] !== undefined ? safeDecode(parts[2]) : undefined;
+  if (parts[2] !== undefined && arg === null) return json(400, { error: 'malformed URL encoding' });
 
   try {
     switch (sub) {
@@ -50,20 +93,24 @@ export async function handleRest(method, pathname, query, ctx) {
         // ones (outside the retained window) are fetched from the node on demand, so
         // the page walks all the way back to genesis on a long chain. `?before=<height>`
         // sets the cursor (omit for the latest page); `?limit` bounds the page.
-        const limit = clamp(query.get('limit'), 1, 200, 25);
+        const limit = clamp(query.get('limit'), 1, 100, 25);
         const tip = store.tipHeight;
         const beforeRaw = query.get('before');
         const startRaw = beforeRaw !== null && beforeRaw !== '' ? Number(beforeRaw) : tip;
-        const start = Number.isFinite(startRaw) ? Math.min(startRaw, tip) : tip;
-        const out = [];
-        for (let h = start; h >= 0 && out.length < limit; h--) {
-          let b = store.block(h);
-          if (!b) {
+        const start = Number.isFinite(startRaw)
+          ? Math.max(0, Math.min(Math.trunc(startRaw), tip))
+          : tip;
+        const heights = Array.from({ length: Math.min(limit, start + 1) }, (_, i) => start - i);
+        const key = `${store.genesisHash}:${start}:${limit}`;
+        const out = await cachedHistory(key, async () => {
+          const rows = await mapBatches(heights, 8, async (h) => {
+            const local = store.block(h);
+            if (local) return local;
             const d = await rpc.blockDigest(h).catch(() => null);
-            if (d) b = digestSummary(h, d, tip);
-          }
-          if (b) out.push(b);
-        }
+            return d ? digestSummary(h, d, tip) : null;
+          });
+          return rows.filter(Boolean);
+        });
         return json(200, out);
       }
 
@@ -73,28 +120,39 @@ export async function handleRest(method, pathname, query, ctx) {
       case 'block': {
         if (arg === undefined) return json(400, { error: 'missing block reference' });
         const ref = /^\d+$/.test(arg) ? Number(arg) : arg.toLowerCase();
+        if (typeof ref === 'number' && (!Number.isSafeInteger(ref) || ref < 0)) {
+          return json(400, { error: 'invalid block height' });
+        }
+        if (typeof ref === 'string' && !HASH_RE.test(ref)) {
+          return json(400, { error: 'invalid block hash' });
+        }
         const block = store.block(ref);
         if (block) return json(200, block);
-        // Outside the in-memory window (e.g. genesis on a long chain): fetch the
-        // block from the node so permalinks — height or hash — never go dark.
-        const node =
-          typeof ref === 'number'
-            ? await rpc.blockDigest(ref).catch(() => null)
-            : await rpc.blockByHash(ref).catch(() => null);
-        if (node) {
-          const height = typeof ref === 'number' ? ref : node.header?.height ?? node.height;
-          const d = typeof ref === 'number' ? node : await rpc.blockDigest(height).catch(() => null);
-          if (d) {
-            const s = digestSummary(height, d, store.tipHeight);
-            return json(200, { ...s, prevHash: d.prevHash, stateRoot: d.stateRoot, txRoot: d.txRoot ?? null, receiptsRoot: d.receiptsRoot ?? null, transactions: [] });
+        // Outside the retained window, load the full body and digest as one
+        // same-relay pair. This keeps old permalinks complete without retaining the
+        // entire chain in memory or mixing a body from one relay with another's id.
+        const cacheKey = `${store.genesisHash}:block:${String(ref)}`;
+        const historical = await cachedHistory(cacheKey, async () => {
+          let height = ref;
+          if (typeof ref === 'string') {
+            const byHash = await rpc.blockByHash(ref).catch(() => null);
+            if (!byHash) return null;
+            height = byHash.header?.height ?? byHash.height;
           }
-        }
+          if (!Number.isSafeInteger(height) || height < 0) return null;
+          const pair = await blockPair(rpc, height).catch(() => null);
+          if (!pair) return null;
+          if (typeof ref === 'string' && String(pair.digest.hash).toLowerCase() !== ref) return null;
+          return normalizeBlock(pair.block, pair.digest, finalAtDepth(store.tipHeight, height));
+        });
+        if (historical) return json(200, historical);
         return json(404, { error: 'block not found on the chain' });
       }
 
       case 'tx': {
         if (!arg) return json(400, { error: 'missing transaction id' });
         const id = arg.toLowerCase();
+        if (!HASH_RE.test(id)) return json(400, { error: 'invalid transaction id' });
         let tx = store.tx(id);
         if (!tx) {
           // Not in the indexed window. If the node holds a RECEIPT for this id,
@@ -103,12 +161,13 @@ export async function handleRest(method, pathname, query, ctx) {
           // (evicted from the window) both resolve.
           const r = await rpc.receipt(id).catch(() => null);
           if (r && Number.isFinite(r.height)) {
-            const [block, digest] = await Promise.all([
-              rpc.blockByHeight(r.height).catch(() => null),
-              rpc.blockDigest(r.height).catch(() => null),
-            ]);
-            if (block && digest) {
-              const rec = normalizeBlock(block, digest, store.tipHeight - r.height >= 6);
+            const pair = await blockPair(rpc, r.height).catch(() => null);
+            if (pair) {
+              const rec = normalizeBlock(
+                pair.block,
+                pair.digest,
+                finalAtDepth(store.tipHeight, r.height),
+              );
               tx = rec.transactions.find((t) => t.id === id) ?? null;
             }
           }
@@ -123,12 +182,13 @@ export async function handleRest(method, pathname, query, ctx) {
         // gas, contract events) and depth-derived confirmations — both are real
         // chain data read from the node, not stored copies.
         const receipt = await rpc.receipt(tx.id).catch(() => null);
-        const confirmations = Math.max(0, store.tipHeight - tx.blockHeight + 1);
-        return json(200, { ...tx, receipt, confirmations, final: confirmations >= 6 });
+        const confirmations = confirmationCount(store.tipHeight, tx.blockHeight);
+        return json(200, { ...tx, receipt, confirmations, final: finalAtDepth(store.tipHeight, tx.blockHeight) });
       }
 
       case 'account': {
         if (!arg) return json(400, { error: 'missing account' });
+        if (!ACCOUNT_RE.test(arg)) return json(400, { error: 'invalid account or name' });
         let id = arg;
         let resolvedFrom = null;
         let account = await rpc.account(id).catch(() => null);
@@ -158,6 +218,7 @@ export async function handleRest(method, pathname, query, ctx) {
       // A single SNS name → its record (owner + registration height), or null.
       case 'name': {
         if (!arg) return json(400, { error: 'missing name' });
+        if (!ACCOUNT_RE.test(arg)) return json(400, { error: 'invalid name' });
         return json(200, (await rpc.getName(arg)) ?? null);
       }
 
@@ -177,8 +238,39 @@ export async function handleRest(method, pathname, query, ctx) {
       case 'analytics':
         return json(200, { stats: store.stats(), supplySeries: store.supplySeries });
 
+      case 'proof': {
+        const stats = store.stats();
+        const latestTx = store.latestTransaction();
+        const nonEmpty = latestTx ? store.block(latestTx.blockHeight) : null;
+        const empty = store.recentBlocks(32).find((block) => block.txCount === 0) ?? null;
+        const roots = (block) => block ? {
+          height: block.height,
+          hash: block.hash,
+          txCount: block.txCount,
+          txRoot: block.txRoot,
+          receiptsRoot: block.receiptsRoot,
+          stateRoot: block.stateRoot,
+          transactionId: block.transactions?.[0]?.id ?? null,
+        } : null;
+        return json(200, {
+          identity: { chainId: store.chainId, genesisHash: store.genesisHash },
+          sync: stats.sync,
+          relays: stats.relays,
+          consensus: {
+            proofOfWork: store.difficulty?.algo ?? null,
+            finalityConfirmations: 6,
+            difficulty: store.difficulty,
+          },
+          cryptography: store.cryptographyStats(),
+          privacy: { supply: store.supply, shieldedInfo: store.shieldedInfo },
+          commitments: { deterministicEmpty: roots(empty), latestNonEmpty: roots(nonEmpty) },
+        });
+      }
+
       case 'search': {
-        const result = store.search(query.get('q') ?? '');
+        const raw = query.get('q') ?? '';
+        if (raw.length > 256) return json(400, { error: 'search query is too long' });
+        const result = store.search(raw);
         // An unknown 0x-hash may be an older block outside our window — ask the node.
         if (result.kind === 'hash') {
           const blk = await rpc.blockByHash(result.ref).catch(() => null);

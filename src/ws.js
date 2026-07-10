@@ -1,23 +1,75 @@
-// A minimal RFC 6455 WebSocket server over Node's HTTP `upgrade` event — no
-// external dependency. The feed is server→client only: the hub broadcasts new
-// blocks and transactions as the indexer ingests them. Inbound frames are only
-// inspected enough to answer pings and honor close.
+// Bounded RFC 6455 WebSocket broadcast hub.
+//
+// The feed is server -> client only. Connections are same-origin checked, capped,
+// heartbeat-reaped, and disconnected when they stop accepting data so one slow or
+// malicious browser cannot grow the Node process's socket buffers without bound.
 
 import { createHash } from 'node:crypto';
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
+function reject(socket, status, reason) {
+  if (socket.writable) {
+    socket.end(
+      `HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Type: text/plain\r\n` +
+      `Content-Length: ${Buffer.byteLength(reason)}\r\n\r\n${reason}`,
+    );
+  } else {
+    socket.destroy();
+  }
+}
+
+function sameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // non-browser health checks / websocket clients
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
 export class WsHub {
-  constructor() {
+  constructor(opts = {}) {
     this.clients = new Set();
+    this.perIp = new Map();
+    this.maxClients = opts.maxClients ?? 1_000;
+    this.maxPerIp = opts.maxPerIp ?? 20;
+    this.maxInboundBytes = opts.maxInboundBytes ?? 64 * 1024;
+    this.maxBufferedBytes = opts.maxBufferedBytes ?? 1024 * 1024;
+    this.heartbeatMs = opts.heartbeatMs ?? 30_000;
+    this._heartbeat = setInterval(() => this._pulse(), this.heartbeatMs);
+    this._heartbeat.unref?.();
   }
 
   handleUpgrade(req, socket) {
-    const key = req.headers['sec-websocket-key'];
-    if (!key) {
-      socket.destroy();
-      return;
+    const upgrade = String(req.headers.upgrade ?? '').toLowerCase();
+    const connection = String(req.headers.connection ?? '').toLowerCase();
+    const version = String(req.headers['sec-websocket-version'] ?? '');
+    const key = String(req.headers['sec-websocket-key'] ?? '');
+    let keyBytes = null;
+    try {
+      keyBytes = Buffer.from(key, 'base64');
+    } catch {
+      // handled by the length check below
     }
+    if (upgrade !== 'websocket' || !connection.split(',').some((v) => v.trim() === 'upgrade')) {
+      return reject(socket, '400 Bad Request', 'invalid websocket upgrade');
+    }
+    if (version !== '13' || !keyBytes || keyBytes.length !== 16) {
+      return reject(socket, '400 Bad Request', 'invalid websocket handshake');
+    }
+    if (!sameOrigin(req)) return reject(socket, '403 Forbidden', 'websocket origin rejected');
+    if (this.clients.size >= this.maxClients) {
+      return reject(socket, '503 Service Unavailable', 'websocket capacity reached');
+    }
+
+    const ip = req.socket.remoteAddress ?? 'unknown';
+    const ipCount = this.perIp.get(ip) ?? 0;
+    if (ipCount >= this.maxPerIp) {
+      return reject(socket, '429 Too Many Requests', 'too many websocket connections');
+    }
+
     const accept = createHash('sha1').update(key + GUID).digest('base64');
     socket.write(
       'HTTP/1.1 101 Switching Protocols\r\n' +
@@ -26,24 +78,102 @@ export class WsHub {
         `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
     socket.setNoDelay(true);
+    socket.sovAlive = true;
+    socket.sovIp = ip;
+    socket.sovBuffer = Buffer.alloc(0);
     this.clients.add(socket);
+    this.perIp.set(ip, ipCount + 1);
 
     socket.on('data', (buf) => this._onData(socket, buf));
-    const drop = () => this.clients.delete(socket);
+    const drop = () => this._drop(socket);
     socket.on('close', drop);
+    socket.on('end', drop);
     socket.on('error', drop);
   }
 
-  _onData(socket, buf) {
-    if (buf.length < 2) return;
-    const opcode = buf[0] & 0x0f;
-    if (opcode === 0x8) {
-      // close
-      this.clients.delete(socket);
-      socket.end();
-    } else if (opcode === 0x9) {
-      // ping -> pong
-      if (socket.writable) socket.write(encodeFrame(Buffer.alloc(0), 0xa));
+  _drop(socket) {
+    if (!this.clients.delete(socket)) return;
+    const ip = socket.sovIp ?? 'unknown';
+    const next = (this.perIp.get(ip) ?? 1) - 1;
+    if (next <= 0) this.perIp.delete(ip);
+    else this.perIp.set(ip, next);
+  }
+
+  _onData(socket, chunk) {
+    const prior = socket.sovBuffer ?? Buffer.alloc(0);
+    if (prior.length + chunk.length > this.maxInboundBytes) return this._destroy(socket);
+    socket.sovBuffer = prior.length ? Buffer.concat([prior, chunk]) : chunk;
+
+    while (socket.sovBuffer.length >= 2) {
+      const buf = socket.sovBuffer;
+      const first = buf[0];
+      const second = buf[1];
+      const fin = (first & 0x80) !== 0;
+      const opcode = first & 0x0f;
+      const masked = (second & 0x80) !== 0;
+
+      // This is a server-only application protocol. The only valid client frames
+      // are masked, unfragmented close/ping/pong controls with no RSV extensions.
+      if ((first & 0x70) !== 0 || !fin || !masked || ![0x8, 0x9, 0xa].includes(opcode)) {
+        return this._destroy(socket);
+      }
+
+      let length = second & 0x7f;
+      let headerLength = 2;
+      if (length === 126) {
+        if (buf.length < 4) return;
+        length = buf.readUInt16BE(2);
+        headerLength = 4;
+      } else if (length === 127) {
+        if (buf.length < 10) return;
+        const large = buf.readBigUInt64BE(2);
+        if (large > BigInt(Number.MAX_SAFE_INTEGER)) return this._destroy(socket);
+        length = Number(large);
+        headerLength = 10;
+      }
+      if (length > 125 || length > this.maxInboundBytes) return this._destroy(socket);
+
+      const frameLength = headerLength + 4 + length;
+      if (buf.length < frameLength) return;
+      const mask = buf.subarray(headerLength, headerLength + 4);
+      const payload = Buffer.from(buf.subarray(headerLength + 4, frameLength));
+      for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+      socket.sovBuffer = buf.subarray(frameLength);
+
+      if (opcode === 0x8) {
+        this._drop(socket);
+        if (socket.writable) socket.end(encodeFrame(payload, 0x8));
+        else socket.destroy();
+        return;
+      }
+      if (opcode === 0x9) {
+        if (socket.writable) socket.write(encodeFrame(payload, 0xa));
+      } else {
+        socket.sovAlive = true;
+      }
+    }
+  }
+
+  _destroy(socket) {
+    this._drop(socket);
+    socket.destroy();
+  }
+
+  _pulse() {
+    const ping = encodeFrame(Buffer.alloc(0), 0x9);
+    for (const socket of this.clients) {
+      if (!socket.writable || socket.sovAlive === false || socket.writableLength > this.maxBufferedBytes) {
+        this._drop(socket);
+        socket.destroy();
+        continue;
+      }
+      socket.sovAlive = false;
+      try {
+        socket.write(ping);
+      } catch {
+        this._drop(socket);
+        socket.destroy();
+      }
     }
   }
 
@@ -51,12 +181,29 @@ export class WsHub {
     if (this.clients.size === 0) return;
     const frame = encodeFrame(Buffer.from(JSON.stringify(obj)), 0x1);
     for (const socket of this.clients) {
-      if (socket.writable) socket.write(frame);
+      if (!socket.writable || socket.writableLength + frame.length > this.maxBufferedBytes) {
+        this._drop(socket);
+        socket.destroy();
+        continue;
+      }
+      try {
+        socket.write(frame);
+      } catch {
+        this._drop(socket);
+        socket.destroy();
+      }
     }
   }
 
   count() {
     return this.clients.size;
+  }
+
+  stop() {
+    clearInterval(this._heartbeat);
+    for (const socket of this.clients) socket.destroy();
+    this.clients.clear();
+    this.perIp.clear();
   }
 }
 
