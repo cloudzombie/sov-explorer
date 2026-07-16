@@ -35,6 +35,7 @@ export class WsHub {
     this.perIp = new Map();
     this.maxClients = opts.maxClients ?? 1_000;
     this.maxPerIp = opts.maxPerIp ?? 20;
+    this.sharedCapacity = opts.sharedCapacity ?? null;
     this.maxInboundBytes = opts.maxInboundBytes ?? 64 * 1024;
     this.maxBufferedBytes = opts.maxBufferedBytes ?? 1024 * 1024;
     this.heartbeatMs = opts.heartbeatMs ?? 30_000;
@@ -63,8 +64,11 @@ export class WsHub {
     if (this.clients.size >= this.maxClients) {
       return reject(socket, '503 Service Unavailable', 'websocket capacity reached');
     }
+    if (this.sharedCapacity && this.sharedCapacity.count >= this.sharedCapacity.max) {
+      return reject(socket, '503 Service Unavailable', 'websocket process capacity reached');
+    }
 
-    const ip = req.socket.remoteAddress ?? 'unknown';
+    const ip = req.sovClientIp ?? req.socket.remoteAddress ?? 'unknown';
     const ipCount = this.perIp.get(ip) ?? 0;
     if (ipCount >= this.maxPerIp) {
       return reject(socket, '429 Too Many Requests', 'too many websocket connections');
@@ -81,7 +85,9 @@ export class WsHub {
     socket.sovAlive = true;
     socket.sovIp = ip;
     socket.sovBuffer = Buffer.alloc(0);
+    socket.sovSharedCapacity = this.sharedCapacity;
     this.clients.add(socket);
+    if (this.sharedCapacity) this.sharedCapacity.count += 1;
     this.perIp.set(ip, ipCount + 1);
 
     socket.on('data', (buf) => this._onData(socket, buf));
@@ -93,6 +99,10 @@ export class WsHub {
 
   _drop(socket) {
     if (!this.clients.delete(socket)) return;
+    if (socket.sovSharedCapacity) {
+      socket.sovSharedCapacity.count = Math.max(0, socket.sovSharedCapacity.count - 1);
+      socket.sovSharedCapacity = null;
+    }
     const ip = socket.sovIp ?? 'unknown';
     const next = (this.perIp.get(ip) ?? 1) - 1;
     if (next <= 0) this.perIp.delete(ip);
@@ -201,8 +211,10 @@ export class WsHub {
 
   stop() {
     clearInterval(this._heartbeat);
-    for (const socket of this.clients) socket.destroy();
-    this.clients.clear();
+    for (const socket of [...this.clients]) {
+      this._drop(socket);
+      socket.destroy();
+    }
     this.perIp.clear();
   }
 }

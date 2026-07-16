@@ -101,3 +101,25 @@ test('websocket drops unmasked or application-data client frames', () => {
   assert.equal(hub.count(), 0);
   hub.stop();
 });
+
+test('websocket honors trusted forwarded identity and a process-wide capacity', () => {
+  const sharedCapacity = { count: 0, max: 1 };
+  const firstHub = new WsHub({ heartbeatMs: 60_000, sharedCapacity, maxPerIp: 1 });
+  const secondHub = new WsHub({ heartbeatMs: 60_000, sharedCapacity, maxPerIp: 1 });
+  const first = new FakeSocket('127.0.0.1');
+  const firstReq = request(first);
+  firstReq.sovClientIp = '203.0.113.4';
+  firstHub.handleUpgrade(firstReq, first);
+  assert.equal(first.sovIp, '203.0.113.4');
+  assert.equal(sharedCapacity.count, 1);
+
+  const second = new FakeSocket('127.0.0.1');
+  secondHub.handleUpgrade(request(second), second);
+  assert.equal(second.ended, true);
+  assert.match(Buffer.concat(second.writes).toString(), /process capacity reached/);
+
+  first.emit('close');
+  assert.equal(sharedCapacity.count, 0);
+  firstHub.stop();
+  secondHub.stop();
+});

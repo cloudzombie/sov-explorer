@@ -24,6 +24,33 @@ function publicRelayLabel(raw, index) {
   }
 }
 
+function loopbackHostname(hostname) {
+  const host = String(hostname).toLowerCase();
+  return host === 'localhost'
+    || host.endsWith('.localhost')
+    || host === '[::1]'
+    || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+function validateRelayUrl(raw, index, requireTls) {
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`relay ${index + 1} is not a valid URL`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error(`relay ${index + 1} must use HTTP or HTTPS`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`relay ${index + 1} must not embed credentials in its URL`);
+  }
+  if (requireTls && parsed.protocol !== 'https:' && !loopbackHostname(parsed.hostname)) {
+    throw new Error(`relay ${index + 1} requires TLS because it is not loopback`);
+  }
+  return parsed.toString();
+}
+
 function safeError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/https?:\/\/[^\s)]+/g, '[relay]');
@@ -87,9 +114,13 @@ export class SovereignRpc {
       .filter(Boolean);
     if (list.length === 0) throw new Error('at least one relay RPC URL is required');
 
-    this.relays = [...new Set(list)].map((url, index) => ({
+    const requireTls = opts.requireTls === true;
+    const validated = list.map((url, index) => validateRelayUrl(url, index, requireTls));
+
+    this.relays = [...new Set(validated)].map((url, index) => ({
       url,
       label: publicRelayLabel(url, index),
+      tls: url.startsWith('https:'),
       enabled: true,
       verified: false,
       healthy: null,
@@ -105,6 +136,8 @@ export class SovereignRpc {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxResponseBytes = opts.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     this.probeTtlMs = opts.probeTtlMs ?? DEFAULT_PROBE_TTL_MS;
+    this.metrics = opts.metrics ?? null;
+    this.networkName = opts.networkName ?? 'unknown';
     this._id = 0;
     this._verified = false;
     this._probeAt = 0;
@@ -141,6 +174,7 @@ export class SovereignRpc {
       }
       return json.result;
     } catch (error) {
+      this.metrics?.observeUpstream(this.networkName, method);
       if (!error?.relayResponded) relay.healthy = false;
       relay.lastError = safeError(error?.name === 'AbortError' ? new Error('request timed out') : error);
       throw error;
@@ -337,6 +371,7 @@ export class SovereignRpc {
       }),
       relays: this.relays.map((relay) => ({
         name: relay.label,
+        transport: relay.tls ? 'tls' : 'plain-http',
         enabled: relay.enabled,
         verified: relay.verified,
         healthy: relay.healthy,
@@ -387,6 +422,8 @@ export class SovereignRpc {
   stateRoot() { return this.call('sov_getStateRoot'); }
   isFinal(hash) { return this.call('sov_isFinal', { hash }); }
   receipt(txId) { return this.call('sov_getReceipt', { txId }, { nonNull: true }); }
+  transactionProof(txId) { return this.call('sov_getTransactionProof', { txId }, { nonNull: true }); }
+  receiptProof(txId) { return this.call('sov_getReceiptProof', { txId }, { nonNull: true }); }
   miners() { return this.call('sov_getMiners'); }
   mempoolSize() { return this.call('sov_getMempoolSize'); }
 

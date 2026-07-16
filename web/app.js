@@ -1,5 +1,6 @@
 // Sovereign Explorer — single-page UI. Hash-routed, fetches the REST API, and follows
 // a WebSocket live feed. All values shown are real chain data served by the node.
+import { downloadRows, explainAction, isWatched, toggleWatch, verifyMerkleProof } from './tools.js';
 
 const $ = (id) => document.getElementById(id);
 const view = $('view');
@@ -162,7 +163,7 @@ function renderNotLive(routeId) {
   const label = NET.charAt(0).toUpperCase() + NET.slice(1);
   setView(
     `<div class="empty notlive">🚀 <b>${esc(label)} is launching soon.</b><br />` +
-      `<span class="dim">This network isn't live yet — switch to Testnet to explore the running chain.</span></div>`,
+      `<span class="dim">No relay is configured for this network. Choose an available network or check the explorer deployment.</span></div>`,
     routeId,
   );
 }
@@ -312,6 +313,7 @@ async function renderOverview(routeId) {
       <div class="hero-meta">
         <span>Genesis ${esc(shortHash(s.genesisHash, 10, 6))}</span>
         <span>${fmtNum(s.blocksIndexed)} indexed blocks</span>
+        ${s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : ''}
         <span class="relay-pill ${relay.degraded ? 'degraded' : ''}">${esc(relayText)}</span>
       </div>
     </section>
@@ -441,6 +443,8 @@ async function renderBlocks(before, routeId) {
     ${pager}
   `, routeId);
   if (!committed) return;
+  window.__sovExport = { name: `${NET}-blocks-${cursor ?? 'latest'}`, rows: blocks };
+  $('export-tools').hidden = false;
   view.dataset.tipHeight = String(highest);
   // Live: on the latest page (no cursor), new blocks stream in at the top.
   if (cursor === null) {
@@ -633,6 +637,9 @@ async function renderTx(id, routeId) {
     ${Array.isArray(returnData) && returnData.length ? `
     <h2>Return data</h2>
     <div class="panel"><pre class="mono" style="margin:0;overflow-wrap:anywhere;white-space:pre-wrap">${fmtEventBytes(returnData)}</pre></div>` : ''}
+    <div class="panel action-explainer"><b>What this action does</b><p>${esc(explainAction(t.action))}</p></div>
+    <h2>Portable inclusion evidence</h2>
+    <div class="panel proof-check" data-proof-id="${encodeURIComponent(t.id)}"><button type="button" class="proof-verify">Request and verify proofs</button><span class="proof-result dim"> Uses optional relay proof RPCs.</span></div>
     <h2>Raw action</h2>
     <div class="panel"><details class="raw" open><summary>decoded action payload (as indexed from the block)</summary><pre class="mono">${esc(fmtActionJson(t.action))}</pre></details></div>
   `, routeId);
@@ -663,14 +670,17 @@ async function renderAccount(idRaw, routeId) {
   setView(`
     <div class="crumb">Account${data.resolvedFrom ? ` · resolved from SNS name` : ''}</div>
     <h1 class="mono">${esc(acct)} ${copyButton(acct, 'account')}</h1>
+    <p><button type="button" class="watch-toggle" data-account="${encodeURIComponent(acct)}">${isWatched(acct) ? '★ Remove from local watchlist' : '☆ Add to local watchlist'}</button></p>
     ${data.resolvedFrom ? `<p class="dim">↳ <span class="mono">${esc(data.resolvedFrom)}</span> resolves here</p>` : ''}
     ${names.length ? `<p class="dim">SNS: ${names.map((n) => `<span class="mono">${esc(n)}</span>`).join(', ')}</p>` : ''}
     <div class="panel"><table class="kv">${kv}</table></div>
     <h2>Indexed Transactions</h2>
     <div class="panel"><table><thead><tr><th>Tx</th><th>Type</th><th>Detail</th><th class="right">Block</th></tr></thead>
     <tbody>${txs.map((t) => `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td>${t.signer === acct ? actionSummary(t.action) : `from ${acctLink(t.signer)}`}</td><td class="right">${blockLink(t.blockHeight)}</td></tr>`).join('') || emptyRow(4)}</tbody></table></div>
-    <p class="note">Transaction history is from the explorer's indexed window; balances are read live from the node.</p>
+    <p class="note">${data.historyComplete ? 'Complete archived transaction history' : `Transaction history currently indexed from block #${fmtNum(data.historyFromHeight)}`} · balances are read live from the node.</p>
   `, routeId);
+  window.__sovExport = { name: `${NET}-account-${acct}-transactions`, rows: txs };
+  $('export-tools').hidden = false;
 }
 
 async function renderMiners(routeId) {
@@ -758,6 +768,7 @@ async function renderAnalytics(routeId) {
       <div class="card"><div class="label">Finality depth</div><div class="value num">6</div><div class="sub">confirmation convention</div></div>
       <div class="card"><div class="label">Mempool</div><div class="value num">${fmtNum(stats.mempoolSize)}</div></div>
       <div class="card"><div class="label">Blocks indexed</div><div class="value num">${fmtNum(stats.blocksIndexed)}</div></div>
+      ${stats.archive?.enabled ? `<div class="card"><div class="label">Blocks archived</div><div class="value num">${fmtNum(stats.archive.blocks)}</div><div class="sub">${stats.archive.complete ? 'complete from genesis' : `contiguous from #${fmtNum(stats.archive.contiguousFromHeight)}`}</div></div>` : ''}
       <div class="card"><div class="label">Transactions retained</div><div class="value num">${fmtNum(stats.transactionsRetained ?? stats.transactionsIndexed)}</div><div class="sub">memory-bounded indexed window</div></div>
     </div>
     <h2>Issuance Over Time</h2>
@@ -857,6 +868,7 @@ async function renderProof(routeId) {
           <span>Genesis</span><b class="mono break">${esc(proof.identity?.genesisHash)} ${copyButton(proof.identity?.genesisHash, 'genesis hash')}</b>
           <span>Common-head hash</span><b class="mono break">${commonHash ? `${esc(commonHash)} ${copyButton(commonHash, 'common-head hash')}` : '—'}</b>
           <span>Node / indexed</span><b class="mono">${fmtNum(proof.sync?.nodeHeight)} / ${fmtNum(proof.sync?.indexedHeight)}</b>
+          <span>Durable archive</span><b class="mono">${proof.archive?.enabled ? `${fmtNum(proof.archive.blocks)} blocks · ${proof.archive.complete ? 'complete from genesis' : `contiguous from #${fmtNum(proof.archive.contiguousFromHeight)}`}` : 'disabled'}</b>
         </div>
         <div class="relay-evidence-grid">${relayCards || '<span class="dim">No relay evidence available.</span>'}</div>
         <p class="proof-note">This proves source identity and cross-relay agreement at the compared height. It is not a substitute for independently executing consensus in a full node.</p>
@@ -951,6 +963,8 @@ async function resolveSearch(q) {
 
 function route() {
   const routeId = ++ROUTE_ID;
+  window.__sovExport = null;
+  $('export-tools').hidden = true;
   liveReset(); // the incoming view re-registers its own live hooks
   // A not-yet-live network (e.g. mainnet pre-launch) shows a launching-soon panel
   // instead of querying a node that doesn't exist.
@@ -1002,6 +1016,34 @@ $('search').addEventListener('submit', (e) => {
 });
 
 document.addEventListener('click', async (event) => {
+  const exportButton = event.target.closest?.('.data-export');
+  if (exportButton && window.__sovExport) {
+    const format = exportButton.dataset.format || 'json';
+    downloadRows(`${window.__sovExport.name}.${format}`, window.__sovExport.rows, format);
+    return;
+  }
+  const watchButton = event.target.closest?.('.watch-toggle');
+  if (watchButton) {
+    const account = decodeURIComponent(watchButton.dataset.account || '');
+    watchButton.textContent = toggleWatch(account) ? '★ Remove from local watchlist' : '☆ Add to local watchlist';
+    return;
+  }
+  const proofButton = event.target.closest?.('.proof-verify');
+  if (proofButton) {
+    const panel = proofButton.closest('.proof-check');
+    const result = panel.querySelector('.proof-result');
+    proofButton.disabled = true;
+    result.textContent = ' Requesting relay evidence…';
+    try {
+      const evidence = await api(`/inclusion-proof/${panel.dataset.proofId}`);
+      const tx = await verifyMerkleProof(evidence.transactionProof, evidence.txRoot);
+      const receipt = await verifyMerkleProof(evidence.receiptProof, evidence.receiptsRoot);
+      result.textContent = ` Transaction: ${tx.reason}. Receipt: ${receipt.reason}.`;
+      result.className = `proof-result ${tx.verified && receipt.verified ? 'ok-text' : 'warn-text'}`;
+    } catch (error) { result.textContent = ` ${error.message}`; }
+    finally { proofButton.disabled = false; }
+    return;
+  }
   const button = event.target.closest?.('.copy-btn');
   if (!button) return;
   try {

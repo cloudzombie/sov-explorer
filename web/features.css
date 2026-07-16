@@ -1,0 +1,7 @@
+.export-tools { display: flex; gap: .35rem; }
+.export-tools button, .watch-toggle, .proof-verify { border: 1px solid var(--line); border-radius: 5px; background: var(--panel); color: var(--muted); padding: .45rem .65rem; cursor: pointer; }
+.export-tools button:hover, .watch-toggle:hover, .proof-verify:hover { color: var(--text); border-color: var(--blue); }
+.action-explainer p { margin-bottom: 0; color: var(--muted); }
+.proof-check { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
+.ok-text { color: var(--green); } .warn-text { color: var(--yellow); }
+@media (max-width: 900px) { .export-tools { order: 8; } }

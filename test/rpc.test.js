@@ -6,6 +6,23 @@ import { RelayDivergenceError, SovereignRpc } from '../src/rpc.js';
 
 const hx = (byte) => `0x${byte.repeat(64)}`;
 
+test('strict relay transport requires TLS except for local development', () => {
+  assert.throws(
+    () => new SovereignRpc('http://203.0.113.10:8645', { requireTls: true }),
+    /requires TLS/,
+  );
+  assert.doesNotThrow(
+    () => new SovereignRpc('http://127.0.0.1:8645', { requireTls: true }),
+  );
+  const tls = new SovereignRpc('https://relay.example.com/rpc', { requireTls: true });
+  assert.equal(tls.status().relays[0].transport, 'tls');
+  assert.throws(
+    () => new SovereignRpc('https://user:secret@relay.example.com'),
+    /must not embed credentials/,
+  );
+  assert.throws(() => new SovereignRpc('file:///tmp/relay'), /must use HTTP or HTTPS/);
+});
+
 async function fakeRelay(options = {}) {
   const calls = [];
   const server = createServer((req, res) => {

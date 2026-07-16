@@ -207,8 +207,11 @@ export async function executeGraphql(source, ctx, roots) {
 export const schemaRoots = {
   head: (_a, { store }) => store.block(store.tipHeight),
   block: (a, { store }) =>
-    store.block(a.hash !== undefined ? String(a.hash).toLowerCase() : Number(a.height)),
-  transaction: (a, { store }) => store.tx(String(a.id).toLowerCase()),
+    store.block(a.hash !== undefined ? String(a.hash).toLowerCase() : Number(a.height))
+      ?? store.archive?.block(a.hash !== undefined ? String(a.hash).toLowerCase() : Number(a.height)),
+  transaction: (a, { store }) =>
+    store.tx(String(a.id).toLowerCase())
+      ?? store.archive?.transaction(String(a.id).toLowerCase()),
   account: async (a, { rpc, store }) => {
     const acc = await rpc.account(a.id).catch(() => null);
     if (!acc) return null;
@@ -220,10 +223,15 @@ export const schemaRoots = {
       unlockHeight: acc.unlock_height,
       key: acc.key,
       isContract: !!acc.code,
-      transactions: store.accountTxs(
-        a.id,
-        Math.max(0, Math.min(100, Number.isFinite(Number(a.limit)) ? Math.trunc(Number(a.limit)) : 25)),
-      ),
+      transactions: store.archive
+        ? store.archive.accountTransactions(
+            a.id,
+            Math.max(0, Math.min(100, Number.isFinite(Number(a.limit)) ? Math.trunc(Number(a.limit)) : 25)),
+          )
+        : store.accountTxs(
+            a.id,
+            Math.max(0, Math.min(100, Number.isFinite(Number(a.limit)) ? Math.trunc(Number(a.limit)) : 25)),
+          ),
     };
   },
   supply: (_a, { store }) => store.supply,

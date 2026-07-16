@@ -9,12 +9,15 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
 
+import { openArchive } from './archive.js';
 import { SovereignRpc } from './rpc.js';
 import { Store } from './store.js';
 import { Indexer } from './indexer.js';
 import { handleRest } from './rest.js';
 import { executeGraphql, schemaRoots } from './graphql.js';
 import { WsHub } from './ws.js';
+import { RateGate } from './limits.js';
+import { Metrics, routeTemplate } from './metrics.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = normalize(join(HERE, '..', 'web'));
@@ -56,13 +59,23 @@ const PORT = envInt('PORT', Number(process.argv[3]) || 8730, 1, 65_535);
 const RPC_TIMEOUT_MS = envInt('RPC_TIMEOUT_MS', 5_000, 500, 60_000);
 const INDEX_BACKFILL = envInt('INDEX_BACKFILL_BLOCKS', 640, 32, 10_000);
 const INDEX_BATCH = envInt('INDEX_BATCH_SIZE', 8, 1, 32);
+const ARCHIVE_BACKFILL_BATCH = envInt('ARCHIVE_BACKFILL_BATCH', 16, 1, 64);
+const ARCHIVE_DIR = String(process.env.ARCHIVE_DIR || '').trim();
 const MAX_STORE_BLOCKS = envInt('MAX_STORE_BLOCKS', 10_000, 100, 100_000);
 const MAX_STORE_BYTES = envInt('MAX_STORE_MIB', 256, 16, 4096) * 1024 * 1024;
 const MAX_BODY_BYTES = envInt('MAX_REQUEST_BODY_KIB', 64, 4, 1024) * 1024;
 const HTTP_RPM = envInt('HTTP_REQUESTS_PER_MINUTE', 600, 30, 100_000);
 const GRAPHQL_RPM = envInt('GRAPHQL_REQUESTS_PER_MINUTE', 60, 5, 10_000);
+const GLOBAL_HTTP_RPM = envInt('GLOBAL_HTTP_REQUESTS_PER_MINUTE', 30_000, 100, 10_000_000);
+const GLOBAL_GRAPHQL_RPM = envInt('GLOBAL_GRAPHQL_REQUESTS_PER_MINUTE', 3_000, 10, 1_000_000);
+const HTTP_MAX_CONNECTIONS = envInt('HTTP_MAX_CONNECTIONS', 2_000, 10, 100_000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+const REQUIRE_TLS_RELAYS = process.env.REQUIRE_TLS_RELAYS === '1';
+const METRICS_TOKEN = String(process.env.METRICS_TOKEN || '').trim();
+const ROLE = ['all', 'ingest', 'serve'].includes(process.env.EXPLORER_ROLE)
+  ? process.env.EXPLORER_ROLE
+  : 'all';
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -108,23 +121,40 @@ function blockSummary(b) {
 // Build an isolated store/indexer/hub per network. Mainnet's one logical RPC client
 // owns both relay URLs and handles identity checks, failover, and cross-checking.
 const nets = new Map();
+const metrics = new Metrics();
+const wsSharedCapacity = {
+  count: 0,
+  max: envInt('WS_MAX_CLIENTS', 1_000, 10, 100_000),
+};
 for (const [name, config] of Object.entries(NETWORKS)) {
-  const store = new Store({ maxBlocks: MAX_STORE_BLOCKS, maxBytes: MAX_STORE_BYTES });
+  const archive = ARCHIVE_DIR && config.urls.length
+    ? await openArchive(join(ARCHIVE_DIR, `${name}.sqlite`), { readOnly: ROLE === 'serve' })
+    : null;
+  const store = new Store({
+    maxBlocks: MAX_STORE_BLOCKS,
+    maxBytes: MAX_STORE_BYTES,
+    archive,
+  });
   const wsHub = new WsHub({
-    maxClients: envInt('WS_MAX_CLIENTS', 1_000, 10, 100_000),
+    maxClients: envInt('WS_MAX_CLIENTS_PER_NETWORK', 750, 10, 100_000),
     maxPerIp: envInt('WS_MAX_PER_IP', 20, 1, 1_000),
+    sharedCapacity: wsSharedCapacity,
   });
   const rpc = config.urls.length
     ? new SovereignRpc(config.urls, {
         expectedChainId: config.chainId,
         expectedGenesisHash: config.genesisHash,
         timeoutMs: RPC_TIMEOUT_MS,
+        requireTls: REQUIRE_TLS_RELAYS,
+        metrics,
+        networkName: name,
       })
     : null;
   const indexer = rpc
     ? new Indexer(rpc, store, {
         backfill: INDEX_BACKFILL,
         batchSize: INDEX_BATCH,
+        archiveBatchSize: ARCHIVE_BACKFILL_BATCH,
         onBlock: (b) => wsHub.broadcast({ type: 'block', block: blockSummary(b) }),
         onTx: (t) =>
           wsHub.broadcast({
@@ -156,6 +186,7 @@ function send(res, status, body, contentType = 'application/json; charset=utf-8'
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(String(body));
   res.writeHead(status, {
     ...baseHeaders(contentType, opts.cacheControl ?? 'no-store'),
+    ...(opts.headers ?? {}),
     'content-length': payload.length,
   });
   if (opts.head) res.end();
@@ -202,7 +233,9 @@ async function serveStatic(req, res, pathname) {
     const ext = full.slice(full.lastIndexOf('.'));
     send(res, 200, data, CONTENT_TYPES[ext] || 'application/octet-stream', {
       head: req.method === 'HEAD',
-      cacheControl: rel === 'index.html' ? 'no-cache' : 'public, max-age=300',
+      // Unfingerprinted application assets must revalidate so a deployment cannot
+      // pair new HTML/modules with a stale cached app.js or stylesheet.
+      cacheControl: /\.(?:html|js|css)$/.test(rel) ? 'no-cache' : 'public, max-age=300',
     });
   } catch {
     send(res, 404, 'not found', 'text/plain; charset=utf-8');
@@ -212,8 +245,12 @@ async function serveStatic(req, res, pathname) {
 // Small in-process fixed-window limiter. Production deployments should keep the
 // reverse-proxy limit too; this layer prevents a proxy mistake from becoming an
 // unbounded GraphQL/RPC amplifier.
-const rateWindows = new Map();
-let rateRequests = 0;
+const rateGate = new RateGate({
+  clientHttp: HTTP_RPM,
+  clientGraphql: GRAPHQL_RPM,
+  globalHttp: GLOBAL_HTTP_RPM,
+  globalGraphql: GLOBAL_GRAPHQL_RPM,
+});
 function clientIp(req) {
   if (TRUST_PROXY) {
     const forwarded = String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
@@ -223,21 +260,8 @@ function clientIp(req) {
 }
 
 function rateAllowed(req, pathname) {
-  const nowWindow = Math.floor(Date.now() / 60_000);
-  const limit = pathname.startsWith('/graphql/') ? GRAPHQL_RPM : HTTP_RPM;
-  const key = `${clientIp(req)}:${pathname.startsWith('/graphql/') ? 'graphql' : 'http'}`;
-  const current = rateWindows.get(key);
-  const next = !current || current.window !== nowWindow
-    ? { window: nowWindow, count: 1 }
-    : { window: nowWindow, count: current.count + 1 };
-  rateWindows.set(key, next);
-  rateRequests += 1;
-  if (rateRequests % 1_000 === 0) {
-    for (const [entryKey, value] of rateWindows) {
-      if (value.window < nowWindow - 1) rateWindows.delete(entryKey);
-    }
-  }
-  return next.count <= limit;
+  const kind = pathname.startsWith('/graphql/') ? 'graphql' : 'http';
+  return rateGate.allow(clientIp(req), kind);
 }
 
 async function handleRequest(req, res) {
@@ -249,8 +273,18 @@ async function handleRequest(req, res) {
   }
   const pathname = url.pathname;
 
-  if (!rateAllowed(req, pathname)) {
-    return send(res, 429, JSON.stringify({ error: 'rate limit exceeded' }));
+  if (pathname === '/metrics') {
+    if (METRICS_TOKEN && req.headers.authorization !== `Bearer ${METRICS_TOKEN}`) {
+      return send(res, 401, 'unauthorized', 'text/plain; charset=utf-8');
+    }
+    return send(res, 200, metrics.render([...nets.values()]), 'text/plain; version=0.0.4; charset=utf-8');
+  }
+
+  const rate = rateAllowed(req, pathname);
+  if (!rate.allowed) {
+    return send(res, 429, JSON.stringify({ error: 'rate limit exceeded', scope: rate.scope }), undefined, {
+      headers: { 'retry-after': String(rate.retryAfterSeconds) },
+    });
   }
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -264,16 +298,24 @@ async function handleRequest(req, res) {
 
   if (pathname === '/healthz') {
     const requested = url.searchParams.get('network');
+    const requireArchive = url.searchParams.get('archive') === '1';
     const selected = requested ? [nets.get(requested)].filter(Boolean) : [...nets.values()].filter((net) => net.live);
     if (requested && selected.length === 0) {
       return send(res, 404, JSON.stringify({ ok: false, error: 'unknown network' }));
     }
-    const states = Object.fromEntries(selected.map((net) => [net.name, {
-      live: net.live,
-      ready: net.store.ready,
-      phase: net.store.syncPhase,
-    }]));
-    const readyCount = selected.filter((net) => net.live && net.store.ready).length;
+    const states = Object.fromEntries(selected.map((net) => {
+      const archive = net.store.archive?.status(net.store.nodeHeight) ?? { enabled: false };
+      return [net.name, {
+        live: net.live,
+        ready: net.store.ready,
+        phase: net.store.syncPhase,
+        archive,
+      }];
+    }));
+    const readyCount = selected.filter((net) => {
+      const archiveReady = !requireArchive || !!net.store.archive?.status(net.store.nodeHeight).complete;
+      return net.live && net.store.ready && archiveReady;
+    }).length;
     const ok = requested ? readyCount === selected.length : readyCount > 0;
     const degraded = readyCount < selected.filter((net) => net.live).length;
     return send(res, ok ? 200 : 503, JSON.stringify({ ok, degraded, networks: states }));
@@ -288,6 +330,7 @@ async function handleRequest(req, res) {
         live: net.live,
         ready: net.store.ready,
         phase: net.store.syncPhase,
+        archive: net.store.archive?.status(net.store.nodeHeight) ?? { enabled: false },
       }))),
     );
   }
@@ -319,6 +362,7 @@ async function handleRequest(req, res) {
     const rest = await handleRest(req.method, '/api' + sub, url.searchParams, {
       store: net.store,
       rpc: net.rpc,
+      metrics,
     });
     if (rest) return send(res, rest.status, rest.body);
     return send(res, 404, JSON.stringify({ error: 'not found' }));
@@ -328,6 +372,12 @@ async function handleRequest(req, res) {
 }
 
 const server = createServer({ maxHeaderSize: 16 * 1024 }, (req, res) => {
+  const started = performance.now();
+  res.once('finish', () => {
+    let pathname = 'malformed';
+    try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
+    metrics.observeRequest(req.method, routeTemplate(pathname), res.statusCode, performance.now() - started);
+  });
   handleRequest(req, res).catch((error) => {
     if (res.headersSent) return res.destroy();
     const status = Number(error?.status) || 500;
@@ -339,6 +389,7 @@ server.requestTimeout = 15_000;
 server.headersTimeout = 10_000;
 server.keepAliveTimeout = 5_000;
 server.maxRequestsPerSocket = 100;
+server.maxConnections = HTTP_MAX_CONNECTIONS;
 
 server.on('upgrade', (req, socket) => {
   let url;
@@ -349,29 +400,65 @@ server.on('upgrade', (req, socket) => {
   }
   const match = url.pathname.match(/^\/ws\/([a-z0-9-]+)$/);
   const net = match && nets.get(match[1]);
-  if (net?.live) net.wsHub.handleUpgrade(req, socket);
+  if (net?.live) {
+    req.sovClientIp = clientIp(req);
+    net.wsHub.handleUpgrade(req, socket);
+  }
   else socket.destroy();
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`sovereign-explorer: web UI + API on http://${HOST}:${PORT}`);
+async function startRuntime() {
   for (const net of nets.values()) {
     if (net.indexer) {
       const relayCount = net.rpc.status().relays.length;
       console.log(`sovereign-explorer: ${net.name} configured with ${relayCount} pinned relay(s)`);
-      net.indexer.start(1_000);
+      if (ROLE !== 'serve') net.indexer.start(1_000);
+      else {
+        // A serve-only replica tails the durable archive written by the ingest
+        // process. It retains direct read RPC access but never advances ingestion.
+        await net.indexer.init();
+        const refresh = async () => {
+          const records = net.store.archive?.recentBlocks(net.store.maxBlocks).reverse() ?? [];
+          for (const record of records) {
+            if (!net.store.block(record.height)) net.store.addBlock(record, { persist: false });
+          }
+          const head = await net.rpc.height().catch(() => net.store.tipHeight);
+          net.store.setSyncStatus({ nodeHeight: head, ready: net.store.tipHeight >= 0, syncing: false, phase: 'serving-archive' });
+        };
+        await refresh();
+        net.serveTimer = setInterval(refresh, 1_000);
+        net.serveTimer.unref();
+      }
     } else {
       console.log(`sovereign-explorer: ${net.name} disabled (no relay configured)`);
     }
   }
-});
+}
+
+if (ROLE === 'ingest') {
+  if (!ARCHIVE_DIR) throw new Error('EXPLORER_ROLE=ingest requires ARCHIVE_DIR');
+  console.log('sovereign-explorer: ingest-only role (public HTTP disabled)');
+  await startRuntime();
+} else {
+  if (ROLE === 'serve' && !ARCHIVE_DIR) throw new Error('EXPLORER_ROLE=serve requires ARCHIVE_DIR');
+  server.listen(PORT, HOST, () => {
+    console.log(`sovereign-explorer: web UI + API on http://${HOST}:${PORT} (${ROLE})`);
+    startRuntime().catch((error) => {
+      console.error(`sovereign-explorer: startup failed: ${error.message}`);
+      shutdown();
+    });
+  });
+}
 
 function shutdown() {
   for (const net of nets.values()) {
     net.indexer?.stop();
+    if (net.serveTimer) clearInterval(net.serveTimer);
     net.wsHub.stop();
+    net.store.archive?.close();
   }
-  server.close(() => process.exit(0));
+  if (server.listening) server.close(() => process.exit(0));
+  else process.exit(0);
   setTimeout(() => process.exit(1), 5_000).unref();
 }
 process.once('SIGINT', shutdown);

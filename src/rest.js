@@ -29,9 +29,13 @@ function safeDecode(value) {
   }
 }
 
-async function cachedHistory(key, load) {
+async function cachedHistory(key, load, metrics = null) {
   const existing = historyCache.get(key);
-  if (existing && existing.expires > Date.now()) return existing.value;
+  if (existing && existing.expires > Date.now()) {
+    metrics?.observeCache(true);
+    return existing.value;
+  }
+  metrics?.observeCache(false);
   const value = await load();
   historyCache.set(key, { expires: Date.now() + HISTORY_CACHE_TTL_MS, value });
   while (historyCache.size > HISTORY_CACHE_MAX) {
@@ -73,11 +77,26 @@ function digestSummary(height, d, tip) {
   };
 }
 
+function blockListSummary(block, tip) {
+  return {
+    height: block.height,
+    hash: block.hash,
+    proposer: block.proposer,
+    txCount: block.txCount ?? block.transactions?.length ?? 0,
+    coinbase: block.coinbase ?? null,
+    timestampMs: block.timestampMs,
+    stateRoot: block.stateRoot ?? null,
+    txRoot: block.txRoot ?? null,
+    receiptsRoot: block.receiptsRoot ?? null,
+    final: finalAtDepth(tip, block.height),
+  };
+}
+
 export async function handleRest(method, pathname, query, ctx) {
   if (!pathname.startsWith('/api/')) return null;
   if (method !== 'GET') return json(405, { error: 'GET only' });
 
-  const { store, rpc } = ctx;
+  const { store, rpc, metrics } = ctx;
   const parts = pathname.split('/').filter(Boolean); // ['api', <sub>, <arg>]
   const sub = parts[1];
   const arg = parts[2] !== undefined ? safeDecode(parts[2]) : undefined;
@@ -101,16 +120,20 @@ export async function handleRest(method, pathname, query, ctx) {
           ? Math.max(0, Math.min(Math.trunc(startRaw), tip))
           : tip;
         const heights = Array.from({ length: Math.min(limit, start + 1) }, (_, i) => start - i);
-        const key = `${store.genesisHash}:${start}:${limit}`;
+        // The head participates in the key because list summaries contain derived
+        // finality. Finalized historical pages are then immutable for this head.
+        const key = `${store.genesisHash}:${tip}:${start}:${limit}`;
         const out = await cachedHistory(key, async () => {
           const rows = await mapBatches(heights, 8, async (h) => {
             const local = store.block(h);
-            if (local) return local;
+            if (local) return blockListSummary(local, tip);
+            const archived = store.archive?.block(h);
+            if (archived) return blockListSummary(archived, tip);
             const d = await rpc.blockDigest(h).catch(() => null);
             return d ? digestSummary(h, d, tip) : null;
           });
           return rows.filter(Boolean);
-        });
+        }, metrics);
         return json(200, out);
       }
 
@@ -126,8 +149,10 @@ export async function handleRest(method, pathname, query, ctx) {
         if (typeof ref === 'string' && !HASH_RE.test(ref)) {
           return json(400, { error: 'invalid block hash' });
         }
-        const block = store.block(ref);
-        if (block) return json(200, block);
+        const block = store.block(ref) ?? store.archive?.block(ref);
+        if (block) {
+          return json(200, { ...block, final: finalAtDepth(store.tipHeight, block.height) });
+        }
         // Outside the retained window, load the full body and digest as one
         // same-relay pair. This keeps old permalinks complete without retaining the
         // entire chain in memory or mixing a body from one relay with another's id.
@@ -144,8 +169,11 @@ export async function handleRest(method, pathname, query, ctx) {
           if (!pair) return null;
           if (typeof ref === 'string' && String(pair.digest.hash).toLowerCase() !== ref) return null;
           return normalizeBlock(pair.block, pair.digest, finalAtDepth(store.tipHeight, height));
-        });
-        if (historical) return json(200, historical);
+        }, metrics);
+        if (historical) {
+          store.archive?.putBlock(historical);
+          return json(200, historical);
+        }
         return json(404, { error: 'block not found on the chain' });
       }
 
@@ -153,7 +181,7 @@ export async function handleRest(method, pathname, query, ctx) {
         if (!arg) return json(400, { error: 'missing transaction id' });
         const id = arg.toLowerCase();
         if (!HASH_RE.test(id)) return json(400, { error: 'invalid transaction id' });
-        let tx = store.tx(id);
+        let tx = store.tx(id) ?? store.archive?.transaction(id);
         if (!tx) {
           // Not in the indexed window. If the node holds a RECEIPT for this id,
           // the transaction IS on-chain — pull its block and lift the record out,
@@ -168,6 +196,7 @@ export async function handleRest(method, pathname, query, ctx) {
                 pair.digest,
                 finalAtDepth(store.tipHeight, r.height),
               );
+              store.archive?.putBlock(rec);
               tx = rec.transactions.find((t) => t.id === id) ?? null;
             }
           }
@@ -184,6 +213,33 @@ export async function handleRest(method, pathname, query, ctx) {
         const receipt = await rpc.receipt(tx.id).catch(() => null);
         const confirmations = confirmationCount(store.tipHeight, tx.blockHeight);
         return json(200, { ...tx, receipt, confirmations, final: finalAtDepth(store.tipHeight, tx.blockHeight) });
+      }
+
+      case 'inclusion-proof': {
+        if (!arg || !HASH_RE.test(arg)) return json(400, { error: 'invalid transaction id' });
+        const id = arg.toLowerCase();
+        const tx = store.tx(id) ?? store.archive?.transaction(id);
+        const receipt = await rpc.receipt(id).catch(() => null);
+        const height = tx?.blockHeight ?? receipt?.height;
+        if (!Number.isSafeInteger(height) || height < 0) return json(404, { error: 'transaction not found on the chain' });
+        const block = store.block(height) ?? store.archive?.block(height);
+        const pair = block ? null : await blockPair(rpc, height).catch(() => null);
+        const header = block ?? (pair ? normalizeBlock(pair.block, pair.digest, finalAtDepth(store.tipHeight, height)) : null);
+        if (!header) return json(502, { error: 'block header unavailable' });
+        const [transactionProof, receiptProof] = await Promise.all([
+          rpc.transactionProof(id).catch(() => null),
+          rpc.receiptProof(id).catch(() => null),
+        ]);
+        return json(200, {
+          transactionId: id,
+          blockHeight: height,
+          blockHash: header.hash,
+          txRoot: header.txRoot,
+          receiptsRoot: header.receiptsRoot,
+          transactionProof,
+          receiptProof,
+          supported: { transaction: !!transactionProof, receipt: !!receiptProof },
+        });
       }
 
       case 'account': {
@@ -204,7 +260,20 @@ export async function handleRest(method, pathname, query, ctx) {
         }
         // SNS names that resolve to this account (reverse lookup).
         const names = await rpc.namesOf(id).catch(() => []);
-        return json(200, { id, resolvedFrom, account, names, transactions: store.accountTxs(id, 50) });
+        const archiveStatus = store.archive?.status(store.nodeHeight) ?? null;
+        const transactions = store.archive
+          ? store.archive.accountTransactions(id, 50)
+          : store.accountTxs(id, 50);
+        return json(200, {
+          id,
+          resolvedFrom,
+          account,
+          names,
+          transactions,
+          historyFromHeight: archiveStatus?.contiguousFromHeight
+            ?? (Number.isFinite(store.minHeight) ? store.minHeight : null),
+          historyComplete: archiveStatus?.complete ?? false,
+        });
       }
 
       // Sovereign Name Service: a page of registered names. Live from the node so
@@ -264,6 +333,7 @@ export async function handleRest(method, pathname, query, ctx) {
           cryptography: store.cryptographyStats(),
           privacy: { supply: store.supply, shieldedInfo: store.shieldedInfo },
           commitments: { deterministicEmpty: roots(empty), latestNonEmpty: roots(nonEmpty) },
+          archive: stats.archive,
         });
       }
 
@@ -271,8 +341,13 @@ export async function handleRest(method, pathname, query, ctx) {
         const raw = query.get('q') ?? '';
         if (raw.length > 256) return json(400, { error: 'search query is too long' });
         const result = store.search(raw);
+        if (result.kind === 'block' && !result.known && store.archive?.block(result.ref)) {
+          return json(200, { ...result, known: true });
+        }
         // An unknown 0x-hash may be an older block outside our window — ask the node.
         if (result.kind === 'hash') {
+          const archived = store.archive?.lookupHash(result.ref);
+          if (archived) return json(200, archived);
           const blk = await rpc.blockByHash(result.ref).catch(() => null);
           if (blk) return json(200, { kind: 'block', ref: blk.header.height, known: true });
         }

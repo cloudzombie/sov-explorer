@@ -63,6 +63,7 @@ export class Indexer {
     // process restart replay thousands of blocks before it can become useful.
     this.backfill = opts.backfill ?? 640;
     this.batchSize = Math.max(1, Math.min(32, opts.batchSize ?? 8));
+    this.archiveBatchSize = Math.max(1, Math.min(64, opts.archiveBatchSize ?? 16));
     this.finalityWindow = opts.finalityWindow ?? 64;
     this.finalityDepth = opts.finalityDepth ?? 6;
     this.liveCatchupThreshold = opts.liveCatchupThreshold ?? 3;
@@ -73,6 +74,7 @@ export class Indexer {
     this._running = false;
     this._timer = null;
     this._lastStatsAt = 0;
+    this._archiveRestored = false;
   }
 
   /** Learn the chain id and genesis hash before the first sync. */
@@ -81,6 +83,19 @@ export class Indexer {
     this.store.chainId = await this.rpc.chainId();
     const g = await this.rpc.blockDigest(0);
     if (g) this.store.genesisHash = g.hash;
+    if (this.store.archive) {
+      const identity = this.store.archive.ensureIdentity(this.store.chainId, this.store.genesisHash);
+      if (identity.cleared && this.store.tipHeight >= 0) {
+        this.store.reset({ clearArchive: false });
+        this.store.chainId = await this.rpc.chainId();
+        this.store.genesisHash = g?.hash ?? null;
+      }
+      if (!this._archiveRestored && this.store.tipHeight < 0) {
+        const records = this.store.archive.recentBlocks(this.store.maxBlocks).reverse();
+        for (const record of records) this.store.addBlock(record, { persist: false });
+      }
+      this._archiveRestored = true;
+    }
     this.store.setSyncStatus({
       phase: 'bootstrap',
       relays: typeof this.rpc.status === 'function' ? this.rpc.status() : null,
@@ -185,6 +200,7 @@ export class Indexer {
     // the live chain's genesis so we never serve stale blocks.
     if (await this.chainWasReset(head)) {
       this.store.reset();
+      this._archiveRestored = false;
       await this.init();
       if (this.onReset) this.onReset();
     }
@@ -222,6 +238,48 @@ export class Indexer {
       relays,
       lastError: null,
     });
+
+    if (this.store.archive) {
+      try {
+        await this.backfillArchive(head);
+        this.store.archiveError = null;
+      } catch (error) {
+        this.store.archiveError = error?.message ?? String(error);
+        if (process?.env?.DEBUG) console.error('[archive]', this.store.archiveError);
+      }
+    }
+  }
+
+  /** Fill one older archive batch without expanding the bounded hot Store. */
+  async backfillArchive(head) {
+    const archive = this.store.archive;
+    if (!archive) return;
+    const status = archive.status(head);
+    const floor = status.contiguousFromHeight;
+    if (status.blocks === 0 || floor === null || floor <= 0) return;
+    const to = floor - 1;
+    const from = Math.max(0, to - this.archiveBatchSize + 1);
+    const records = [];
+    for (let start = from; start <= to; start += this.batchSize) {
+      const end = Math.min(to, start + this.batchSize - 1);
+      records.push(...await Promise.all(
+        Array.from({ length: end - start + 1 }, (_, i) => this.fetchBlock(start + i, head)),
+      ));
+    }
+    if (records.some((record) => !record)) {
+      throw new Error(`relay did not return archive range ${from}..${to}`);
+    }
+    for (let i = 1; i < records.length; i++) {
+      if (comparableHash(records[i].prevHash) !== comparableHash(records[i - 1].hash)) {
+        throw new Error(`non-canonical archive range at block ${records[i].height}`);
+      }
+    }
+    const next = archive.block(floor);
+    const last = records.at(-1);
+    if (next && comparableHash(next.prevHash) !== comparableHash(last.hash)) {
+      throw new Error(`archive range ${from}..${to} does not join block ${next.height}`);
+    }
+    archive.putBlocks(records);
   }
 
   /** Re-check finality for the most recent not-yet-final blocks. */

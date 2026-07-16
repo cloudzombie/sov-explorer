@@ -43,9 +43,11 @@ export function transactionCrypto(tx) {
 }
 
 export class Store {
-  constructor({ maxBlocks = 10_000, maxBytes = 256 * 1024 * 1024 } = {}) {
+  constructor({ maxBlocks = 10_000, maxBytes = 256 * 1024 * 1024, archive = null } = {}) {
     this.maxBlocks = Math.max(1, maxBlocks);
     this.maxBytes = Math.max(1, maxBytes);
+    this.archive = archive;
+    this.archiveError = null;
     this._statsVersion = 0;
     this._statsCache = null;
     this.chainId = null;
@@ -57,6 +59,7 @@ export class Store {
     this.syncStartHeight = null;
     this.syncTargetHeight = null;
     this.lastIndexedAt = null;
+    this.archiveError = null;
     this.lastError = null;
     this.relayStatus = null;
     this.tipHeight = -1;
@@ -90,7 +93,8 @@ export class Store {
    * when the node's chain is replaced (a regenesis) or rolls back below our tip —
    * the old blocks describe a dead chain and must not be served. `chainId` and
    * `genesisHash` are refreshed by the indexer's `init()` right after. */
-  reset() {
+  reset({ clearArchive = true } = {}) {
+    if (clearArchive) this.archive?.clearChainData();
     this.tipHeight = -1;
     this.minHeight = Infinity;
     this.blocksByHeight.clear();
@@ -132,7 +136,8 @@ export class Store {
   }
 
   /** Insert (or replace, e.g. on a finality refresh) a normalized block record. */
-  addBlock(rec) {
+  addBlock(rec, { persist = true } = {}) {
+    if (persist) this.archive?.putBlock(rec);
     const existing = this.blocksByHeight.has(rec.height);
     this.blocksByHeight.set(rec.height, rec);
     this.heightByHash.set(rec.hash, rec.height);
@@ -483,6 +488,9 @@ export class Store {
         error: this.lastError,
       },
       relays: this.relayStatus,
+      archive: this.archive
+        ? { ...this.archive.status(this.nodeHeight), error: this.archiveError }
+        : { enabled: false, error: null },
     };
     this._statsCache = { at: now, version: this._statsVersion, value };
     return value;

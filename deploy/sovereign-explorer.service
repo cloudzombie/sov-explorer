@@ -3,14 +3,14 @@
 # Install:
 #   sudo useradd --system --create-home --home-dir /opt/sov-explorer explorer  # or reuse
 #   sudo git clone https://github.com/cloudzombie/sov-explorer /opt/sov-explorer/app
-#   # edit the RPC env vars below to point at your nodes, then:
+#   sudo install -m 0600 deploy/sov-explorer.env.example /etc/sov-explorer.env
+#   # Provision the TLS relay names and edit /etc/sov-explorer.env, then:
 #   sudo cp /opt/sov-explorer/app/deploy/sovereign-explorer.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now sovereign-explorer
 #   journalctl -u sovereign-explorer -f
 #
-# Holds no authoritative state (indexes on boot), so Restart=always is safe. Bind it
-# to loopback and publish through a TLS reverse proxy with its own request/connection
-# limits; the process also enforces bounded requests as a second line of defense.
+# The archive is durable but derived entirely from identity-pinned relays, so it can
+# be rebuilt. Bind to loopback and publish through the supplied TLS reverse proxy.
 
 [Unit]
 Description=Sovereign block explorer
@@ -23,17 +23,24 @@ Type=simple
 User=explorer
 Group=explorer
 WorkingDirectory=/opt/sov-explorer/app
+ExecStartPre=/usr/bin/node -e "const [a,b]=process.versions.node.split('.').map(Number);if(a<24||(a===24&&b<15)){console.error('Node 24.15+ required');process.exit(1)}"
 ExecStart=/usr/bin/node src/server.js
 
-# Which networks to index. Point these at your nodes. Set
-# SOVEREIGN_<NETWORK>_DISABLED=1 in the env file to disable one explicitly.
 Environment=PORT=8730
 Environment=HOST=127.0.0.1
-Environment=SOVEREIGN_TESTNET_RPCS=http://159.203.109.204:8645
-Environment="SOVEREIGN_MAINNET_RPCS=http://64.225.10.34:8645,http://137.184.83.91:8645"
+Environment=ARCHIVE_DIR=/var/lib/sovereign-explorer
+Environment=ARCHIVE_BACKFILL_BATCH=16
+Environment=REQUIRE_TLS_RELAYS=1
 Environment=TRUST_PROXY=1
-# Optional local overrides without editing the unit:
-EnvironmentFile=-/etc/sov-explorer.env
+Environment=HTTP_REQUESTS_PER_MINUTE=600
+Environment=GRAPHQL_REQUESTS_PER_MINUTE=60
+Environment=GLOBAL_HTTP_REQUESTS_PER_MINUTE=30000
+Environment=GLOBAL_GRAPHQL_REQUESTS_PER_MINUTE=3000
+Environment=HTTP_MAX_CONNECTIONS=2000
+Environment=WS_MAX_CLIENTS=1000
+Environment=WS_MAX_CLIENTS_PER_NETWORK=750
+# Required: the explorer fails closed until real HTTPS relay endpoints are supplied.
+EnvironmentFile=/etc/sov-explorer.env
 
 Restart=always
 RestartSec=3
@@ -59,6 +66,8 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 LockPersonality=true
 UMask=0077
+StateDirectory=sovereign-explorer
+StateDirectoryMode=0700
 LimitNOFILE=65536
 TasksMax=128
 MemoryHigh=640M

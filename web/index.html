@@ -10,7 +10,8 @@
       name="description"
       content="Block explorer for Sovereign. Live blocks, transactions, accounts, miners, supply, mempool, and Nakamoto finality, read directly from a node."
     />
-    <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/style.css?v=2" />
+    <link rel="stylesheet" href="/features.css?v=2" />
   </head>
   <body>
     <a class="skip-link" href="#view">Skip to chain data</a>
@@ -46,6 +47,7 @@
         <a href="#/validity">Finality</a>
         <a href="https://faucet.sovxus.org" target="_blank" rel="noopener noreferrer" class="nav-faucet" title="Free mainnet XUS — USA only">Faucet 🇺🇸</a>
       </nav>
+      <div class="export-tools" id="export-tools" aria-label="Export current table" hidden><button type="button" class="data-export" data-format="csv">CSV</button><button type="button" class="data-export" data-format="json">JSON</button></div>
 
       <div class="netsw" id="netsw" role="group" aria-label="Network">
         <button type="button" data-net="testnet" aria-pressed="false">Testnet</button>
@@ -74,6 +76,6 @@
       <span id="foot-chain"></span>
     </footer>
 
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="/app.js?v=2"></script>
   </body>
 </html>
