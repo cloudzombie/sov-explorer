@@ -6,6 +6,12 @@
 const GRAINS_PER_XUS = 100_000_000n; // 8 decimals
 const SUPPLY_CAP_GRAINS = 21_000_000n * GRAINS_PER_XUS;
 
+// A miner in the node registry (sov_getMiners) counts as ACTIVE if it produced a block
+// within this many blocks of the current tip — i.e. it is mining now, not merely seen
+// once in chain history. At the 150s target this window is ~1.25h, so a home rig or a
+// laptop that just found a block shows up as active and drops off when it goes idle.
+const ACTIVE_MINER_WINDOW_BLOCKS = 30;
+
 /** The account a transaction touches besides its signer, if any. */
 export function txCounterparty(action) {
   if (!action || typeof action !== 'object') return null;
@@ -332,6 +338,23 @@ export class Store {
     return this.observedMiners();
   }
 
+  /**
+   * How many miners in the node registry are ACTIVE — produced a block within
+   * `ACTIVE_MINER_WINDOW_BLOCKS` of the current tip. Distinct from `miners.length`
+   * (every miner ever seen) and from the relay count (infrastructure nodes). This is
+   * the number that rises when the home rig or a laptop starts mining and falls when
+   * they go idle. Returns null when the tip or registry isn't known yet.
+   */
+  _activeMinerCount() {
+    if (!Array.isArray(this.miners) || this.miners.length === 0) return null;
+    if (!Number.isFinite(this.tipHeight) || this.tipHeight < 0) return null;
+    const cutoff = this.tipHeight - ACTIVE_MINER_WINDOW_BLOCKS;
+    return this.miners.reduce((n, m) => {
+      const seen = Number(m?.lastSeenHeight);
+      return n + (Number.isFinite(seen) && seen >= cutoff ? 1 : 0);
+    }, 0);
+  }
+
   recordSupply(supply, height) {
     this.supply = supply;
     this._touchStats();
@@ -452,6 +475,7 @@ export class Store {
       indexedFromHeight: Number.isFinite(this.minHeight) ? this.minHeight : null,
       minersObserved: this.proposers.size,
       miners: this.miners.length,
+      minersActive: this._activeMinerCount(),
       mempoolSize: this.mempoolSize,
       supply: this.supply,
       difficulty: this.difficulty,
@@ -461,6 +485,8 @@ export class Store {
         marketDominance: null,
         blockchainSizeBytes: this.totalBlockBytesIndexed,
         networkNodes: this.miners.length || null,
+        minersSeen: this.miners.length || null,
+        minersActive: this._activeMinerCount(),
         difficulty: this.difficulty?.sha256d ?? null,
         // The PoW seal actually in force (RandomX on mainnet, SHA-256d on dev/test) —
         // reported by the node's sov_getDifficulty `algo`, not assumed.

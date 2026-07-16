@@ -304,6 +304,13 @@ async function renderOverview(routeId) {
   const relayText = relay.healthy !== undefined
     ? `${fmtNum(relay.healthy)}/${fmtNum(relay.verified)} relays${relay.consistent === false ? ' · disagreement' : relay.degraded ? ' · degraded' : ' · consistent'}`
     : 'relay status pending';
+  // Active miners = registry entries that mined near the tip (the home rig / laptop /
+  // Windows machine appear here when they mine). Distinct from relays and from all
+  // miners ever seen. Its own chip so it reads at a glance.
+  const minersActive = all.minersActive;
+  const minersText = minersActive === null || minersActive === undefined
+    ? 'miners pending'
+    : `${fmtNum(minersActive)} active miner${minersActive === 1 ? '' : 's'}`;
   setView(`
     <section class="hero-strip">
       <div>
@@ -315,6 +322,7 @@ async function renderOverview(routeId) {
         <span>${fmtNum(s.blocksIndexed)} indexed blocks</span>
         ${s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : ''}
         <span class="relay-pill ${relay.degraded ? 'degraded' : ''}">${esc(relayText)}</span>
+        <span class="miners-pill ${minersActive ? '' : 'idle'}">${esc(minersText)}</span>
       </div>
     </section>
 
@@ -326,7 +334,9 @@ async function renderOverview(routeId) {
         ${statItem('Market cap', fmtUsd(all.marketCapUsd), 'price feed not configured')}
         ${statItem('Market dominance', all.marketDominance === null || all.marketDominance === undefined ? '—' : pct(all.marketDominance), 'market feed not configured')}
         ${statItem('Blockchain size', fmtBytes(all.blockchainSizeBytes), 'indexed window')}
-        ${statItem('Network nodes', all.networkNodes === null || all.networkNodes === undefined ? '—' : fmtNum(all.networkNodes), 'miner registry entries')}
+        ${statItem('Active miners', all.minersActive === null || all.minersActive === undefined ? '—' : fmtNum(all.minersActive), 'mined a block near the tip')}
+        ${statItem('Miners seen', (all.minersSeen ?? all.networkNodes) == null ? '—' : fmtNum(all.minersSeen ?? all.networkNodes), 'all-time miner registry')}
+        ${statItem('Relays', relay.verified === undefined ? '—' : fmtNum(relay.verified), 'pinned infrastructure nodes')}
         ${statItem('Difficulty', all.difficulty === null || all.difficulty === undefined ? '—' : esc(fmtNum(all.difficulty)), esc(all.difficultyAlgo === 'Sha256d' ? 'SHA-256d' : (all.difficultyAlgo || 'PoW')))}
       </section>
 

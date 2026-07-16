@@ -561,6 +561,16 @@ h3 {
   color: var(--warn);
 }
 
+.hero-meta .miners-pill {
+  border-color: rgba(110, 168, 254, 0.38);
+  color: var(--accent, #6ea8fe);
+}
+
+.hero-meta .miners-pill.idle {
+  border-color: rgba(148, 163, 184, 0.32);
+  color: var(--muted, #94a3b8);
+}
+
 .stat-columns {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
