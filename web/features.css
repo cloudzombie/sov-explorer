@@ -5,3 +5,18 @@
 .proof-check { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
 .ok-text { color: var(--green); } .warn-text { color: var(--yellow); }
 @media (max-width: 900px) { .export-tools { order: 8; } }
+.tx-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: .75rem; align-items: end; margin-bottom: 1rem; }
+.tx-filters label { display: grid; gap: .35rem; color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
+.tx-filters input, .tx-filters select { min-width: 0; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--text); padding: .55rem; }
+.tx-filters button { border: 1px solid var(--blue); border-radius: 5px; background: var(--blue); color: white; padding: .58rem; cursor: pointer; }
+.watch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+.watch-card { display: grid; gap: .7rem; }
+.watch-card h2, .watch-card p { margin: 0; }
+.watch-balance { font-size: 1.35rem; font-weight: 700; }
+.proof-check.unavailable { border-color: var(--line); }
+.object-summary { display: grid; gap: 1.5rem; }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+.section-heading h2 { margin-bottom: .6rem; }
+.break { overflow-wrap: anywhere; word-break: break-word; }
+.not-found { max-width: 620px; margin: 4rem auto; text-align: center; }
+.not-found .es-code { color: var(--blue); font: 700 3rem/1 var(--mono, monospace); }

@@ -11,25 +11,40 @@ export class Metrics {
     this.requests = new Map();
     this.requestSeconds = new Map();
     this.upstreamErrors = new Map();
+    this.apiAccess = new Map();
     this.cache = { hit: 0, miss: 0 };
   }
 
   observeRequest(method, route, status, elapsedMs) {
     const key = `${method}\0${route}\0${status}`;
-    this.requests.set(key, (this.requests.get(key) ?? 0) + 1);
+    this._increment(this.requests, key, 256);
     const timingKey = `${method}\0${route}`;
-    const timing = this.requestSeconds.get(timingKey) ?? { count: 0, sum: 0 };
+    const boundedTimingKey = this.requestSeconds.has(timingKey) || this.requestSeconds.size < 128
+      ? timingKey
+      : 'overflow\0overflow';
+    const timing = this.requestSeconds.get(boundedTimingKey) ?? { count: 0, sum: 0 };
     timing.count += 1;
     timing.sum += elapsedMs / 1000;
-    this.requestSeconds.set(timingKey, timing);
+    this.requestSeconds.set(boundedTimingKey, timing);
   }
 
   observeUpstream(network, method) {
     const key = `${network}\0${method}`;
-    this.upstreamErrors.set(key, (this.upstreamErrors.get(key) ?? 0) + 1);
+    this._increment(this.upstreamErrors, key, 64);
+  }
+
+  _increment(map, key, max) {
+    const boundedKey = map.has(key) || map.size < max ? key : 'overflow';
+    map.set(boundedKey, (map.get(boundedKey) ?? 0) + 1);
   }
 
   observeCache(hit) { this.cache[hit ? 'hit' : 'miss'] += 1; }
+
+  observeApiAccess(tier, outcome) {
+    const safeTier = ['anonymous', 'pro', 'enterprise'].includes(tier) ? tier : 'unknown';
+    const safeOutcome = ['standard', 'paid', 'rejected'].includes(outcome) ? outcome : 'unknown';
+    this._increment(this.apiAccess, `${safeTier}\0${safeOutcome}`, 16);
+  }
 
   render(nets = []) {
     const lines = [
@@ -61,6 +76,12 @@ export class Metrics {
       const [network, method] = key.split('\0');
       lines.push(`sovereign_explorer_upstream_errors_total{network="${labelValue(network)}",method="${labelValue(method)}"} ${value}`);
     }
+    lines.push('# HELP sovereign_explorer_api_access_total API tier authorization outcomes.');
+    lines.push('# TYPE sovereign_explorer_api_access_total counter');
+    for (const [key, value] of this.apiAccess) {
+      const [tier, outcome] = key.split('\0');
+      lines.push(`sovereign_explorer_api_access_total{tier="${labelValue(tier)}",outcome="${labelValue(outcome)}"} ${value}`);
+    }
     for (const net of nets) {
       const stats = net.store.stats();
       const labels = `network="${labelValue(net.name)}"`;
@@ -75,7 +96,15 @@ export class Metrics {
 }
 
 export function routeTemplate(pathname) {
-  if (pathname === '/' || /^\/[a-z.-]+$/.test(pathname)) return pathname;
+  const fixed = new Set([
+    '/', '/app.js', '/tools.js', '/style.css', '/features.css', '/favicon.svg',
+    '/healthz', '/metrics', '/networks', '/robots.txt', '/openapi.json',
+  ]);
+  if (fixed.has(pathname)) return pathname;
+  if (/^\/api\/v1\/[a-z0-9-]+\//.test(pathname)) {
+    const [, , version, , endpoint] = pathname.split('/');
+    return `/api/${version}/:network/${endpoint || ''}`;
+  }
   if (/^\/api\/[a-z0-9-]+\//.test(pathname)) {
     const [, , network, endpoint] = pathname.split('/');
     return `/api/${network}/${endpoint || ''}`;

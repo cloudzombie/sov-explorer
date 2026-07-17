@@ -17,9 +17,13 @@ function clamp(v, lo, hi, dflt) {
 
 const HASH_RE = /^0x[0-9a-f]{64}$/i;
 const ACCOUNT_RE = /^[a-z0-9._-]{1,128}$/i;
+const ACTION_TYPE_RE = /^[a-z][a-z0-9_]{0,63}$/;
+const OBJECT_KINDS = new Set(['token', 'nft', 'contract', 'htlc']);
+const TOKEN_ID_RE = /^[0-9a-f]{0,1024}$/i;
 const HISTORY_CACHE_TTL_MS = 15_000;
 const HISTORY_CACHE_MAX = 100;
 const historyCache = new Map();
+const capabilityCache = new Map();
 
 function safeDecode(value) {
   try {
@@ -27,6 +31,67 @@ function safeDecode(value) {
   } catch {
     return null;
   }
+}
+
+function compactAction(action) {
+  if (!action || typeof action !== 'object') return null;
+  const omitted = new Set(['bundle', 'code', 'preimage', 'proof', 'witness']);
+  return Object.fromEntries(Object.entries(action).filter(([key, value]) => (
+    !omitted.has(key) && !(Array.isArray(value) && value.length > 32)
+  )));
+}
+
+function transactionSummary(tx) {
+  return {
+    id: tx.id,
+    index: tx.index,
+    signer: tx.signer,
+    action: compactAction(tx.action),
+    actionType: tx.action?.type ?? null,
+    executionStatus: tx.executionStatus ?? tx.receipt?.status?.status ?? tx.receipt?.status ?? null,
+    blockHeight: tx.blockHeight,
+    blockHash: tx.blockHash,
+    timestampMs: tx.timestampMs,
+    sizeBytes: tx.sizeBytes,
+  };
+}
+
+function mergeActivity(...groups) {
+  const byId = new Map();
+  for (const tx of groups.flat()) {
+    if (tx?.id) byId.set(tx.id, tx);
+  }
+  return [...byId.values()]
+    .sort((a, b) => (b.blockHeight - a.blockHeight) || ((b.index ?? 0) - (a.index ?? 0)))
+    .map(transactionSummary);
+}
+
+function indexedObjectSummary(object) {
+  if (!object) return null;
+  return {
+    kind: object.kind,
+    id: object.id,
+    owner: object.owner,
+    label: object.label,
+    status: object.status,
+    createdHeight: object.createdHeight ?? object.blockHeight,
+    updatedHeight: object.updatedHeight,
+    creation: object.createdTransaction ? transactionSummary(object.createdTransaction) : null,
+    latestAction: compactAction(object.action),
+  };
+}
+
+function encodeCursor(tx) {
+  return Buffer.from(JSON.stringify([tx.blockHeight, tx.index ?? 0, tx.id])).toString('base64url');
+}
+
+function decodeCursor(value) {
+  if (!value) return null;
+  try {
+    const [height, index, id] = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+    if (!Number.isSafeInteger(height) || height < 0 || !Number.isSafeInteger(index) || index < 0 || !HASH_RE.test(id)) return null;
+    return { height, index, id: id.toLowerCase() };
+  } catch { return null; }
 }
 
 async function cachedHistory(key, load, metrics = null) {
@@ -97,10 +162,13 @@ export async function handleRest(method, pathname, query, ctx) {
   if (method !== 'GET') return json(405, { error: 'GET only' });
 
   const { store, rpc, metrics } = ctx;
+  const maxPageLimit = ['pro', 'enterprise'].includes(ctx.apiTier) ? 200 : 50;
   const parts = pathname.split('/').filter(Boolean); // ['api', <sub>, <arg>]
   const sub = parts[1];
   const arg = parts[2] !== undefined ? safeDecode(parts[2]) : undefined;
   if (parts[2] !== undefined && arg === null) return json(400, { error: 'malformed URL encoding' });
+  const extra = parts[3] !== undefined ? safeDecode(parts.slice(3).join('/')) : undefined;
+  if (parts[3] !== undefined && extra === null) return json(400, { error: 'malformed URL encoding' });
 
   try {
     switch (sub) {
@@ -112,7 +180,7 @@ export async function handleRest(method, pathname, query, ctx) {
         // ones (outside the retained window) are fetched from the node on demand, so
         // the page walks all the way back to genesis on a long chain. `?before=<height>`
         // sets the cursor (omit for the latest page); `?limit` bounds the page.
-        const limit = clamp(query.get('limit'), 1, 100, 25);
+        const limit = clamp(query.get('limit'), 1, maxPageLimit, 25);
         const tip = store.tipHeight;
         const beforeRaw = query.get('before');
         const startRaw = beforeRaw !== null && beforeRaw !== '' ? Number(beforeRaw) : tip;
@@ -138,7 +206,158 @@ export async function handleRest(method, pathname, query, ctx) {
       }
 
       case 'txs':
-        return json(200, store.recentTxs(clamp(query.get('limit'), 1, 200, 25)));
+        return json(200, store.recentTxs(clamp(query.get('limit'), 1, maxPageLimit, 25)).map(transactionSummary));
+
+      case 'transactions': {
+        const limit = clamp(query.get('limit'), 1, maxPageLimit, 50);
+        const cursorRaw = query.get('cursor');
+        const cursor = decodeCursor(cursorRaw);
+        if (cursorRaw && !cursor) return json(400, { error: 'invalid transaction cursor' });
+        const actionType = String(query.get('action') ?? '').trim().toLowerCase();
+        if (actionType && !ACTION_TYPE_RE.test(actionType)) return json(400, { error: 'invalid action filter' });
+        const status = String(query.get('status') ?? '').trim().toLowerCase();
+        if (status && !['success', 'failed'].includes(status)) return json(400, { error: 'invalid status filter' });
+        const account = String(query.get('account') ?? '').trim();
+        if (account && !ACCOUNT_RE.test(account)) return json(400, { error: 'invalid account filter' });
+        const intFilter = (name) => {
+          const raw = query.get(name);
+          if (raw === null || raw === '') return null;
+          const value = Number(raw);
+          return Number.isSafeInteger(value) && value >= 0 ? value : NaN;
+        };
+        const minHeight = intFilter('minHeight');
+        const maxHeight = intFilter('maxHeight');
+        const fromMs = intFilter('fromMs');
+        const toMs = intFilter('toMs');
+        if ([minHeight, maxHeight, fromMs, toMs].some(Number.isNaN)) return json(400, { error: 'invalid numeric transaction filter' });
+        let records;
+        let hasMore = false;
+        if (store.archive) {
+          ({ records, hasMore } = store.archive.transactionPage({
+            limit, cursor, actionType: actionType || null, status: status || null,
+            account: account || null, minHeight, maxHeight, fromMs, toMs,
+          }));
+        } else {
+          records = store.recentTxs(200).filter((tx) => (
+            (!actionType || tx.action?.type === actionType)
+            && (!status || (tx.executionStatus ?? tx.receipt?.status?.status ?? tx.receipt?.status) === status)
+            && (!account || tx.signer === account)
+            && (minHeight === null || tx.blockHeight >= minHeight)
+            && (maxHeight === null || tx.blockHeight <= maxHeight)
+            && (fromMs === null || tx.timestampMs >= fromMs)
+            && (toMs === null || tx.timestampMs <= toMs)
+          )).slice(0, limit);
+        }
+        return json(200, {
+          items: records.map(transactionSummary),
+          nextCursor: hasMore && records.length ? encodeCursor(records.at(-1)) : null,
+          historyComplete: store.archive?.status(store.nodeHeight).complete ?? false,
+        });
+      }
+
+      case 'catalog': {
+        const kind = String(query.get('kind') ?? '').toLowerCase();
+        if (!OBJECT_KINDS.has(kind)) return json(400, { error: 'kind must be token, nft, contract, or htlc' });
+        const offset = clamp(query.get('offset'), 0, 1_000_000_000, 0);
+        const limit = clamp(query.get('limit'), 1, maxPageLimit, 50);
+        if (kind === 'token' && typeof rpc.listTokens === 'function') {
+          const page = await rpc.listTokens(offset, limit);
+          return json(200, {
+            kind,
+            items: (page?.tokens ?? []).map((item) => ({ kind, id: item.asset, ...item, status: 'active' })),
+            offset,
+            limit,
+            hasMore: !!page?.hasMore,
+          });
+        }
+        if (kind === 'nft' && typeof rpc.listNfts === 'function') {
+          const page = await rpc.listNfts(offset, limit);
+          return json(200, {
+            kind,
+            items: (page?.nfts ?? []).map((item) => ({
+              kind, id: `${item.collection}:${item.tokenId}`, collection: item.collection,
+              tokenId: item.tokenId, tokenText: item.tokenText, owner: item.owner,
+              mintedHeight: item.mintedHeight, status: 'minted',
+            })),
+            offset,
+            limit,
+            hasMore: !!page?.hasMore,
+          });
+        }
+        const items = store.archive?.objects(kind, limit + 1, offset) ?? [];
+        return json(200, {
+          kind,
+          items: items.slice(0, limit).map(indexedObjectSummary),
+          offset,
+          limit,
+          hasMore: items.length > limit,
+        });
+      }
+
+      case 'object': {
+        const kind = String(arg ?? '').toLowerCase();
+        const id = extra;
+        if (!OBJECT_KINDS.has(kind)) return json(400, { error: 'invalid object kind' });
+        if (!id) return json(400, { error: 'missing object id' });
+        const archive = store.archive;
+        if (kind === 'token') {
+          if (!HASH_RE.test(id)) return json(400, { error: 'invalid token asset id' });
+          const state = typeof rpc.tokenInfo === 'function' ? await rpc.tokenInfo(id).catch(() => null) : null;
+          const indexed = archive?.object(kind, id);
+          if (!state && !indexed) return json(404, { error: 'token not found on the chain' });
+          const issuance = state
+            ? archive?.object(kind, `issue:${state.issuer}:${state.symbol}`)?.activity ?? []
+            : [];
+          return json(200, {
+            kind, id: id.toLowerCase(), state, indexed: indexedObjectSummary(indexed),
+            activity: mergeActivity(indexed?.activity ?? [], issuance),
+          });
+        }
+        if (kind === 'nft') {
+          const separator = id.indexOf(':');
+          const collection = separator > 0 ? id.slice(0, separator) : '';
+          const tokenId = separator > 0 ? id.slice(separator + 1) : '';
+          if (!HASH_RE.test(collection) || !TOKEN_ID_RE.test(tokenId)) return json(400, { error: 'invalid NFT id' });
+          const [state, collectionState] = await Promise.all([
+            typeof rpc.nft === 'function' ? rpc.nft(collection, tokenId).catch(() => null) : null,
+            typeof rpc.nftClass === 'function' ? rpc.nftClass(collection).catch(() => null) : null,
+          ]);
+          const indexed = archive?.object(kind, id);
+          if (!state && !indexed) return json(404, { error: 'NFT not found on the chain' });
+          const mint = collectionState
+            ? archive?.object(kind, `mint:${collectionState.issuer}:${collectionState.symbol}:${tokenId}`)?.activity ?? []
+            : [];
+          return json(200, {
+            kind, id: id.toLowerCase(), collection, tokenId, state, collectionState,
+            indexed: indexedObjectSummary(indexed),
+            activity: mergeActivity(indexed?.activity ?? [], mint),
+          });
+        }
+        if (kind === 'contract') {
+          if (!ACCOUNT_RE.test(id)) return json(400, { error: 'invalid contract account' });
+          const [state, indexed] = await Promise.all([
+            typeof rpc.account === 'function' ? rpc.account(id).catch(() => null) : null,
+            Promise.resolve(archive?.object(kind, id)),
+          ]);
+          if (!indexed && !state?.code) return json(404, { error: 'contract not found on the chain' });
+          return json(200, {
+            kind, id, state, indexed: indexedObjectSummary(indexed),
+            activity: mergeActivity(indexed?.activity ?? []),
+            events: indexed?.events ?? [],
+          });
+        }
+        if (!HASH_RE.test(id)) return json(400, { error: 'invalid HTLC id' });
+        const [state, indexed] = await Promise.all([
+          typeof rpc.htlc === 'function' ? rpc.htlc(id).catch(() => null) : null,
+          Promise.resolve(archive?.object(kind, id)),
+        ]);
+        if (!state && !indexed) return json(404, { error: 'HTLC not found on the chain' });
+        return json(200, {
+          kind, id: id.toLowerCase(), state, indexed: indexedObjectSummary(indexed),
+          status: indexed?.status ?? (state ? 'locked' : 'unknown'),
+          activity: mergeActivity(indexed?.activity ?? []),
+        });
+      }
 
       case 'block': {
         if (arg === undefined) return json(400, { error: 'missing block reference' });
@@ -210,7 +429,7 @@ export async function handleRest(method, pathname, query, ctx) {
         // Enrich with the live execution receipt (success / exact failure reason,
         // gas, contract events) and depth-derived confirmations — both are real
         // chain data read from the node, not stored copies.
-        const receipt = await rpc.receipt(tx.id).catch(() => null);
+        const receipt = await rpc.receipt(tx.id).catch(() => null) ?? tx.receipt ?? null;
         const confirmations = confirmationCount(store.tipHeight, tx.blockHeight);
         return json(200, { ...tx, receipt, confirmations, final: finalAtDepth(store.tipHeight, tx.blockHeight) });
       }
@@ -242,6 +461,35 @@ export async function handleRest(method, pathname, query, ctx) {
         });
       }
 
+      case 'capabilities': {
+        const key = store.genesisHash ?? 'unknown';
+        const cached = capabilityCache.get(key);
+        if (cached && cached.expires > Date.now()) return json(200, cached.value);
+        const latest = store.latestTransaction();
+        let transactionProof = null;
+        let receiptProof = null;
+        if (latest?.id) {
+          [transactionProof, receiptProof] = await Promise.all([
+            typeof rpc.transactionProof === 'function' ? rpc.transactionProof(latest.id).catch(() => null) : null,
+            typeof rpc.receiptProof === 'function' ? rpc.receiptProof(latest.id).catch(() => null) : null,
+          ]);
+        }
+        const algorithms = [...new Set(
+          [transactionProof?.algorithm, receiptProof?.algorithm].filter(Boolean).map((x) => String(x).toLowerCase()),
+        )];
+        const value = {
+          proofs: {
+            transaction: !!transactionProof,
+            receipt: !!receiptProof,
+            algorithms,
+            browserVerifiable: !!transactionProof && !!receiptProof
+              && algorithms.length > 0 && algorithms.every((algorithm) => algorithm === 'sha256'),
+          },
+        };
+        capabilityCache.set(key, { expires: Date.now() + 5 * 60_000, value });
+        return json(200, value);
+      }
+
       case 'account': {
         if (!arg) return json(400, { error: 'missing account' });
         if (!ACCOUNT_RE.test(arg)) return json(400, { error: 'invalid account or name' });
@@ -258,18 +506,35 @@ export async function handleRest(method, pathname, query, ctx) {
             account = await rpc.account(id).catch(() => null);
           }
         }
-        // SNS names that resolve to this account (reverse lookup).
-        const names = await rpc.namesOf(id).catch(() => []);
+        // Reverse indexes are live state: names, native-token holdings, and NFTs.
+        const [names, tokenBalances, nfts] = await Promise.all([
+          rpc.namesOf(id).catch(() => []),
+          typeof rpc.tokenBalances === 'function' ? rpc.tokenBalances(id, 0, 100).catch(() => []) : [],
+          typeof rpc.nftsOf === 'function' ? rpc.nftsOf(id, 0, 100).catch(() => []) : [],
+        ]);
         const archiveStatus = store.archive?.status(store.nodeHeight) ?? null;
-        const transactions = store.archive
-          ? store.archive.accountTransactions(id, 50)
-          : store.accountTxs(id, 50);
+        const limit = clamp(query.get('limit'), 1, maxPageLimit, 50);
+        const cursorRaw = query.get('cursor');
+        const cursor = decodeCursor(cursorRaw);
+        if (cursorRaw && !cursor) return json(400, { error: 'invalid account-history cursor' });
+        let transactions;
+        let hasMore = false;
+        if (store.archive) {
+          const page = store.archive.transactionPage({ account: id, limit, cursor });
+          transactions = page.records;
+          hasMore = page.hasMore;
+        } else {
+          transactions = store.accountTxs(id, limit).map((tx) => tx);
+        }
         return json(200, {
           id,
           resolvedFrom,
           account,
           names,
-          transactions,
+          tokenBalances,
+          nfts,
+          transactions: transactions.map(transactionSummary),
+          nextCursor: hasMore && transactions.length ? encodeCursor(transactions.at(-1)) : null,
           historyFromHeight: archiveStatus?.contiguousFromHeight
             ?? (Number.isFinite(store.minHeight) ? store.minHeight : null),
           historyComplete: archiveStatus?.complete ?? false,
@@ -280,7 +545,7 @@ export async function handleRest(method, pathname, query, ctx) {
       // it reflects the current registry. Params: ?offset & ?limit.
       case 'names': {
         const offset = clamp(query.get('offset'), 0, 1e9, 0);
-        const limit = clamp(query.get('limit'), 1, 200, 100);
+        const limit = clamp(query.get('limit'), 1, maxPageLimit, 50);
         return json(200, await rpc.listNames(offset, limit));
       }
 

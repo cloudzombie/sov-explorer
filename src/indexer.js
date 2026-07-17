@@ -125,7 +125,16 @@ export class Indexer {
     // from the already cross-checked head avoids an extra RPC call for every backfill
     // block (thousands of requests on a cold start).
     const final = finalAtDepth(head, height, this.finalityDepth);
-    return normalizeBlock(block, digest, final);
+    const record = normalizeBlock(block, digest, final);
+    if (typeof this.rpc.receipt === 'function' && record.transactions.length) {
+      await Promise.all(record.transactions.map(async (tx) => {
+        const receipt = await this.rpc.receipt(tx.id).catch(() => null);
+        if (!receipt) return;
+        tx.receipt = receipt;
+        tx.executionStatus = receipt.status?.status ?? receipt.status ?? null;
+      }));
+    }
+    return record;
   }
 
   /** Commit one normalized record and optionally announce it as genuinely live. */
@@ -248,6 +257,17 @@ export class Indexer {
         if (process?.env?.DEBUG) console.error('[archive]', this.store.archiveError);
       }
     }
+    await this.backfillExecutionStatuses();
+  }
+
+  async backfillExecutionStatuses() {
+    const archive = this.store.archive;
+    if (!archive?.missingExecutionStatus || typeof this.rpc.receipt !== 'function') return;
+    const ids = archive.missingExecutionStatus(16);
+    await Promise.all(ids.map(async (id) => {
+      const receipt = await this.rpc.receipt(id).catch(() => null);
+      if (receipt) archive.updateTransactionReceipt(id, receipt);
+    }));
   }
 
   /** Fill one older archive batch without expanding the bounded hot Store. */

@@ -23,6 +23,7 @@ function transaction(height, index = 0) {
     blockHeight: height,
     blockHash: hx(height + 1),
     timestampMs: 1_000 + height,
+    executionStatus: 'success',
   };
 }
 
@@ -75,6 +76,23 @@ test('SQLite archive persists blocks, transactions, account history, and search 
   assert.deepEqual(archive.lookupHash(transaction(1).id), {
     kind: 'tx', ref: transaction(1).id, known: true,
   });
+  const firstPage = archive.transactionPage({ limit: 1, actionType: 'transfer' });
+  assert.equal(firstPage.records.length, 1);
+  assert.equal(firstPage.hasMore, true);
+  assert.equal(firstPage.records[0].executionStatus, 'success');
+  const cursorTx = firstPage.records[0];
+  const secondPage = archive.transactionPage({
+    limit: 1,
+    cursor: { height: cursorTx.blockHeight, index: cursorTx.index, id: cursorTx.id },
+    account: 'bob.sovereign',
+    status: 'success',
+    minHeight: 0,
+    maxHeight: 2,
+    fromMs: 1_000,
+    toMs: 2_000,
+  });
+  assert.equal(secondPage.records.length, 1);
+  assert.equal(secondPage.records[0].blockHeight, 0);
 
   const status = archive.status(2);
   assert.equal(status.blocks, 3);
@@ -95,6 +113,43 @@ test('an on-demand historical island cannot redirect contiguous genesis backfill
   assert.equal(status.contiguousFromHeight, 3, 'coverage truth follows the head-connected tail');
   assert.equal(status.contiguous, false);
   assert.equal(status.complete, false);
+});
+
+test('archive indexes token, NFT, contract, and HTLC object activity', async (t) => {
+  const { archive } = await tempArchive(t);
+  const asset = hx(700);
+  const collection = hx(800);
+  const lockId = hx(900);
+  const actions = [
+    { type: 'token_issue', symbol: 'USD1', amount: '1000', to: 'holder.sovereign' },
+    { type: 'token_transfer', asset, amount: '25', to: 'buyer.sovereign' },
+    { type: 'token_burn', asset, amount: '5' },
+    { type: 'nft_mint', symbol: 'ART', token_id: [1, 2], to: 'collector.sovereign', metadata: [9] },
+    { type: 'nft_transfer', collection, token_id: [1, 2], to: 'buyer.sovereign' },
+    { type: 'deploy', code: [0, 97, 115, 109] },
+    { type: 'call', contract: 'contract.sovereign', gas_limit: 1000, calldata: [] },
+    { type: 'htlc_lock', recipient: 'swap.sovereign', amount: '42', hashlock: hx(901), timeout_height: 99 },
+    { type: 'htlc_claim', htlc_id: lockId, preimage: [1, 2, 3] },
+  ];
+  const transactions = actions.map((action, index) => ({
+    ...transaction(10, index),
+    id: index === 7 ? lockId : hx(910 + index),
+    signer: index === 5 ? 'contract.sovereign' : 'alice.sovereign',
+    action,
+    receipt: index === 6 ? { status: { status: 'success' }, events: [{ topic: [1], data: [2] }] } : undefined,
+  }));
+  archive.putBlock({ ...block(10, false), txCount: transactions.length, transactions });
+
+  assert.equal(archive.object('token', asset).activity.length, 2);
+  assert.equal(archive.matchingObjectActivity('token', {
+    signer: 'alice.sovereign', symbol: 'USD1',
+  })[0].action.type, 'token_issue');
+  assert.equal(archive.object('nft', `${collection}:0102`).owner, 'buyer.sovereign');
+  assert.equal(archive.object('contract', 'contract.sovereign').events.length, 1);
+  assert.equal(archive.object('htlc', lockId).status, 'claimed');
+  assert.equal(archive.object('htlc', lockId).activity.length, 2);
+  assert.equal(archive.accountTransactions('buyer.sovereign', 10).length, 2);
+  assert.deepEqual(archive.objectCounts(), { contract: 1, htlc: 1, nft: 2, token: 2 });
 });
 
 test('SQLite archive survives restart and clears records on chain identity mismatch', async (t) => {

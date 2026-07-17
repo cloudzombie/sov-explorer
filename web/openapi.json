@@ -1,0 +1,82 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Sovereign Explorer API",
+    "version": "1.0.0",
+    "description": "Read-only, archive-backed Sovereign chain data. Versioned routes use /api/v1/{network}; legacy /api/{network} routes remain compatible. Anonymous reads allow limit <= 50, offset <= 500, block ranges <= 100000 heights, and time ranges <= 366 days. GraphQL and requests beyond that envelope require a paid API key; paid REST limits are capped at 200.",
+    "x-api-tiers": {
+      "anonymous": { "maximumLimit": 50, "maximumOffset": 500 },
+      "pro": { "maximumLimit": 200, "maximumOffset": 1000000000, "authentication": ["X-API-Key", "Bearer"] },
+      "enterprise": { "maximumLimit": 200, "maximumOffset": 1000000000, "authentication": ["X-API-Key", "Bearer"] }
+    }
+  },
+  "servers": [
+    { "url": "https://sovxus.org", "description": "Production explorer" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "paidApiKey": { "type": "apiKey", "in": "header", "name": "X-API-Key" },
+      "paidBearer": { "type": "http", "scheme": "bearer" }
+    },
+    "parameters": {
+      "network": { "name": "network", "in": "path", "required": true, "schema": { "type": "string", "enum": ["mainnet", "testnet"] } },
+      "limit": { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }, "description": "Values above the anonymous limit require a paid API key." }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message", "requestId"],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" },
+              "requestId": { "type": "string", "format": "uuid" },
+              "paidAccessRequired": { "type": "boolean" },
+              "details": { "type": "object", "additionalProperties": true }
+            }
+          }
+        }
+      },
+      "TransactionPage": { "type": "object", "required": ["items", "historyComplete"], "properties": { "items": { "type": "array", "items": { "type": "object" } }, "nextCursor": { "type": ["string", "null"] }, "historyComplete": { "type": "boolean" } } },
+      "CatalogPage": { "type": "object", "required": ["kind", "items", "hasMore"], "properties": { "kind": { "type": "string" }, "items": { "type": "array", "items": { "type": "object" } }, "offset": { "type": "integer" }, "limit": { "type": "integer" }, "hasMore": { "type": "boolean" } } }
+    },
+    "responses": {
+      "ValidationError": { "description": "A parameter is malformed or outside the hard service bounds.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Unauthorized": { "description": "The supplied API key is invalid, inactive, expired, or conflicts with another credential.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "PaymentRequired": { "description": "The request is outside the anonymous envelope and requires a paid API key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "RateLimited": { "description": "The IP or paid-key quota is exhausted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    }
+  },
+  "paths": {
+    "/api/v1/{network}/status": {
+      "get": { "summary": "Explorer and chain status", "parameters": [{ "$ref": "#/components/parameters/network" }], "responses": { "200": { "description": "Current status" } } }
+    },
+    "/api/v1/{network}/blocks": {
+      "get": { "summary": "Newest-first block page", "parameters": [{ "$ref": "#/components/parameters/network" }, { "$ref": "#/components/parameters/limit" }, { "name": "before", "in": "query", "schema": { "type": "integer", "minimum": 0 } }], "responses": { "200": { "description": "Block summaries" } } }
+    },
+    "/api/v1/{network}/block/{reference}": {
+      "get": { "summary": "Block by height or hash", "parameters": [{ "$ref": "#/components/parameters/network" }, { "name": "reference", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Normalized block" }, "404": { "description": "Not found" } } }
+    },
+    "/api/v1/{network}/transactions": {
+      "get": { "summary": "Cursor-paginated transaction archive", "parameters": [{ "$ref": "#/components/parameters/network" }, { "$ref": "#/components/parameters/limit" }, { "name": "cursor", "in": "query", "schema": { "type": "string" } }, { "name": "action", "in": "query", "schema": { "type": "string" } }, { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["success", "failed"] } }, { "name": "account", "in": "query", "schema": { "type": "string" } }, { "name": "minHeight", "in": "query", "schema": { "type": "integer" } }, { "name": "maxHeight", "in": "query", "schema": { "type": "integer" } }], "responses": { "200": { "description": "Transaction page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransactionPage" } } } }, "400": { "$ref": "#/components/responses/ValidationError" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "402": { "$ref": "#/components/responses/PaymentRequired" }, "429": { "$ref": "#/components/responses/RateLimited" } } }
+    },
+    "/api/v1/{network}/tx/{id}": {
+      "get": { "summary": "Transaction and execution receipt", "parameters": [{ "$ref": "#/components/parameters/network" }, { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Transaction detail" }, "404": { "description": "Not mined or unknown" } } }
+    },
+    "/api/v1/{network}/account/{id}": {
+      "get": { "summary": "Account state, holdings, and paginated activity", "parameters": [{ "$ref": "#/components/parameters/network" }, { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }, { "$ref": "#/components/parameters/limit" }, { "name": "cursor", "in": "query", "schema": { "type": "string" } }], "responses": { "200": { "description": "Account detail" } } }
+    },
+    "/api/v1/{network}/catalog": {
+      "get": { "summary": "Token, NFT, contract, or HTLC catalog", "parameters": [{ "$ref": "#/components/parameters/network" }, { "name": "kind", "in": "query", "required": true, "schema": { "type": "string", "enum": ["token", "nft", "contract", "htlc"] } }, { "$ref": "#/components/parameters/limit" }, { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }], "responses": { "200": { "description": "Catalog page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CatalogPage" } } } }, "400": { "$ref": "#/components/responses/ValidationError" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "402": { "$ref": "#/components/responses/PaymentRequired" }, "429": { "$ref": "#/components/responses/RateLimited" } } }
+    },
+    "/api/v1/{network}/object/{kind}/{id}": {
+      "get": { "summary": "Chain-object state and archived activity", "parameters": [{ "$ref": "#/components/parameters/network" }, { "name": "kind", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Object detail" }, "404": { "description": "Not found" } } }
+    },
+    "/api/v1/{network}/proof": {
+      "get": { "summary": "Relay, consensus, cryptography, privacy, and archive evidence", "parameters": [{ "$ref": "#/components/parameters/network" }], "responses": { "200": { "description": "Explorer proof bundle" } } }
+    }
+  }
+}

@@ -427,6 +427,17 @@ export class SovereignRpc {
   miners() { return this.call('sov_getMiners'); }
   mempoolSize() { return this.call('sov_getMempoolSize'); }
 
+  listTokens(offset = 0, limit = 100) { return this.call('sov_listTokens', { offset, limit }); }
+  tokenInfo(asset) { return this.call('sov_getTokenInfo', { hash: asset }); }
+  tokenBalances(account, offset = 0, limit = 100) {
+    return this.call('sov_getTokenBalances', { account, offset, limit });
+  }
+  htlc(id) { return this.call('sov_getHtlc', { hash: id }); }
+  listNfts(offset = 0, limit = 100) { return this.call('sov_listNfts', { offset, limit }); }
+  nftClass(collection) { return this.call('sov_getNftClass', { collection }); }
+  nft(collection, tokenId) { return this.call('sov_getNft', { collection, tokenId }); }
+  nftsOf(account, offset = 0, limit = 100) { return this.call('sov_nftsOf', { account, offset, limit }); }
+
   listNames(offset = 0, limit = 100) { return this.call('sov_listNames', { offset, limit }); }
   resolveName(name) { return this.call('sov_resolveName', { name }); }
   getName(name) { return this.call('sov_getName', { name }); }

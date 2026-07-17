@@ -1,9 +1,21 @@
 // Sovereign Explorer — single-page UI. Hash-routed, fetches the REST API, and follows
 // a WebSocket live feed. All values shown are real chain data served by the node.
-import { downloadRows, explainAction, isWatched, toggleWatch, verifyMerkleProof } from './tools.js';
+import { downloadRows, explainAction, isWatched, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
 
 const $ = (id) => document.getElementById(id);
 const view = $('view');
+const DEFAULT_DESCRIPTION = 'Independent live explorer for Sovereign blocks, transactions, accounts, assets, contracts, HTLCs, and Nakamoto finality.';
+
+function setPageMeta(title, description = DEFAULT_DESCRIPTION) {
+  const fullTitle = title ? `${title} — Sovereign Explorer` : 'Sovereign Explorer';
+  document.title = fullTitle;
+  $('meta-description')?.setAttribute('content', description);
+  $('og-title')?.setAttribute('content', fullTitle);
+  $('og-description')?.setAttribute('content', description);
+  $('og-url')?.setAttribute('content', location.href);
+  $('twitter-title')?.setAttribute('content', fullTitle);
+  $('twitter-description')?.setAttribute('content', description);
+}
 
 // ---- formatting -----------------------------------------------------------
 
@@ -133,7 +145,7 @@ async function switchNet(net) {
   if (ticker) ticker.hidden = true;
   if (tickerItems) tickerItems.replaceChildren();
   localStorage.setItem('sov-net-v2', net);
-  document.title = `Sovereign Explorer — ${net}`;
+  setPageMeta(net);
   setNetToggleUI();
   connectWs();
   await route().catch((e) => errView(e.message));
@@ -152,7 +164,7 @@ async function loadNetworks() {
     NET = NET === 'mainnet' ? 'testnet' : 'mainnet';
     localStorage.setItem('sov-net-v2', NET);
   }
-  document.title = `Sovereign Explorer — ${NET}`;
+  setPageMeta(NET);
   setNetToggleUI();
   for (const b of document.querySelectorAll('#netsw button')) {
     b.addEventListener('click', () => switchNet(b.dataset.net));
@@ -172,7 +184,8 @@ async function api(path) {
   const res = await fetch('/api/' + NET + path);
   if (!res.ok) {
     const e = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(e.error || `HTTP ${res.status}`);
+    const message = typeof e.error === 'object' ? e.error?.message : e.error;
+    throw new Error(message || `HTTP ${res.status}`);
   }
   return res.json();
 }
@@ -186,6 +199,10 @@ function setView(html, routeId = null) {
 }
 function errView(msg, routeId = null) {
   setView(`<div class="empty">⚠ ${esc(msg)}<br /><span class="dim">Is a Sovereign node running and reachable?</span></div>`, routeId);
+}
+function renderNotFound(message = 'That explorer page does not exist.', routeId = null) {
+  setPageMeta('Not found', message);
+  setView(`<div class="panel empty-state not-found"><div class="es-code">404</div><h1>Not found</h1><p>${esc(message)}</p><p><a class="pager-btn" href="#/">Return to overview</a></p></div>`, routeId);
 }
 
 // ---- live view hooks ------------------------------------------------------
@@ -214,6 +231,7 @@ const blockLink = (h) => `<a href="#/block/${encodeURIComponent(h)}" class="mono
 const blockHashLink = (hash) => `<a href="#/block/${encodeURIComponent(hash)}" class="mono">${esc(shortHash(hash))}</a>`;
 const txLink = (id) => `<a href="#/tx/${encodeURIComponent(id)}" class="mono">${esc(shortHash(id))}</a>`;
 const acctLink = (a) => `<a href="#/account/${encodeURIComponent(a)}" class="mono">${esc(a)}</a>`;
+const objectLink = (kind, id, label = shortHash(id)) => `<a href="#/object/${encodeURIComponent(kind)}/${encodeURIComponent(id)}" class="mono">${esc(label)}</a>`;
 // Like acctLink but abbreviates a long implicit id (a35755d3…4c1e24); short
 // human names (founder.tax.sov) are left whole.
 const acctLinkShort = (a) =>
@@ -236,17 +254,17 @@ function actionSummary(action) {
     case 'token_issue':
       return `<b>${fmtCoin(action.amount)}</b> ${esc(action.symbol)} · to ${acctLink(action.to)}`;
     case 'token_transfer':
-      return `asset ${esc(shortHash(action.asset, 8, 6))} → ${acctLink(action.to)} · <b>${fmtCoin(action.amount)}</b>`;
+      return `asset ${objectLink('token', action.asset, shortHash(action.asset, 8, 6))} → ${acctLink(action.to)} · <b>${fmtCoin(action.amount)}</b>`;
     case 'token_burn':
-      return `asset ${esc(shortHash(action.asset, 8, 6))} · <b>${fmtCoin(action.amount)}</b>`;
+      return `asset ${objectLink('token', action.asset, shortHash(action.asset, 8, 6))} · <b>${fmtCoin(action.amount)}</b>`;
     case 'shielded':
       return `shielded bundle (${fmtBytes((action.bundle || []).length)})`;
     case 'htlc_lock':
       return `HTLC lock → ${acctLink(action.recipient)} · <b>${fmtCoin(action.amount)}</b> ${COIN_SYMBOL}`;
     case 'htlc_claim':
-      return `HTLC claim ${esc(shortHash(action.htlc_id, 8, 6))}`;
+      return `HTLC claim ${objectLink('htlc', action.htlc_id, shortHash(action.htlc_id, 8, 6))}`;
     case 'htlc_refund':
-      return `HTLC refund ${esc(shortHash(action.htlc_id, 8, 6))}`;
+      return `HTLC refund ${objectLink('htlc', action.htlc_id, shortHash(action.htlc_id, 8, 6))}`;
     case 'call':
       return `→ ${acctLink(action.contract)} · gas ${fmtNum(action.gas_limit)}`;
     case 'deploy':
@@ -260,12 +278,18 @@ function actionSummary(action) {
     case 'nft_mint':
       return `mint NFT in <b>${esc(action.symbol)}</b> → ${acctLink(action.to)}`;
     case 'nft_transfer':
-      return `NFT → ${acctLink(action.to)}`;
+      return `NFT ${objectLink('nft', `${action.collection}:${bytesHex(action.token_id)}`, shortHash(bytesHex(action.token_id), 8, 6))} → ${acctLink(action.to)}`;
     case 'nft_set_meta':
-      return `set NFT metadata`;
+      return `set NFT ${objectLink('nft', `${action.collection}:${bytesHex(action.token_id)}`, shortHash(bytesHex(action.token_id), 8, 6))} metadata`;
     default:
       return '';
   }
+}
+
+function bytesHex(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value.replace(/^0x/, '').toLowerCase();
+  return Array.from(value, (byte) => Number(byte).toString(16).padStart(2, '0')).join('');
 }
 function finalBadge(final) {
   return final
@@ -474,6 +498,172 @@ function blocksListRow(b) {
     <td>${finalBadge(b.final)}</td></tr>`;
 }
 
+const TX_ACTION_TYPES = [
+  'transfer', 'token_issue', 'token_transfer', 'token_burn', 'shielded',
+  'htlc_lock', 'htlc_claim', 'htlc_refund', 'call', 'deploy',
+  'claim_vesting', 'register_name', 'transfer_name', 'nft_mint',
+  'nft_transfer', 'nft_set_meta',
+];
+
+function transactionListRow(tx) {
+  const status = tx.executionStatus
+    ? `<span class="badge ${tx.executionStatus === 'success' ? 'ok' : 'fail'}">${esc(tx.executionStatus)}</span>`
+    : '<span class="dim">—</span>';
+  return `<tr><td>${txLink(tx.id)}</td><td>${actionBadge(tx.action)}</td><td>${status}</td><td>${acctLinkShort(tx.signer)}</td><td>${actionSummary(tx.action)}</td><td>${blockLink(tx.blockHeight)}</td><td class="time">${fmtDateTime(tx.timestampMs)}</td></tr>`;
+}
+
+async function renderTransactions(params, routeId) {
+  setView('<div class="loading">Loading transactions…</div>', routeId);
+  const query = new URLSearchParams(params);
+  query.set('limit', '50');
+  const page = await api(`/transactions?${query}`);
+  const items = page.items ?? [];
+  const selected = (name, value) => query.get(name) === value ? ' selected' : '';
+  const filterValue = (name) => esc(query.get(name) ?? '');
+  const next = page.nextCursor
+    ? `<a class="pager-btn" href="#/transactions?${new URLSearchParams({ ...Object.fromEntries(query), cursor: page.nextCursor, limit: '50' })}">Older ▶</a>`
+    : '<span class="pager-btn is-disabled">Older ▶</span>';
+  const committed = setView(`
+    <h1>Transactions</h1>
+    <form class="tx-filters panel" id="tx-filters">
+      <label>Action<select name="action"><option value="">All actions</option>${TX_ACTION_TYPES.map((type) => `<option value="${type}"${selected('action', type)}>${esc(type)}</option>`).join('')}</select></label>
+      <label>Status<select name="status"><option value="">Any status</option><option value="success"${selected('status', 'success')}>Success</option><option value="failed"${selected('status', 'failed')}>Failed</option></select></label>
+      <label>Account<input name="account" value="${filterValue('account')}" placeholder="account or name" /></label>
+      <label>From block<input name="minHeight" type="number" min="0" value="${filterValue('minHeight')}" /></label>
+      <label>To block<input name="maxHeight" type="number" min="0" value="${filterValue('maxHeight')}" /></label>
+      <label>From date<input name="fromDate" type="date" /></label>
+      <label>To date<input name="toDate" type="date" /></label>
+      <button type="submit">Apply filters</button><a class="pager-btn" href="#/transactions">Clear</a>
+    </form>
+    <div class="panel"><table><thead><tr><th>Tx</th><th>Action</th><th>Status</th><th>Signer</th><th>Detail</th><th>Block</th><th>Date</th></tr></thead><tbody>${items.map(transactionListRow).join('') || emptyRow(7)}</tbody></table></div>
+    <div class="pager"><span class="pager-info">${page.historyComplete ? 'Complete archived history' : 'Indexed history only'}</span>${next}</div>
+  `, routeId);
+  if (!committed) return;
+  window.__sovExport = { name: `${NET}-transactions`, rows: items };
+  $('export-tools').hidden = false;
+  const form = $('tx-filters');
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const values = new FormData(form);
+    const out = new URLSearchParams();
+    for (const name of ['action', 'status', 'account', 'minHeight', 'maxHeight']) {
+      const value = String(values.get(name) ?? '').trim();
+      if (value) out.set(name, value);
+    }
+    const fromDate = String(values.get('fromDate') ?? '');
+    const toDate = String(values.get('toDate') ?? '');
+    if (fromDate) out.set('fromMs', String(new Date(`${fromDate}T00:00:00Z`).getTime()));
+    if (toDate) out.set('toMs', String(new Date(`${toDate}T23:59:59.999Z`).getTime()));
+    location.hash = `#/transactions${out.size ? `?${out}` : ''}`;
+  });
+}
+
+const OBJECT_KINDS = ['token', 'nft', 'contract', 'htlc'];
+const OBJECT_LABELS = { token: 'Tokens', nft: 'NFTs', contract: 'Contracts', htlc: 'HTLCs' };
+
+function catalogRow(kind, item) {
+  if (kind === 'token') return `<tr><td>${objectLink(kind, item.id, item.symbol || shortHash(item.id))}</td><td>${acctLinkShort(item.issuer)}</td><td class="right num">${fmtCoin(item.supply)}</td><td class="right num">${fmtCoin(item.burned)}</td></tr>`;
+  if (kind === 'nft') return `<tr><td>${objectLink(kind, item.id, item.tokenText || shortHash(item.tokenId, 10, 6))}</td><td>${objectLink('nft', item.id, shortHash(item.collection, 8, 6))}</td><td>${acctLinkShort(item.owner)}</td><td class="right">#${fmtNum(item.mintedHeight)}</td></tr>`;
+  return `<tr><td>${objectLink(kind, item.id)}</td><td>${item.status ? `<span class="badge act">${esc(item.status)}</span>` : '<span class="dim">—</span>'}</td><td>${item.owner ? acctLinkShort(item.owner) : '<span class="dim">—</span>'}</td><td class="right">${blockLink(item.updatedHeight ?? item.blockHeight)}</td></tr>`;
+}
+
+function catalogTable(kind, items) {
+  const headings = kind === 'token'
+    ? '<th>Symbol / asset</th><th>Issuer</th><th class="right">Supply</th><th class="right">Burned</th>'
+    : kind === 'nft'
+      ? '<th>Token</th><th>Collection</th><th>Owner</th><th class="right">Minted</th>'
+      : '<th>Object</th><th>Status</th><th>Owner</th><th class="right">Latest block</th>';
+  return `<div class="panel"><table><thead><tr>${headings}</tr></thead><tbody>${items.map((item) => catalogRow(kind, item)).join('') || emptyRow(4)}</tbody></table></div>`;
+}
+
+async function renderAssets(params, routeId) {
+  setView('<div class="loading">Loading chain objects…</div>', routeId);
+  const selected = params.get('kind');
+  const kind = OBJECT_KINDS.includes(selected) ? selected : null;
+  const offset = Math.max(0, Number(params.get('offset')) || 0);
+  if (kind) {
+    const page = await api(`/catalog?kind=${kind}&offset=${offset}&limit=50`);
+    const newer = offset > 0 ? `<a class="pager-btn" href="#/assets?kind=${kind}&offset=${Math.max(0, offset - 50)}">◀ Newer</a>` : '<span class="pager-btn is-disabled">◀ Newer</span>';
+    const older = page.hasMore ? `<a class="pager-btn" href="#/assets?kind=${kind}&offset=${offset + 50}">Older ▶</a>` : '<span class="pager-btn is-disabled">Older ▶</span>';
+    const committed = setView(`
+      <div class="crumb"><a href="#/assets">Assets</a> / ${OBJECT_LABELS[kind]}</div>
+      <h1>${OBJECT_LABELS[kind]}</h1>
+      ${catalogTable(kind, page.items ?? [])}
+      <div class="pager">${newer}<span class="pager-info">${fmtNum(offset + 1)}–${fmtNum(offset + (page.items?.length ?? 0))}</span>${older}</div>
+    `, routeId);
+    if (committed) {
+      window.__sovExport = { name: `${NET}-${kind}-${offset}`, rows: page.items ?? [] };
+      $('export-tools').hidden = false;
+    }
+    return;
+  }
+  const pages = await Promise.all(OBJECT_KINDS.map((itemKind) => api(`/catalog?kind=${itemKind}&limit=5`)));
+  setView(`
+    <h1>Assets &amp; chain objects</h1>
+    <p class="note">Authoritative token and NFT state comes from the live node; archived activity, contracts, events, and completed HTLC status come from the complete explorer index.</p>
+    <div class="object-summary">${OBJECT_KINDS.map((itemKind, index) => `<section><div class="section-heading"><h2>${OBJECT_LABELS[itemKind]}</h2><a href="#/assets?kind=${itemKind}">Browse all</a></div>${catalogTable(itemKind, pages[index].items ?? [])}</section>`).join('')}</div>
+  `, routeId);
+}
+
+function objectActivityTable(activity) {
+  return `<div class="panel"><table><thead><tr><th>Tx</th><th>Action</th><th>Signer</th><th>Detail</th><th class="right">Block</th></tr></thead><tbody>${activity.map((tx) => `<tr><td>${txLink(tx.id)}</td><td>${actionBadge(tx.action)}</td><td>${acctLinkShort(tx.signer)}</td><td>${actionSummary(tx.action)}</td><td class="right">${blockLink(tx.blockHeight)}</td></tr>`).join('') || emptyRow(5)}</tbody></table></div>`;
+}
+
+function objectFields(data) {
+  const state = data.state ?? {};
+  if (data.kind === 'token') return [
+    ['Asset', data.id], ['Symbol', state.symbol], ['Issuer', state.issuer],
+    ['Current supply', state.supply === undefined ? null : `${fmtCoin(state.supply)} units`],
+    ['Total issued', state.issued === undefined ? null : `${fmtCoin(state.issued)} units`],
+    ['Total burned', state.burned === undefined ? null : `${fmtCoin(state.burned)} units`],
+  ];
+  if (data.kind === 'nft') return [
+    ['Collection', data.collection], ['Token ID', data.tokenId], ['Readable token', state.tokenText],
+    ['Owner', state.owner], ['Collection symbol', data.collectionState?.symbol],
+    ['Collection issuer', data.collectionState?.issuer], ['Minted height', state.mintedHeight],
+    ['Metadata', state.metadata === undefined ? null : JSON.stringify(state.metadata)],
+  ];
+  if (data.kind === 'contract') return [
+    ['Contract account', data.id], ['Status', data.indexed?.status ?? (state.code ? 'deployed' : null)],
+    ['Balance', state.balance === undefined ? null : `${fmtCoin(state.balance)} ${COIN_SYMBOL}`],
+    ['Nonce', state.nonce], ['WASM size', state.code ? fmtBytes(state.code.length) : null],
+  ];
+  const lock = state && Object.keys(state).length ? state : data.indexed?.creation?.action ?? {};
+  return [
+    ['HTLC ID', data.id], ['Status', data.status], ['Locker', lock.locker ?? data.indexed?.owner],
+    ['Recipient', lock.recipient], ['Amount', lock.amount === undefined ? null : `${fmtCoin(lock.amount)} ${COIN_SYMBOL}`],
+    ['Hashlock', Array.isArray(lock.hashlock) ? bytesHex(lock.hashlock) : lock.hashlock], ['Timeout height', lock.timeoutHeight ?? lock.timeout_height],
+  ];
+}
+
+async function renderObject(kindRaw, idRaw, routeId) {
+  const kind = decodeURIComponent(kindRaw ?? '');
+  const id = decodeURIComponent(idRaw ?? '');
+  setView('<div class="loading">Loading chain object…</div>', routeId);
+  let data;
+  try {
+    data = await api(`/object/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`);
+  } catch (error) {
+    return renderNotFound(`The ${kind || 'chain'} object “${shortHash(id)}” was not found.`, routeId);
+  }
+  setPageMeta(`${data.state?.symbol || data.state?.tokenText || kind} ${shortHash(id)}`, `${kind} detail and complete archived activity on Sovereign.`);
+  const fields = objectFields(data).filter(([, value]) => value !== null && value !== undefined && value !== '');
+  const events = data.events ?? data.indexed?.events ?? [];
+  const activity = data.activity ?? [];
+  const committed = setView(`
+    <div class="crumb"><a href="#/assets">Assets</a> / <a href="#/assets?kind=${encodeURIComponent(kind)}">${esc(OBJECT_LABELS[kind] ?? kind)}</a></div>
+    <h1>${esc((data.state?.symbol || data.state?.tokenText || OBJECT_LABELS[kind]?.slice(0, -1) || kind))} <span class="badge act">${esc(kind)}</span></h1>
+    <div class="panel"><table class="kv">${fields.map(([label, value]) => `<tr><td class="k">${esc(label)}</td><td class="v mono break">${esc(value)} ${copyButton(value, label)}</td></tr>`).join('')}</table></div>
+    <h2>Archived activity</h2>
+    ${objectActivityTable(activity)}
+    ${events.length ? `<h2>Contract events</h2><div class="panel"><table><thead><tr><th>Tx</th><th>Block</th><th>Topic</th><th>Data</th></tr></thead><tbody>${events.map((event) => `<tr><td>${txLink(event.txId)}</td><td>${blockLink(event.blockHeight)}</td><td class="mono break">${esc(JSON.stringify(event.topic))}</td><td class="mono break">${esc(JSON.stringify(event.data))}</td></tr>`).join('')}</tbody></table></div>` : ''}
+  `, routeId);
+  if (committed) {
+    window.__sovExport = { name: `${NET}-${kind}-${id}`, rows: activity };
+    $('export-tools').hidden = false;
+  }
+}
+
 async function renderBlock(ref, routeId) {
   setView('<div class="loading">Loading block…</div>', routeId);
   let b;
@@ -482,6 +672,7 @@ async function renderBlock(ref, routeId) {
   } catch (e) {
     return errView(e.message, routeId);
   }
+  setPageMeta(`Block #${b.height}`, `Sovereign block #${b.height}, ${b.txCount} transactions, roots, miner, and finality.`);
   const txs = b.transactions || [];
   setView(`
     <div class="crumb"><a href="#/blocks">Blocks</a> / Block #${fmtNum(b.height)}</div>
@@ -593,14 +784,16 @@ function rawBlob(value) {
 async function renderTx(id, routeId) {
   setView('<div class="loading">Loading transaction…</div>', routeId);
   let t;
+  let capabilities = null;
   try {
     const res = await fetch('/api/' + NET + '/tx/' + encodeURIComponent(id));
     const body = await res.json();
     if (!res.ok) {
+      const apiError = typeof body.error === 'object' ? body.error : null;
       // A just-submitted transaction has no receipt yet — show a live waiting
       // state and re-check every 5s while this page stays open, so the payout
       // link a wallet/faucet hands out "just works" once the block lands.
-      if (body.pending) {
+      if (body.pending || apiError?.details?.pending) {
         const here = location.hash;
         setTimeout(() => { if (location.hash === here) route(); }, 5000);
         return setView(`
@@ -612,12 +805,14 @@ async function renderTx(id, routeId) {
           </table></div>
         `, routeId);
       }
-      throw new Error(body.error || `HTTP ${res.status}`);
+      throw new Error(apiError?.message || body.error || `HTTP ${res.status}`);
     }
     t = body;
+    capabilities = await api('/capabilities').catch(() => null);
   } catch (e) {
     return errView(e.message, routeId);
   }
+  setPageMeta(`Transaction ${shortHash(t.id)}`, `${t.action?.type || 'Transaction'} in Sovereign block #${t.blockHeight}.`);
   const r = t.receipt;
   const value = actionValue(t.action);
   const events = r?.events || [];
@@ -649,25 +844,34 @@ async function renderTx(id, routeId) {
     <div class="panel"><pre class="mono" style="margin:0;overflow-wrap:anywhere;white-space:pre-wrap">${fmtEventBytes(returnData)}</pre></div>` : ''}
     <div class="panel action-explainer"><b>What this action does</b><p>${esc(explainAction(t.action))}</p></div>
     <h2>Portable inclusion evidence</h2>
-    <div class="panel proof-check" data-proof-id="${encodeURIComponent(t.id)}"><button type="button" class="proof-verify">Request and verify proofs</button><span class="proof-result dim"> Uses optional relay proof RPCs.</span></div>
+    ${capabilities?.proofs?.browserVerifiable
+      ? `<div class="panel proof-check" data-proof-id="${encodeURIComponent(t.id)}"><button type="button" class="proof-verify">Request and verify proofs</button><span class="proof-result dim"> Relay proof methods and browser algorithm are supported.</span></div>`
+      : `<div class="panel proof-check unavailable"><span class="badge pending">Unavailable</span><span class="dim">${capabilities?.proofs?.transaction || capabilities?.proofs?.receipt ? `Relay proofs use ${esc(capabilities.proofs.algorithms.join(', ') || 'an unsupported algorithm')}; browser verification is disabled.` : 'The configured relays do not expose transaction and receipt proof methods.'}</span></div>`}
     <h2>Raw action</h2>
     <div class="panel"><details class="raw" open><summary>decoded action payload (as indexed from the block)</summary><pre class="mono">${esc(fmtActionJson(t.action))}</pre></details></div>
   `, routeId);
 }
 
-async function renderAccount(idRaw, routeId) {
+async function renderAccount(idRaw, params, routeId) {
   const id = decodeURIComponent(idRaw);
   setView('<div class="loading">Loading account…</div>', routeId);
   let data;
   try {
-    data = await api('/account/' + encodeURIComponent(id));
+    const query = new URLSearchParams({ limit: '50' });
+    if (params.get('cursor')) query.set('cursor', params.get('cursor'));
+    data = await api(`/account/${encodeURIComponent(id)}?${query}`);
   } catch (e) {
     return errView(e.message, routeId);
   }
   const a = data.account;
   const acct = data.id || id; // the resolved account (if `id` was an SNS name)
+  setPageMeta(`Account ${shortHash(acct, 10, 8)}`, `Sovereign account balance, holdings, names, and complete paginated transaction history.`);
   const txs = data.transactions || [];
   const names = data.names || [];
+  const tokenBalances = data.tokenBalances || [];
+  const nfts = data.nfts || [];
+  const accountBase = `#/account/${encodeURIComponent(id)}`;
+  const accountPager = `<div class="pager"><a class="pager-btn${params.get('cursor') ? '' : ' is-disabled'}" href="${accountBase}">⏮ Latest</a><span class="pager-info">${data.historyComplete ? 'Complete archived history' : 'Indexed history only'}</span>${data.nextCursor ? `<a class="pager-btn" href="${accountBase}?cursor=${encodeURIComponent(data.nextCursor)}">Older ▶</a>` : '<span class="pager-btn is-disabled">Older ▶</span>'}</div>`;
   const locked = a?.locked ?? '0';
   const kv = a
     ? `
@@ -684,13 +888,39 @@ async function renderAccount(idRaw, routeId) {
     ${data.resolvedFrom ? `<p class="dim">↳ <span class="mono">${esc(data.resolvedFrom)}</span> resolves here</p>` : ''}
     ${names.length ? `<p class="dim">SNS: ${names.map((n) => `<span class="mono">${esc(n)}</span>`).join(', ')}</p>` : ''}
     <div class="panel"><table class="kv">${kv}</table></div>
+    ${tokenBalances.length ? `<h2>Token holdings</h2><div class="panel"><table><thead><tr><th>Asset</th><th>Symbol</th><th class="right">Balance</th></tr></thead><tbody>${tokenBalances.map((token) => `<tr><td>${objectLink('token', token.asset)}</td><td>${esc(token.symbol)}</td><td class="right num">${fmtCoin(token.balance)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+    ${nfts.length ? `<h2>NFT holdings</h2><div class="panel"><table><thead><tr><th>Token</th><th>Collection</th><th>Type</th></tr></thead><tbody>${nfts.map((nft) => `<tr><td>${objectLink('nft', `${nft.collection}:${nft.tokenId}`, nft.tokenText || shortHash(nft.tokenId))}</td><td class="mono">${esc(shortHash(nft.collection))}</td><td>${nft.isSns ? 'SNS name' : 'NFT'}</td></tr>`).join('')}</tbody></table></div>` : ''}
     <h2>Indexed Transactions</h2>
+    ${accountPager}
     <div class="panel"><table><thead><tr><th>Tx</th><th>Type</th><th>Detail</th><th class="right">Block</th></tr></thead>
     <tbody>${txs.map((t) => `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td>${t.signer === acct ? actionSummary(t.action) : `from ${acctLink(t.signer)}`}</td><td class="right">${blockLink(t.blockHeight)}</td></tr>`).join('') || emptyRow(4)}</tbody></table></div>
+    ${accountPager}
     <p class="note">${data.historyComplete ? 'Complete archived transaction history' : `Transaction history currently indexed from block #${fmtNum(data.historyFromHeight)}`} · balances are read live from the node.</p>
   `, routeId);
   window.__sovExport = { name: `${NET}-account-${acct}-transactions`, rows: txs };
   $('export-tools').hidden = false;
+}
+
+async function renderWatchlist(routeId) {
+  const accounts = watchlist();
+  setView('<div class="loading">Loading local watchlist…</div>', routeId);
+  if (!accounts.length) {
+    return setView('<h1>Watchlist</h1><div class="panel empty-state"><div class="es-title">No watched accounts</div><div class="dim">Open an account and choose “Add to local watchlist.” Saved accounts remain in this browser.</div></div>', routeId);
+  }
+  const rows = [];
+  for (const account of accounts) {
+    const data = await api('/account/' + encodeURIComponent(account)).catch(() => null);
+    rows.push({ account, data });
+  }
+  setView(`
+    <h1>Watchlist</h1>
+    <p class="note">Stored only in this browser. The explorer requests each displayed account independently; it never uploads or stores the watchlist.</p>
+    <div class="watch-grid">${rows.map(({ account, data }) => {
+      const state = data?.account;
+      const latest = data?.transactions?.[0];
+      return `<article class="panel watch-card"><div><h2>${acctLinkShort(account)}</h2><p class="mono break">${esc(account)}</p></div><div class="watch-balance">${state ? `${fmtCoin(state.balance)} ${COIN_SYMBOL}` : 'No funded state'}</div><div class="dim">${latest ? `Latest activity ${txLink(latest.id)} · block ${blockLink(latest.blockHeight)}` : 'No archived activity'}</div><button type="button" class="watch-toggle" data-account="${encodeURIComponent(account)}">Remove</button></article>`;
+    }).join('')}</div>
+  `, routeId);
 }
 
 async function renderMiners(routeId) {
@@ -723,11 +953,12 @@ function snsCard(n) {
   </div>`;
 }
 
-async function renderSns(routeId) {
+async function renderSns(params, routeId) {
   setView('<div class="loading">Loading names…</div>', routeId);
   // The Sovereign Name Service: human-readable *.sov names that resolve to
   // accounts. Each name is a non-fungible token in the reserved SNS collection.
-  const page = await api('/names?limit=200');
+  const offset = Math.max(0, Number(params.get('offset')) || 0);
+  const page = await api(`/names?limit=50&offset=${offset}`);
   const names = page.names ?? [];
   const total = page.total ?? names.length;
   const committed = setView(`
@@ -752,6 +983,8 @@ async function renderSns(routeId) {
         ? `<div class="sns-grid">${names.map(snsCard).join('')}</div>`
         : `<div class="panel empty-state"><div class="es-title">No names registered yet</div><div class="dim">Register one in SOV Station → Wallet → Sovereign Name Service.</div></div>`
     }
+
+    <div class="pager">${offset ? `<a class="pager-btn" href="#/sns?offset=${Math.max(0, offset - 50)}">◀ Newer</a>` : '<span class="pager-btn is-disabled">◀ Newer</span>'}<span class="pager-info">${names.length ? `${fmtNum(offset + 1)}–${fmtNum(offset + names.length)} of ${fmtNum(total)}` : 'No names'}</span>${page.hasMore ? `<a class="pager-btn" href="#/sns?offset=${offset + 50}">Older ▶</a>` : '<span class="pager-btn is-disabled">Older ▶</span>'}</div>
 
     <p class="note">Each name is a non-fungible token (token id = the name) in the reserved SNS collection — owned, transferable, and resolvable. The registry and resolution are consensus state every node agrees on.</p>
   `, routeId);
@@ -983,25 +1216,39 @@ function route() {
     return Promise.resolve();
   }
   const hash = location.hash.replace(/^#/, '') || '/';
-  const [, head, arg] = hash.split('/');
+  const [routePath, routeSearch = ''] = hash.split('?');
+  const [, head, arg, extra] = routePath.split('/');
+  const routeQuery = new URLSearchParams(routeSearch);
+  const routeTitles = {
+    proof: 'Proof', blocks: 'Blocks', transactions: 'Transactions', assets: 'Assets',
+    watchlist: 'Watchlist', miners: 'Miners', validators: 'Miners', sns: 'Names',
+    analytics: 'Analytics', validity: 'Finality',
+  };
+  setPageMeta(routeTitles[head] ?? (head ? '' : 'Overview'));
   setActiveNav(hash);
   let task;
   if (!head) task = renderOverview(routeId);
   else if (head === 'proof') task = renderProof(routeId);
   else if (head === 'blocks') task = renderBlocks(arg, routeId);
-  else if (head === 'block') task = renderBlock(arg, routeId);
-  else if (head === 'tx') task = renderTx(arg, routeId);
-  else if (head === 'account') task = renderAccount(arg, routeId);
+  else if (head === 'transactions') task = renderTransactions(routeQuery, routeId);
+  else if (head === 'assets') task = renderAssets(routeQuery, routeId);
+  else if (head === 'watchlist') task = renderWatchlist(routeId);
+  else if (head === 'block' && arg) task = renderBlock(arg, routeId);
+  else if (head === 'tx' && arg) task = renderTx(arg, routeId);
+  else if (head === 'object' && arg && extra) task = renderObject(arg, extra, routeId);
+  else if (head === 'account' && arg) task = renderAccount(arg, routeQuery, routeId);
   else if (head === 'miners' || head === 'validators') task = renderMiners(routeId);
   else if (head === 'analytics') task = renderAnalytics(routeId);
-  else if (head === 'sns') task = renderSns(routeId);
+  else if (head === 'sns') task = renderSns(routeQuery, routeId);
   else if (head === 'validity') task = renderValidity(routeId);
-  else task = renderOverview(routeId);
+  else task = renderNotFound(`Unknown or incomplete explorer route “${head}”.`, routeId);
   return Promise.resolve(task).catch((e) => errView(e.message, routeId));
 }
 
 function setActiveNav(hash) {
-  const top = '#/' + (hash.split('/')[1] || '');
+  let section = hash.split('/')[1] || '';
+  if (section === 'object') section = 'assets';
+  const top = '#/' + section;
   for (const a of document.querySelectorAll('.nav a')) {
     a.classList.toggle('active', a.getAttribute('href') === top);
   }
@@ -1036,6 +1283,7 @@ document.addEventListener('click', async (event) => {
   if (watchButton) {
     const account = decodeURIComponent(watchButton.dataset.account || '');
     watchButton.textContent = toggleWatch(account) ? '★ Remove from local watchlist' : '☆ Add to local watchlist';
+    if (location.hash.startsWith('#/watchlist')) route();
     return;
   }
   const proofButton = event.target.closest?.('.proof-verify');

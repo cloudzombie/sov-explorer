@@ -5,6 +5,7 @@
 // canonical chain id/genesis by SovereignRpc before any indexed data is trusted.
 
 import { createServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
@@ -18,6 +19,7 @@ import { executeGraphql, schemaRoots } from './graphql.js';
 import { WsHub } from './ws.js';
 import { RateGate } from './limits.js';
 import { Metrics, routeTemplate } from './metrics.js';
+import { ApiAccess, ApiAccessError, evaluatePaidRequirement } from './api-access.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = normalize(join(HERE, '..', 'web'));
@@ -73,9 +75,13 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const REQUIRE_TLS_RELAYS = process.env.REQUIRE_TLS_RELAYS === '1';
 const METRICS_TOKEN = String(process.env.METRICS_TOKEN || '').trim();
+const API_KEYS_FILE = String(process.env.API_KEYS_FILE || '').trim();
+const REQUIRE_COMPLETE_ARCHIVE = process.env.REQUIRE_COMPLETE_ARCHIVE === '1';
 const ROLE = ['all', 'ingest', 'serve'].includes(process.env.EXPLORER_ROLE)
   ? process.env.EXPLORER_ROLE
   : 'all';
+
+const apiAccess = await ApiAccess.fromFile(API_KEYS_FILE);
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -177,6 +183,7 @@ function baseHeaders(contentType, cacheControl) {
   return {
     ...SECURITY_HEADERS,
     'access-control-allow-origin': CORS_ORIGIN,
+    'access-control-expose-headers': 'x-request-id, x-api-tier, x-api-upgrade-required, x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset, retry-after',
     'cache-control': cacheControl,
     'content-type': contentType,
   };
@@ -191,6 +198,44 @@ function send(res, status, body, contentType = 'application/json; charset=utf-8'
   });
   if (opts.head) res.end();
   else res.end(payload);
+}
+
+function apiHeaders(requestId, access = null, extra = {}) {
+  const headers = {
+    'x-request-id': requestId,
+    'x-api-tier': access?.tier ?? 'anonymous',
+    ...extra,
+  };
+  if (access?.quota) {
+    headers['x-ratelimit-limit'] = String(access.quota.limit);
+    headers['x-ratelimit-remaining'] = String(access.quota.remaining);
+    headers['x-ratelimit-reset'] = String(access.quota.reset);
+  }
+  return headers;
+}
+
+function sendApiError(res, status, code, message, requestId, { access = null, headers = {}, upgrade = false, details = null } = {}) {
+  const authentication = status === 401 ? { 'www-authenticate': 'Bearer realm="Sovereign Explorer API"' } : {};
+  const payment = upgrade ? { 'x-api-upgrade-required': 'true' } : {};
+  return send(res, status, JSON.stringify({
+    error: { code, message, requestId, ...(upgrade ? { paidAccessRequired: true } : {}), ...(details ? { details } : {}) },
+  }), undefined, { headers: apiHeaders(requestId, access, { ...authentication, ...payment, ...headers }) });
+}
+
+function authorizeApi(req, pathname, query, { graphql = false } = {}) {
+  const requirement = evaluatePaidRequirement(pathname, query, { graphql });
+  const access = apiAccess.authorize(req, requirement);
+  metrics.observeApiAccess(access.tier, requirement.required ? 'paid' : 'standard');
+  return access;
+}
+
+function apiErrorCode(status) {
+  if (status === 400) return 'validation_error';
+  if (status === 404) return 'not_found';
+  if (status === 405) return 'method_not_allowed';
+  if (status === 429) return 'rate_limit_exceeded';
+  if (status === 502 || status === 503) return 'upstream_unavailable';
+  return 'request_failed';
 }
 
 function readBody(req, maxBytes = MAX_BODY_BYTES) {
@@ -282,6 +327,12 @@ async function handleRequest(req, res) {
 
   const rate = rateAllowed(req, pathname);
   if (!rate.allowed) {
+    if (pathname.startsWith('/api/') || pathname.startsWith('/graphql/')) {
+      return sendApiError(res, 429, 'rate_limit_exceeded', 'The client request rate is exhausted.', randomUUID(), {
+        headers: { 'retry-after': String(rate.retryAfterSeconds) },
+        details: { scope: rate.scope },
+      });
+    }
     return send(res, 429, JSON.stringify({ error: 'rate limit exceeded', scope: rate.scope }), undefined, {
       headers: { 'retry-after': String(rate.retryAfterSeconds) },
     });
@@ -290,7 +341,7 @@ async function handleRequest(req, res) {
     res.writeHead(204, {
       ...baseHeaders('text/plain; charset=utf-8', 'no-store'),
       'access-control-allow-methods': 'GET, POST, HEAD, OPTIONS',
-      'access-control-allow-headers': 'content-type',
+      'access-control-allow-headers': 'authorization, content-type, x-api-key',
       'access-control-max-age': '600',
     });
     return res.end();
@@ -298,7 +349,7 @@ async function handleRequest(req, res) {
 
   if (pathname === '/healthz') {
     const requested = url.searchParams.get('network');
-    const requireArchive = url.searchParams.get('archive') === '1';
+    const requireArchive = REQUIRE_COMPLETE_ARCHIVE || url.searchParams.get('archive') === '1';
     const selected = requested ? [nets.get(requested)].filter(Boolean) : [...nets.values()].filter((net) => net.live);
     if (requested && selected.length === 0) {
       return send(res, 404, JSON.stringify({ ok: false, error: 'unknown network' }));
@@ -337,11 +388,22 @@ async function handleRequest(req, res) {
 
   const gql = pathname.match(/^\/graphql\/([a-z0-9-]+)$/);
   if (gql) {
+    const requestId = randomUUID();
+    req.sovRequestId = requestId;
+    let access;
+    try {
+      access = authorizeApi(req, pathname, url.searchParams, { graphql: true });
+      req.sovApiAccess = access;
+    } catch (error) {
+      if (!(error instanceof ApiAccessError)) throw error;
+      metrics.observeApiAccess('anonymous', 'rejected');
+      return sendApiError(res, error.status, error.code, error.message, requestId, error);
+    }
     const net = nets.get(gql[1]);
-    if (!net) return send(res, 404, JSON.stringify({ errors: [{ message: 'unknown network' }] }));
-    if (!net.live) return send(res, 503, JSON.stringify({ errors: [{ message: 'network not live' }] }));
-    if (req.method !== 'POST') return send(res, 405, JSON.stringify({ errors: [{ message: 'POST only' }] }));
+    if (!net) return sendApiError(res, 404, 'unknown_network', 'Unknown network.', requestId, { access });
+    if (req.method !== 'POST') return sendApiError(res, 405, 'method_not_allowed', 'POST only.', requestId, { access });
     const body = await readBody(req);
+    if (!net.live) return sendApiError(res, 503, 'network_unavailable', 'Network not live.', requestId, { access });
     let query = body;
     try {
       const parsed = JSON.parse(body);
@@ -350,22 +412,45 @@ async function handleRequest(req, res) {
       // Raw GraphQL query strings are supported.
     }
     const result = await executeGraphql(query, { store: net.store, rpc: net.rpc }, schemaRoots);
-    return send(res, 200, JSON.stringify(result));
+    result.extensions = { ...(result.extensions ?? {}), requestId };
+    return send(res, 200, JSON.stringify(result), undefined, { headers: apiHeaders(requestId, access) });
   }
 
-  const apim = pathname.match(/^\/api\/([a-z0-9-]+)(\/.*)?$/);
+  const apim = pathname.match(/^\/api\/(?:v1\/)?([a-z0-9-]+)(\/.*)?$/);
   if (apim) {
+    const requestId = randomUUID();
+    req.sovRequestId = requestId;
+    let access;
+    try {
+      access = authorizeApi(req, pathname, url.searchParams);
+      req.sovApiAccess = access;
+    } catch (error) {
+      if (!(error instanceof ApiAccessError)) throw error;
+      metrics.observeApiAccess('anonymous', 'rejected');
+      return sendApiError(res, error.status, error.code, error.message, requestId, error);
+    }
     const net = nets.get(apim[1]);
-    if (!net) return send(res, 404, JSON.stringify({ error: 'unknown network' }));
-    if (!net.live) return send(res, 503, JSON.stringify({ error: 'network not live', live: false }));
+    if (!net) return sendApiError(res, 404, 'unknown_network', 'Unknown network.', requestId, { access });
+    if (!net.live) return sendApiError(res, 503, 'network_unavailable', 'Network not live.', requestId, { access });
     const sub = apim[2] || '/';
     const rest = await handleRest(req.method, '/api' + sub, url.searchParams, {
       store: net.store,
       rpc: net.rpc,
       metrics,
+      apiTier: access.tier,
     });
-    if (rest) return send(res, rest.status, rest.body);
-    return send(res, 404, JSON.stringify({ error: 'not found' }));
+    if (rest?.status >= 400) {
+      let parsed = {};
+      try { parsed = JSON.parse(rest.body); } catch {}
+      const message = typeof parsed.error === 'string' ? parsed.error : 'Request failed.';
+      const { error: _, ...details } = parsed;
+      return sendApiError(res, rest.status, apiErrorCode(rest.status), message, requestId, {
+        access,
+        details: Object.keys(details).length ? details : null,
+      });
+    }
+    if (rest) return send(res, rest.status, rest.body, undefined, { headers: apiHeaders(requestId, access) });
+    return sendApiError(res, 404, 'not_found', 'Not found.', requestId, { access });
   }
 
   return serveStatic(req, res, pathname);
@@ -382,6 +467,18 @@ const server = createServer({ maxHeaderSize: 16 * 1024 }, (req, res) => {
     if (res.headersSent) return res.destroy();
     const status = Number(error?.status) || 500;
     const message = status >= 500 ? 'internal server error' : error.message;
+    let pathname = '';
+    try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
+    if (pathname.startsWith('/api/') || pathname.startsWith('/graphql/')) {
+      return sendApiError(
+        res,
+        status,
+        status === 413 ? 'payload_too_large' : status >= 500 ? 'internal_error' : 'request_failed',
+        message,
+        req.sovRequestId ?? randomUUID(),
+        { access: req.sovApiAccess ?? null },
+      );
+    }
     send(res, status, JSON.stringify({ error: message }));
   });
 });
@@ -463,3 +560,8 @@ function shutdown() {
 }
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
+process.on('SIGHUP', () => {
+  apiAccess.reload()
+    .then((count) => console.log(`sovereign-explorer: reloaded ${count} paid API key record(s)`))
+    .catch((error) => console.error(`sovereign-explorer: API key reload failed: ${error.message}`));
+});

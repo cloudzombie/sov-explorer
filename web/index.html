@@ -7,11 +7,22 @@
     <meta name="theme-color" content="#07080d" />
     <title>Sovereign Explorer</title>
     <meta
+      id="meta-description"
       name="description"
       content="Block explorer for Sovereign. Live blocks, transactions, accounts, miners, supply, mempool, and Nakamoto finality, read directly from a node."
     />
-    <link rel="stylesheet" href="/style.css?v=3" />
-    <link rel="stylesheet" href="/features.css?v=3" />
+    <link id="canonical-link" rel="canonical" href="https://sovxus.org/" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Sovereign Explorer" />
+    <meta id="og-title" property="og:title" content="Sovereign Explorer" />
+    <meta id="og-description" property="og:description" content="Independent live explorer for the Sovereign chain." />
+    <meta id="og-url" property="og:url" content="https://sovxus.org/" />
+    <meta name="twitter:card" content="summary" />
+    <meta id="twitter-title" name="twitter:title" content="Sovereign Explorer" />
+    <meta id="twitter-description" name="twitter:description" content="Independent live explorer for the Sovereign chain." />
+    <link rel="stylesheet" href="/style.css?v=9" />
+    <link rel="stylesheet" href="/features.css?v=9" />
   </head>
   <body>
     <a class="skip-link" href="#view">Skip to chain data</a>
@@ -41,6 +52,9 @@
         <a href="#/">Overview</a>
         <a href="#/proof">Proof</a>
         <a href="#/blocks">Blocks</a>
+        <a href="#/transactions">Transactions</a>
+        <a href="#/assets">Assets</a>
+        <a href="#/watchlist">Watchlist</a>
         <a href="#/miners">Miners</a>
         <a href="#/sns">SNS</a>
         <a href="#/analytics">Analytics</a>
@@ -76,6 +90,6 @@
       <span id="foot-chain"></span>
     </footer>
 
-    <script type="module" src="/app.js?v=3"></script>
+    <script type="module" src="/app.js?v=9"></script>
   </body>
 </html>

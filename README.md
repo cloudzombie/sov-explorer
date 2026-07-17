@@ -44,13 +44,58 @@ GET  /api/<net>/status         → chain stats for that network
 GET  /api/<net>/blocks?limit=  → recent blocks
 GET  /api/<net>/block/<ref>    → block by height or hash
 GET  /api/<net>/tx/<id>        → a transaction
+GET  /api/<net>/transactions   → archived cursor page with action/account/status/range filters
+GET  /api/<net>/catalog        → paged token/NFT/contract/HTLC catalog
+GET  /api/<net>/object/<kind>/<id> → object state + archived activity/events
 GET  /api/<net>/inclusion-proof/<id> → optional tx + receipt Merkle evidence
-GET  /api/<net>/account/<id>   → an account
+GET  /api/<net>/account/<id>   → account, holdings, and cursor-paginated history
 GET  /api/<net>/proof          → relay/PQ/privacy/commitment evidence
 POST /graphql/<net>            → GraphQL
 WS   /ws/<net>                 → live block/tx feed
 GET  /healthz[?network=<net>&archive=1] → service, network, or full-archive readiness
 GET  /metrics                  → Prometheus process/index/relay/cache/WS metrics
+```
+
+The stable versioned form is `/api/v1/<net>/...`; unversioned routes remain compatible
+for the browser application. The machine-readable contract is published at
+[`/openapi.json`](https://sovxus.org/openapi.json).
+
+```sh
+curl 'https://sovxus.org/api/v1/mainnet/transactions?limit=25&action=htlc_claim'
+curl 'https://sovxus.org/api/v1/mainnet/catalog?kind=htlc&limit=25'
+```
+
+### Paid API enforcement
+
+Ordinary browser and REST reads use the bounded anonymous envelope: `limit ≤ 50`,
+`offset ≤ 500`, block ranges up to 100,000 heights, and time ranges up to 366 days.
+GraphQL and requests beyond those parameter thresholds require a paid key. Paid keys
+raise `limit` to 200 and `offset` to 1,000,000,000 while retaining the API's hard
+query, response-size, upstream, and process rate limits.
+
+Supply a key in `X-API-Key` or `Authorization: Bearer`; never put one in a URL. Every
+API response includes `X-Request-Id` and `X-API-Tier`. Keyed responses also include
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`. Paid-boundary,
+authentication, quota, and validation failures use a stable error object:
+
+```json
+{"error":{"code":"paid_api_key_required","message":"…","requestId":"…","paidAccessRequired":true}}
+```
+
+The root-owned key document stores SHA-256 digests only. Create, inspect, rotate, and
+revoke records offline; create/rotate prints the new secret once:
+
+```sh
+node scripts/api-key.mjs create --file /etc/sov-explorer.api-keys.json --id customer --plan pro --rpm 1200 --expires 2027-07-01T00:00:00Z
+node scripts/api-key.mjs list --file /etc/sov-explorer.api-keys.json
+node scripts/api-key.mjs rotate --file /etc/sov-explorer.api-keys.json --id customer
+node scripts/api-key.mjs revoke --file /etc/sov-explorer.api-keys.json --id customer
+systemctl kill --signal=HUP sovereign-explorer
+```
+
+```sh
+curl -H "X-API-Key: $SOV_EXPLORER_API_KEY" \
+  'https://sovxus.org/api/v1/mainnet/transactions?limit=200'
 ```
 
 ## Run
@@ -91,6 +136,7 @@ Then open `http://127.0.0.1:8730`.
 | `GLOBAL_GRAPHQL_REQUESTS_PER_MINUTE` | `3000` | Process-wide GraphQL ceiling across all clients |
 | `HTTP_MAX_CONNECTIONS` | `2000` | Process-wide TCP connection ceiling |
 | `METRICS_TOKEN` | unset | Optional bearer token required by `/metrics` |
+| `API_KEYS_FILE` | unset | Root-owned JSON key registry; paid-only requests fail closed when no valid key exists |
 | `REQUIRE_TLS_RELAYS` | unset | Set to `1` in production; rejects non-loopback plain-HTTP relays |
 | `WS_MAX_CLIENTS` | `1000` | Process-wide WebSocket connection ceiling across networks |
 | `WS_MAX_CLIENTS_PER_NETWORK` | `750` | WebSocket ceiling for one network |
