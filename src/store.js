@@ -116,6 +116,9 @@ export class Store {
     this.shieldedInfo = null;
     this.deployments = null; // { height, deployments: [...] } from sov_getDeployments
     this.feeEstimate = null; // { kind, gasUsed, gasPriceGrains, feeGrains } from sov_estimateFee
+    this.feeRoutes = null; // { <kind>: estimate } for every route the node prices
+    this.mintReward = null; // decimal-grain string from sov_getMintReward
+    this.signingDomain = null; // { active, chainId, genesis, txTag, intentTag } from sov_getSigningDomain
     this.peerSummary = null; // { peers, agents } aggregated from sov_getPeerInfo (no addresses)
     this.supplySeries = []; // [{ height, total, mined, timestampMs }]
     this.totalTxIndexed = 0;
@@ -149,6 +152,9 @@ export class Store {
     this.shieldedInfo = null;
     this.deployments = null;
     this.feeEstimate = null;
+    this.feeRoutes = null;
+    this.mintReward = null;
+    this.signingDomain = null;
     this.peerSummary = null;
     this.supplySeries = [];
     this.totalTxIndexed = 0;
@@ -436,6 +442,85 @@ export class Store {
   }
 
   /**
+   * Observed block spacing over the last `windowBlocks` heights, measured from the
+   * `timestamp_ms` of retained headers — never from wall-clock time and never
+   * assumed from the difficulty target.
+   *
+   * Method (stated so the number can be checked): take consecutive retained heights
+   * in the window, difference their header timestamps, and report the MEDIAN and the
+   * MEAN of those intervals. Proof-of-work intervals are approximately exponential,
+   * so the median is the robust headline and the mean is the one that should track
+   * the protocol target; both are reported rather than silently picking one.
+   *
+   * Header timestamps are miner-supplied and only loosely ordered by consensus, so a
+   * negative interval is possible. Those are EXCLUDED from the statistics and counted
+   * in `nonMonotonicIntervals` rather than being clamped to zero, which would drag
+   * the average down and misrepresent spacing. A gap in retained heights breaks the
+   * chain of differences instead of producing one huge fabricated interval.
+   *
+   * Returns nulls (never zeros) when there is not yet a single usable interval.
+   */
+  blockTimeStats(windowBlocks = MINER_WINDOW_BLOCKS) {
+    const to = this.tipHeight;
+    const empty = {
+      windowBlocks,
+      fromHeight: null,
+      toHeight: null,
+      intervals: 0,
+      nonMonotonicIntervals: 0,
+      medianMs: null,
+      meanMs: null,
+      minMs: null,
+      maxMs: null,
+      targetMs: this.difficulty?.targetBlockMs ?? null,
+      complete: false,
+    };
+    if (!Number.isFinite(to) || to < 0) return empty;
+    // `windowBlocks` intervals need `windowBlocks + 1` heights.
+    const requestedFrom = Math.max(0, to - windowBlocks);
+    const from = Math.max(requestedFrom, Number.isFinite(this.minHeight) ? this.minHeight : requestedFrom);
+    const deltas = [];
+    let nonMonotonic = 0;
+    let previous = null;
+    for (let h = from; h <= to; h++) {
+      const block = this.blocksByHeight.get(h);
+      const ts = Number(block?.timestampMs);
+      if (!block || !Number.isFinite(ts)) {
+        previous = null; // a hole in retained history must not become one giant interval
+        continue;
+      }
+      if (previous !== null) {
+        const delta = ts - previous;
+        if (delta >= 0) deltas.push(delta);
+        else nonMonotonic += 1;
+      }
+      previous = ts;
+    }
+    if (deltas.length === 0) {
+      return { ...empty, fromHeight: from, toHeight: to, nonMonotonicIntervals: nonMonotonic };
+    }
+    const sorted = [...deltas].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    const medianMs = sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    const meanMs = deltas.reduce((sum, d) => sum + d, 0) / deltas.length;
+    return {
+      windowBlocks,
+      fromHeight: from,
+      toHeight: to,
+      intervals: deltas.length,
+      nonMonotonicIntervals: nonMonotonic,
+      medianMs,
+      meanMs,
+      minMs: sorted[0],
+      maxMs: sorted[sorted.length - 1],
+      targetMs: this.difficulty?.targetBlockMs ?? null,
+      // True only when the full requested window was retained AND every height in it
+      // produced an interval (no holes, no non-monotonic headers dropped).
+      complete: from === requestedFrom && deltas.length + nonMonotonic === to - from,
+    };
+  }
+
+  /**
    * BIP-9 signaling actually observed in retained headers: for each deployment bit,
    * how many of the last `windowBlocks` retained blocks set it in `version_bits`.
    * Blocks indexed before the explorer recorded `versionBits` are excluded from
@@ -620,13 +705,33 @@ export class Store {
       // sov_estimateFee for a plain transfer (null = not exposed by the node). The
       // mempool auction's dynamic floor has no RPC today and is reported as absent.
       fees: this.feeEstimate,
+      // Every send route the node prices (transfer | tokenTransfer | shielded), each
+      // an exact runtime fee, not an interpolation. Routes the node did not answer
+      // are simply absent from the map rather than defaulted.
+      feeRoutes: this.feeRoutes,
+      // The height-keyed coinbase subsidy the node would pay next (sov_getMintReward).
+      mintRewardGrains: this.mintReward,
+      // Runtime effect of the ACTIVE tx-domain deployment: the exact domain tags every
+      // signature is now bound to (sov_getSigningDomain). Null when not exposed.
+      signingDomain: this.signingDomain,
+      // Observed block spacing from real header timestamps, method + window stated.
+      blockTime: this.blockTimeStats(),
       peers: this.peerSummary,
       allTime: {
         circulationGrains: this.supply?.total ?? null,
         marketCapUsd: null,
         marketDominance: null,
         blockchainSizeBytes: this.totalBlockBytesIndexed,
-        networkNodes: this.miners.length || null,
+        // Reachable NODES, not miner accounts. This used to report the miner-account
+        // count, which conflated two different things: a coinbase account is not a
+        // machine (several machines can pay one account) and a node is not a miner
+        // (most peers do not mine). The only honest node-side signal is the peer
+        // count of the relay we are connected to — itself a lower bound on one
+        // relay's neighbourhood, not a network census. Null when unavailable.
+        networkNodes: this.peerSummary?.peers ?? null,
+        networkNodesBasis: this.peerSummary
+          ? 'peers of one relay (sov_getPeerInfo) — a lower bound, not a network census'
+          : null,
         minersSeen: this.miners.length || null,
         minersActive: recentMinerAccounts,
         difficulty: this.difficulty?.sha256d ?? null,
@@ -642,7 +747,10 @@ export class Store {
         feeTotalUsd: null,
         sizeBytes: null,
       },
-      mintedOfCap: ratio(mined, SUPPLY_CAP_GRAINS),
+      // Null — not 0 — when the node has not supplied a supply figure. A "0.00% of
+      // cap minted" reading is indistinguishable from a real answer and would be a
+      // fabricated statistic during an outage.
+      mintedOfCap: this.supply ? ratio(mined, SUPPLY_CAP_GRAINS) : null,
       supplyCapGrains: SUPPLY_CAP_GRAINS.toString(),
       sync: {
         phase: this.syncPhase,

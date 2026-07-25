@@ -700,7 +700,13 @@ h3 {
   border: 1px solid var(--line);
   border-radius: 8px;
   min-width: 0;
+  /* `hidden` keeps content inside the rounded corners, but on a narrow viewport it
+     also CLIPPED wide tables (the consensus-deployment table is ~680px of real
+     columns) with no way to reach the hidden columns. Scroll them inside their own
+     panel instead, so the page body still never scrolls horizontally. */
   overflow: hidden;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
 }
 
 .grid2 {

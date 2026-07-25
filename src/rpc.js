@@ -422,6 +422,10 @@ export class SovereignRpc {
   stateRoot() { return this.call('sov_getStateRoot'); }
   isFinal(hash) { return this.call('sov_isFinal', { hash }); }
   receipt(txId) { return this.call('sov_getReceipt', { txId }, { nonNull: true }); }
+  /** Every receipt in one block in ONE request. Preferred over N per-transaction
+   * `sov_getReceipt` calls: it cuts the cold-backfill receipt load on a production
+   * node from one request per transaction to one per block. */
+  blockReceipts(height) { return this.call('sov_getBlockReceipts', { height }, { nonNull: true }); }
   transactionProof(txId) { return this.call('sov_getTransactionProof', { txId }, { nonNull: true }); }
   receiptProof(txId) { return this.call('sov_getReceiptProof', { txId }, { nonNull: true }); }
   miners() { return this.call('sov_getMiners'); }
@@ -432,6 +436,10 @@ export class SovereignRpc {
   estimateFee(kind = 'transfer') { return this.call('sov_estimateFee', { kind }); }
   /** Live node networking state (peer counts / versions). */
   peerInfo() { return this.call('sov_getPeerInfo'); }
+  /** The height-keyed coinbase subsidy the node would pay for the next block. */
+  mintReward() { return this.call('sov_getMintReward'); }
+  /** The chain/genesis-bound signing tags the ACTIVE tx-domain deployment enforces. */
+  signingDomain() { return this.call('sov_getSigningDomain'); }
 
   listTokens(offset = 0, limit = 100) { return this.call('sov_listTokens', { offset, limit }); }
   tokenInfo(asset) { return this.call('sov_getTokenInfo', { hash: asset }); }

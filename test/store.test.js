@@ -281,7 +281,11 @@ test('stats expose blockchair-style explorer parameters', () => {
   assert.equal(st.supplyCapGrains, '2100000000000000');
   assert.equal(st.allTime.circulationGrains, '100000000000000');
   assert.equal(st.allTime.blockchainSizeBytes, 4096);
-  assert.equal(st.allTime.networkNodes, 1);
+  // A miner ACCOUNT is not a node: with no peer information available, the node
+  // count must be unavailable rather than borrowing the miner-account count.
+  assert.equal(st.allTime.networkNodes, null);
+  assert.equal(st.allTime.networkNodesBasis, null);
+  assert.equal(st.allTime.minersSeen, 1, 'miner accounts are still reported, as accounts');
   assert.equal(st.allTime.difficulty, '181019021');
   assert.equal(st.last24h.transactions, 1);
   assert.equal(st.last24h.blocks, 1);
@@ -291,4 +295,106 @@ test('stats expose blockchair-style explorer parameters', () => {
   assert.equal(st.mempool.sizeBytes, null);
   assert.equal('stakingRatio' in st, false);
   assert.ok(st.mintedOfCap > 0 && st.mintedOfCap < 0.02, 'mined/cap small but nonzero');
+});
+
+test('block-time statistics are measured from header timestamps with a stated window', () => {
+  const s = new Store();
+  s.difficulty = { targetBlockMs: 150_000 };
+  // Intervals: 100s, 200s, 300s → median 200s, mean 200s.
+  const stamps = [0, 100_000, 300_000, 600_000];
+  stamps.forEach((ts, i) => {
+    const b = block(i, []);
+    b.timestampMs = ts;
+    s.addBlock(b);
+  });
+
+  const bt = s.blockTimeStats(3);
+  assert.equal(bt.intervals, 3);
+  assert.equal(bt.medianMs, 200_000);
+  assert.equal(bt.meanMs, 200_000);
+  assert.equal(bt.minMs, 100_000);
+  assert.equal(bt.maxMs, 300_000);
+  assert.equal(bt.targetMs, 150_000, 'the protocol target is reported alongside, not substituted');
+  assert.equal(bt.fromHeight, 0);
+  assert.equal(bt.toHeight, 3);
+  assert.equal(bt.complete, true);
+  assert.equal(bt.nonMonotonicIntervals, 0);
+});
+
+test('block-time statistics exclude backwards headers instead of clamping them', () => {
+  const s = new Store();
+  // Height 2 has a timestamp EARLIER than height 1 — legal for a miner-supplied
+  // header. It must not be counted as a zero-length block.
+  for (const [h, ts] of [[0, 0], [1, 200_000], [2, 150_000], [3, 350_000]]) {
+    const b = block(h, []);
+    b.timestampMs = ts;
+    s.addBlock(b);
+  }
+  const bt = s.blockTimeStats(3);
+  assert.equal(bt.nonMonotonicIntervals, 1);
+  assert.equal(bt.intervals, 2, 'only the two forward intervals are measured');
+  // 200_000 (0→1) and 200_000 (2→3); the backwards step contributes nothing.
+  assert.equal(bt.meanMs, 200_000);
+  assert.equal(bt.complete, true, 'every height still produced a decision');
+});
+
+test('block-time statistics report nulls, never zeros, without a usable interval', () => {
+  const s = new Store();
+  assert.deepEqual(
+    { medianMs: s.blockTimeStats().medianMs, meanMs: s.blockTimeStats().meanMs, intervals: s.blockTimeStats().intervals },
+    { medianMs: null, meanMs: null, intervals: 0 },
+  );
+  const b = block(5, []);
+  b.timestampMs = 1_000;
+  s.addBlock(b);
+  const one = s.blockTimeStats(576);
+  assert.equal(one.intervals, 0, 'a single block yields no interval');
+  assert.equal(one.medianMs, null);
+  assert.equal(one.complete, false, 'a partial window says so');
+});
+
+test('the node count comes from peers, never from miner accounts', () => {
+  const s = new Store();
+  const b = block(1, []);
+  b.timestampMs = Date.now();
+  s.addBlock(b);
+  s.miners = [{ account: 'a' }, { account: 'b' }, { account: 'c' }];
+  s.recordSupply({ total: '1', mined: '1' }, 1);
+
+  assert.equal(s.stats().allTime.networkNodes, null, 'three miner accounts are not three nodes');
+
+  s.peerSummary = { peers: 3, relayVersion: 'v0.2.0', protocolVersion: 2, agents: {} };
+  s._touchStats(); // chain-stat fields are assigned directly; the snapshot is memoized
+  const st = s.stats();
+  assert.equal(st.allTime.networkNodes, 3);
+  assert.match(st.allTime.networkNodesBasis, /not a network census/);
+  assert.equal(st.allTime.minersSeen, 3, 'miner accounts remain reported separately');
+});
+
+test('fee routes only contain the routes the node actually priced', () => {
+  const s = new Store();
+  s.feeRoutes = { transfer: { kind: 'transfer', feeGrains: '1651760' } };
+  s._touchStats();
+  const st = s.stats();
+  assert.deepEqual(Object.keys(st.feeRoutes), ['transfer']);
+  assert.equal(st.feeRoutes.shielded, undefined, 'an unpriced route is absent, not zero');
+});
+
+test('an outage yields unavailable values, never fabricated zeros', () => {
+  const s = new Store(); // nothing indexed, node never answered
+  const st = s.stats();
+  assert.equal(st.mintedOfCap, null, 'a 0.00%-of-cap reading would look like a real answer');
+  assert.equal(st.supply, null);
+  assert.equal(st.difficulty, null);
+  assert.equal(st.deployments, null);
+  assert.equal(st.feeRoutes, null);
+  assert.equal(st.mintRewardGrains, null);
+  assert.equal(st.signingDomain, null);
+  assert.equal(st.minerWindow.accounts, null);
+  assert.equal(st.blockTime.medianMs, null);
+  assert.equal(st.allTime.networkNodes, null);
+
+  // Once supply is known the ratio becomes a real number again.
+  s.recordSupply({ total: '2100000000000000', mined: '2100000000000000' }, 1);
+  assert.equal(s.stats().mintedOfCap, 1);
 });

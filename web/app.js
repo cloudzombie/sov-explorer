@@ -92,6 +92,18 @@ function minerWindowLabel(blocks, targetBlockMs = LAST_STATUS?.difficulty?.targe
   const approx = hours >= 48 ? `${fmtDecimal(hours / 24, 1)} d` : `${fmtDecimal(hours, hours < 10 ? 1 : 0)} h`;
   return `last ${fmtNum(n)} blocks (~${approx})`;
 }
+/** Format a duration given in milliseconds as seconds/minutes, or an em dash. */
+function fmtDuration(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n < 1000) return `${Math.round(n)} ms`;
+  const s = n / 1000;
+  if (s < 90) return `${fmtDecimal(s, s < 10 ? 2 : 1)} s`;
+  const m = s / 60;
+  return `${fmtDecimal(m, m < 10 ? 2 : 1)} min`;
+}
+
 function shortHash(h, head = 10, tail = 8) {
   if (!h) return '—';
   const value = String(h);
@@ -411,15 +423,17 @@ async function renderOverview(routeId) {
         ${statItem('Blocks', fmtNum(day.blocks))}
         ${statItem('Volume', `${fmtCoin(day.volumeGrains)} ${COIN_SYMBOL}`, `transparent ${COIN_SYMBOL} volume`)}
         ${statItem('Miner tips', day.minerTipGrains === undefined ? '—' : `${fmtCoin(day.minerTipGrains)} ${COIN_SYMBOL}`, day.tippedTransactions ? `${fmtNum(day.tippedTransactions)} fee-auction tipped tx` : 'fee-auction tips in indexed window')}
-        ${statItem('Hashrate', fmtHashrate(day.hashrate), day.hashrate == null ? 'measuring — needs a few blocks' : 'node estimate from recent block work')}
+        ${statItem('Hashrate', fmtHashrate(day.hashrate), day.hashrate == null ? 'measuring — needs a few blocks' : 'node estimate from recent block work (sov_getDifficulty)')}
+        ${blockTimeStat(s.blockTime)}
         ${!day.windowComplete ? `<p class="stat-footnote">Building the recent window; values become a full 24h view after synchronization.</p>` : ''}
       </section>
 
       <section class="stat-card">
         <h2>Mempool &amp; fees</h2>
         ${statItem('Pending transactions', fmtNum(mempool.transactions), 'sov_getMempoolSize')}
-        ${statItem('Transfer fee', s.fees?.feeGrains === undefined || s.fees?.feeGrains === null ? '—' : `${fmtCoin(s.fees.feeGrains)} ${COIN_SYMBOL}`, s.fees ? `exact runtime fee · gas ${fmtNum(s.fees.gasUsed)} × ${fmtNum(s.fees.gasPriceGrains)} grains (sov_estimateFee)` : 'fee estimate not exposed by node')}
-        ${statItem('Auction floor', '—', 'mempool tip floor is not exposed by the node RPC')}
+        ${feeRouteStats(s)}
+        ${statItem('Auction floor', '—', auctionFloorNote(s))}
+        ${statItem('Block subsidy', s.mintRewardGrains == null ? '—' : `${fmtCoin(s.mintRewardGrains)} ${COIN_SYMBOL}`, s.mintRewardGrains == null ? 'not exposed by node' : 'next coinbase at this height (sov_getMintReward)')}
         ${statItem('Size', fmtBytes(mempool.sizeBytes), 'mempool bytes not exposed')}
       </section>
     </div>
@@ -441,6 +455,63 @@ async function renderOverview(routeId) {
   // Live: new blocks and txs stream into their tables in place.
   live.onBlock = (b) => livePrepend('ov-blocks', blockRow(b), 12);
   live.onTx = (t) => livePrepend('ov-txs', txRow({ ...t, timestampMs: t.timestampMs ?? Date.now() }), 12);
+}
+
+/** Why the mempool auction floor is a dash. The floor genuinely has no RPC, but the
+ * reason must not assert the fee-auction's state when the node has not reported it —
+ * during an outage `deployments` is null and nothing about activation is known. */
+function auctionFloorNote(s) {
+  const feeAuction = (s.deployments?.deployments ?? []).find((d) => d?.name === 'fee-auction');
+  if (!feeAuction) return 'mempool tip floor is not exposed by the node RPC';
+  return feeAuction.state === 'Active'
+    ? 'fee-auction is active, but the mempool tip floor has no RPC — not estimated here'
+    : `fee-auction is ${String(feeAuction.state).toLowerCase()}; the mempool tip floor has no RPC either way`;
+}
+
+/** Observed block spacing, measured from real header timestamps. The window and the
+ * method are shown with the number; a window too small to yield an interval renders
+ * as a dash, never as a zero or as the protocol target dressed up as a measurement. */
+function blockTimeStat(bt) {
+  if (!bt || bt.intervals === 0) {
+    return statItem('Block time', '—', 'not enough retained headers to measure yet');
+  }
+  const target = bt.targetMs == null ? '' : ` · target ${fmtDuration(bt.targetMs)}`;
+  const coverage = bt.complete
+    ? `${fmtNum(bt.intervals)} intervals`
+    : `${fmtNum(bt.intervals)} intervals (partial window)`;
+  const skipped = bt.nonMonotonicIntervals
+    ? ` · ${fmtNum(bt.nonMonotonicIntervals)} backwards header${bt.nonMonotonicIntervals === 1 ? '' : 's'} excluded`
+    : '';
+  return statItem(
+    'Block time (median)',
+    fmtDuration(bt.medianMs),
+    `mean ${fmtDuration(bt.meanMs)}${target} · ${coverage} over #${fmtNum(bt.fromHeight)}–#${fmtNum(bt.toHeight)}${skipped}`,
+  );
+}
+
+/** Every send route the node prices, each an exact runtime fee. Routes the node did
+ * not price are simply not shown rather than rendered as a zero fee. */
+function feeRouteStats(s) {
+  const LABELS = {
+    transfer: 'Transfer fee',
+    tokenTransfer: 'Token transfer fee',
+    shielded: 'Shielded fee',
+  };
+  const routes = s.feeRoutes ?? (s.fees ? { [s.fees.kind]: s.fees } : null);
+  if (!routes || !Object.keys(routes).length) {
+    return statItem('Transfer fee', '—', 'fee estimate not exposed by node');
+  }
+  return Object.entries(LABELS)
+    .filter(([kind]) => routes[kind])
+    .map(([kind, label]) => {
+      const fee = routes[kind];
+      return statItem(
+        label,
+        `${fmtCoin(fee.feeGrains)} ${COIN_SYMBOL}`,
+        `exact runtime fee · gas ${fmtNum(fee.gasUsed)} × ${fmtNum(fee.gasPriceGrains)} grains`,
+      );
+    })
+    .join('');
 }
 
 /** Badge for a BIP-9 deployment state, textual — never colour-only. */
@@ -476,7 +547,24 @@ function deploymentsPanel(s) {
   return `
     <h2>Consensus upgrades <span class="dim">— BIP-9 miner signaling, evaluated by the node at height ${fmtNum(dep.height)}</span></h2>
     <div class="panel"><table><thead><tr><th>Deployment</th><th class="right">Bit</th><th>State</th><th class="right">Start</th><th class="right">Timeout</th><th class="right">Period</th><th>Header signaling observed</th></tr></thead>
-    <tbody>${rows || emptyRow(7)}</tbody></table></div>`;
+    <tbody>${rows || emptyRow(7)}</tbody></table></div>
+    ${signingDomainNote(s)}`;
+}
+
+/** The observable RUNTIME EFFECT of an activated tx-domain deployment: the exact
+ * chain/genesis-bound tags every signature is now checked against. This is what
+ * makes a transaction from another SOV network unreplayable here, and the node
+ * reports it directly (sov_getSigningDomain) rather than it being inferred. */
+function signingDomainNote(s) {
+  const d = s.signingDomain;
+  if (!d) return '';
+  const state = d.active
+    ? '<span class="badge ok">ENFORCED</span>'
+    : '<span class="badge pending">NOT YET ENFORCED</span>';
+  return `<p class="note">Transaction signing domain ${state} — signatures are bound to
+    <code>${esc(d.chainId ?? '—')}</code> and genesis <code>${esc(shortHash(d.genesis, 10, 6))}</code>
+    with tags <code>${esc(d.txTag ?? '—')}</code> / <code>${esc(d.intentTag ?? '—')}</code>.
+    A transaction signed for a different Sovereign network cannot be replayed onto this one.</p>`;
 }
 
 function blockRow(b) {

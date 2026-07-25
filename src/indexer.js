@@ -153,15 +153,54 @@ export class Indexer {
     // block (thousands of requests on a cold start).
     const final = finalAtDepth(head, height, this.finalityDepth);
     const record = normalizeBlock(block, digest, final);
-    if (typeof this.rpc.receipt === 'function' && record.transactions.length) {
-      await Promise.all(record.transactions.map(async (tx) => {
-        const receipt = await this.rpc.receipt(tx.id).catch(() => null);
-        if (!receipt) return;
-        tx.receipt = receipt;
-        tx.executionStatus = receipt.status?.status ?? receipt.status ?? null;
-      }));
-    }
+    await this.attachReceipts(record);
     return record;
+  }
+
+  /**
+   * Attach execution receipts to a block's transactions.
+   *
+   * Prefers `sov_getBlockReceipts` — ONE request for the whole block — and only falls
+   * back to per-transaction `sov_getReceipt` when the node does not serve the batch
+   * form. On a 640-block cold backfill of this chain that is the difference between
+   * roughly one request per transaction (thousands) and one per block, against a
+   * production node the explorer does not own.
+   *
+   * Receipts are matched by transaction id, never by array position: a node that
+   * returns them in another order (or omits one) must not mislabel a transaction's
+   * execution status. Anything unmatched simply stays without a status.
+   */
+  async attachReceipts(record) {
+    if (!record.transactions.length) return;
+    if (typeof this.rpc.blockReceipts === 'function') {
+      const receipts = await this.rpc.blockReceipts(record.height).catch(() => null);
+      if (Array.isArray(receipts)) {
+        const byId = new Map();
+        for (const receipt of receipts) {
+          const id = receipt?.tx_id ?? receipt?.txId ?? null;
+          if (id) byId.set(comparableHash(id), receipt);
+        }
+        let matched = 0;
+        for (const tx of record.transactions) {
+          const receipt = byId.get(comparableHash(tx.id));
+          if (!receipt) continue;
+          matched += 1;
+          tx.receipt = receipt;
+          tx.executionStatus = receipt.status?.status ?? receipt.status ?? null;
+        }
+        // A complete batch is authoritative; a partial one falls through so the
+        // remaining transactions still get their real status.
+        if (matched === record.transactions.length) return;
+      }
+    }
+    if (typeof this.rpc.receipt !== 'function') return;
+    await Promise.all(record.transactions.map(async (tx) => {
+      if (tx.receipt) return;
+      const receipt = await this.rpc.receipt(tx.id).catch(() => null);
+      if (!receipt) return;
+      tx.receipt = receipt;
+      tx.executionStatus = receipt.status?.status ?? receipt.status ?? null;
+    }));
   }
 
   /** Commit one normalized record and optionally announce it as genuinely live. */
@@ -348,25 +387,49 @@ export class Indexer {
       ? this.rpc[name](...args).catch(() => null)
       : Promise.resolve(null));
     try {
-      const [supply, difficulty, miners, mempool, shieldedInfo, deployments, feeEstimate, peerInfo] =
-        await Promise.all([
-          this.rpc.supply(),
-          this.rpc.difficulty(),
-          this.rpc.miners(),
-          this.rpc.mempoolSize(),
-          optional('shieldedInfo'),
-          optional('deployments'),
-          optional('estimateFee', 'transfer'),
-          optional('peerInfo'),
-        ]);
+      // Request budget: this whole batch runs at most once per `statsIntervalMs`
+      // (10 s by default), i.e. ≈1.2 requests/second amortized against ONE relay —
+      // the chain-stat cost of the explorer is fixed and does not grow with traffic,
+      // because every browser is served from this one cached snapshot.
+      const [
+        supply, difficulty, miners, mempool, shieldedInfo, deployments,
+        feeTransfer, feeToken, feeShielded, peerInfo, mintReward, signingDomain,
+      ] = await Promise.all([
+        this.rpc.supply(),
+        this.rpc.difficulty(),
+        this.rpc.miners(),
+        this.rpc.mempoolSize(),
+        optional('shieldedInfo'),
+        optional('deployments'),
+        optional('estimateFee', 'transfer'),
+        optional('estimateFee', 'tokenTransfer'),
+        optional('estimateFee', 'shielded'),
+        optional('peerInfo'),
+        optional('mintReward'),
+        optional('signingDomain'),
+      ]);
       this.store.recordSupply(supply, height);
       this.store.difficulty = difficulty;
       this.store.miners = miners;
       this.store.mempoolSize = mempool;
       if (shieldedInfo) this.store.shieldedInfo = shieldedInfo;
       if (deployments) this.store.deployments = deployments;
-      if (feeEstimate) this.store.feeEstimate = feeEstimate;
+      if (feeTransfer) this.store.feeEstimate = feeTransfer;
+      // Only routes the node actually priced appear; a route it refused is absent
+      // rather than present-and-zero.
+      const routes = {};
+      for (const estimate of [feeTransfer, feeToken, feeShielded]) {
+        if (estimate && typeof estimate.kind === 'string') routes[estimate.kind] = estimate;
+      }
+      if (Object.keys(routes).length) this.store.feeRoutes = routes;
       if (peerInfo) this.store.peerSummary = summarizePeerInfo(peerInfo);
+      if (mintReward !== null && mintReward !== undefined) this.store.mintReward = String(mintReward);
+      if (signingDomain) this.store.signingDomain = signingDomain;
+      // These fields are assigned directly rather than through addBlock/recordSupply,
+      // so the memoized stats snapshot must be invalidated explicitly — otherwise a
+      // refresh that changes only chain stats (difficulty, fees, deployments, peers)
+      // could be served from a stale cached snapshot.
+      this.store._touchStats();
     } catch {
       // Transient RPC hiccup; the next tick retries.
     }
