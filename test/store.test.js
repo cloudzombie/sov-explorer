@@ -3,7 +3,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store, transactionCrypto, txCounterparty } from '../src/store.js';
+import {
+  MINER_WINDOW_BLOCKS,
+  Store,
+  tipGrains,
+  transactionCrypto,
+  txCounterparty,
+  unwrapTipped,
+} from '../src/store.js';
 
 const hx = (n) => '0x' + BigInt(n).toString(16).padStart(64, '0');
 
@@ -44,6 +51,101 @@ test('counterparty extraction', () => {
   assert.equal(txCounterparty({ type: 'transfer', to: 'b.sovereign' }), 'b.sovereign');
   assert.equal(txCounterparty({ type: 'call', contract: 'c.sovereign' }), 'c.sovereign');
   assert.equal(txCounterparty({ type: 'mine' }), null);
+  // A fee-auction tipped envelope touches its inner action's counterparty.
+  assert.equal(
+    txCounterparty({ type: 'tipped', tip: '5', inner: { type: 'transfer', to: 'b.sovereign' } }),
+    'b.sovereign',
+  );
+});
+
+test('tipped envelope unwrap and tip extraction are exact and bounded', () => {
+  const inner = { type: 'transfer', to: 'b.sovereign', amount: '7' };
+  const tipped = { type: 'tipped', tip: '250000', inner };
+  assert.equal(unwrapTipped(tipped), inner);
+  assert.equal(unwrapTipped(inner), inner, 'untipped action passes through');
+  assert.equal(tipGrains(tipped), 250000n);
+  assert.equal(tipGrains(inner), 0n);
+  assert.equal(tipGrains({ type: 'tipped', tip: 'garbage' }), 0n, 'malformed tip is 0, not NaN');
+  // Consensus forbids nesting, but a hostile relay must not loop the explorer.
+  let nested = inner;
+  for (let i = 0; i < 10; i++) nested = { type: 'tipped', tip: '1', inner: nested };
+  assert.ok(unwrapTipped(nested) !== undefined);
+});
+
+test('window stats count tipped volume and miner tips', () => {
+  const s = new Store();
+  const plain = tx(hx(4001), 'a.sovereign', { type: 'transfer', to: 'b.sovereign', amount: '100' });
+  const tipped = tx(hx(4002), 'a.sovereign', {
+    type: 'tipped',
+    tip: '25',
+    inner: { type: 'transfer', to: 'b.sovereign', amount: '300' },
+  });
+  const b = block(1, [plain, tipped]);
+  b.timestampMs = Date.now();
+  s.addBlock(b);
+  const day = s.stats().last24h;
+  assert.equal(day.volumeGrains, '400', 'tipped inner transfer counts toward volume');
+  assert.equal(day.minerTipGrains, '25');
+  assert.equal(day.tippedTransactions, 1);
+});
+
+test('miner accounts in window come from the registry with an explicit window', () => {
+  const s = new Store();
+  assert.equal(s.minerAccountsInWindow(), null, 'no registry yet — unknown, never zero');
+  s.addBlock(block(1000));
+  s.tipHeight = 1000;
+  s.miners = [
+    { account: 'in-window', lastSeenHeight: 1000 },
+    { account: 'edge-in', lastSeenHeight: 1000 - MINER_WINDOW_BLOCKS + 1 },
+    { account: 'edge-out', lastSeenHeight: 1000 - MINER_WINDOW_BLOCKS },
+    { account: 'ancient', lastSeenHeight: 3 },
+    { account: 'malformed' },
+  ];
+  assert.equal(s.minerAccountsInWindow(), 2, 'inclusive window boundary');
+  assert.equal(s.minerAccountsInWindow(10_000), 4, 'wider window counts all well-formed entries');
+  const st = s.stats();
+  assert.equal(st.minerWindow.windowBlocks, MINER_WINDOW_BLOCKS);
+  assert.equal(st.minerWindow.accounts, 2);
+  assert.equal(st.minersActive, 2, 'backward-compatible alias');
+});
+
+test('windowed miner distribution reports coverage honestly', () => {
+  const s = new Store();
+  for (let h = 5; h <= 14; h++) {
+    const b = block(h);
+    b.proposer = h % 2 === 0 ? 'alice' : 'bob';
+    s.addBlock(b);
+  }
+  const w = s.windowMinerStats(8); // heights 7..14, fully retained
+  assert.equal(w.coveredBlocks, 8);
+  assert.equal(w.complete, true);
+  assert.deepEqual(w.miners.map((m) => [m.account, m.blocks]), [['alice', 4], ['bob', 4]]);
+  assert.equal(w.miners[0].share, 0.5);
+
+  const partial = s.windowMinerStats(100); // asks below minHeight (5)
+  assert.equal(partial.coveredBlocks, 10);
+  assert.equal(partial.complete, false, 'partial coverage is declared, not hidden');
+  assert.equal(partial.fromHeight, 5);
+  assert.equal(partial.toHeight, 14);
+
+  const empty = new Store();
+  assert.equal(empty.windowMinerStats(8).coveredBlocks, 0);
+  assert.equal(empty.windowMinerStats(8).complete, false);
+});
+
+test('version-bits signaling counts only headers that carry the signal word', () => {
+  const s = new Store();
+  for (let h = 0; h < 6; h++) {
+    const b = block(h);
+    // heights 0-1 pre-date versionBits retention; 2-3 signal bits 0+1; 4-5 signal none
+    b.versionBits = h < 2 ? null : h < 4 ? 0b11 : 0;
+    s.addBlock(b);
+  }
+  const sig = s.versionBitsSignaling([0, 1], 10);
+  assert.equal(sig.coveredBlocks, 4, 'null signal words are excluded, not counted as zero');
+  assert.deepEqual(sig.byBit, { 0: 2, 1: 2 });
+  assert.deepEqual(s.versionBitsSignaling([0], 2).byBit, { 0: 0 }, 'window restricts to newest blocks');
+  assert.deepEqual(s.versionBitsSignaling([99], 10).byBit, {}, 'invalid bits are rejected');
 });
 
 test('hybrid65 key and signature evidence is measured from retained transactions', () => {

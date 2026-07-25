@@ -6,20 +6,51 @@
 const GRAINS_PER_XUS = 100_000_000n; // 8 decimals
 const SUPPLY_CAP_GRAINS = 21_000_000n * GRAINS_PER_XUS;
 
-// A miner in the node registry (sov_getMiners) counts as ACTIVE if it produced a block
-// within this many blocks of the current tip — i.e. it is mining now, not merely seen
-// once in chain history. At the 150s target this window is ~1.25h, so a home rig or a
-// laptop that just found a block shows up as active and drops off when it goes idle.
-const ACTIVE_MINER_WINDOW_BLOCKS = 30;
+// The recent-miner window: a miner ACCOUNT in the node registry (sov_getMiners)
+// counts as "seen recently" if it won a block within this many blocks of the tip.
+//
+// 576 blocks ≈ 24 hours at the 150 s target — long enough that low-hashrate
+// participants still register: an account holding just 2% of network hashrate
+// misses a 576-block window with probability 0.98^576 ≈ 9×10⁻⁶, and one holding
+// 4% with ≈ 8×10⁻¹¹. A short window (e.g. 20–30 blocks) systematically
+// undercounts small miners — with five accounts of unequal hashrate, the last
+// 20 blocks routinely contain only three or four of them. The count is only
+// meaningful WITH its window, so the API reports both together.
+//
+// NOTE: this counts coinbase ACCOUNTS, not machines. Several physical machines
+// can (and on this network do) pay the same coinbase account, so a machine
+// count is not derivable from chain data and is never claimed.
+export const MINER_WINDOW_BLOCKS = 576;
+
+/** Unwrap a fee-auction `tipped` envelope (v0.1.98) to the action it executes.
+ * Consensus forbids nested tips, but decoding stays bounded regardless. */
+export function unwrapTipped(action) {
+  let inner = action;
+  for (let i = 0; i < 4 && inner && typeof inner === 'object' && inner.type === 'tipped'; i++) {
+    inner = inner.inner ?? null;
+  }
+  return inner;
+}
+
+/** The XUS grains a `tipped` envelope bids to the block's miner (0n when untipped). */
+export function tipGrains(action) {
+  if (!action || typeof action !== 'object' || action.type !== 'tipped') return 0n;
+  try {
+    return BigInt(action.tip ?? 0);
+  } catch {
+    return 0n;
+  }
+}
 
 /** The account a transaction touches besides its signer, if any. */
 export function txCounterparty(action) {
-  if (!action || typeof action !== 'object') return null;
-  switch (action.type) {
+  const a = unwrapTipped(action);
+  if (!a || typeof a !== 'object') return null;
+  switch (a.type) {
     case 'transfer':
-      return action.to ?? null;
+      return a.to ?? null;
     case 'call':
-      return action.contract ?? null;
+      return a.contract ?? null;
     default:
       return null;
   }
@@ -83,6 +114,9 @@ export class Store {
     this.difficulty = null; // { sha256d, algo, hashrate, targetBlockMs } from sov_getDifficulty
     this.mempoolSize = 0;
     this.shieldedInfo = null;
+    this.deployments = null; // { height, deployments: [...] } from sov_getDeployments
+    this.feeEstimate = null; // { kind, gasUsed, gasPriceGrains, feeGrains } from sov_estimateFee
+    this.peerSummary = null; // { peers, agents } aggregated from sov_getPeerInfo (no addresses)
     this.supplySeries = []; // [{ height, total, mined, timestampMs }]
     this.totalTxIndexed = 0;
     this.totalBlockBytesIndexed = 0;
@@ -113,6 +147,9 @@ export class Store {
     this.difficulty = null;
     this.mempoolSize = 0;
     this.shieldedInfo = null;
+    this.deployments = null;
+    this.feeEstimate = null;
+    this.peerSummary = null;
     this.supplySeries = [];
     this.totalTxIndexed = 0;
     this.totalBlockBytesIndexed = 0;
@@ -339,20 +376,94 @@ export class Store {
   }
 
   /**
-   * How many miners in the node registry are ACTIVE — produced a block within
-   * `ACTIVE_MINER_WINDOW_BLOCKS` of the current tip. Distinct from `miners.length`
-   * (every miner ever seen) and from the relay count (infrastructure nodes). This is
-   * the number that rises when the home rig or a laptop starts mining and falls when
-   * they go idle. Returns null when the tip or registry isn't known yet.
+   * How many miner ACCOUNTS in the node registry won a block within the last
+   * `windowBlocks` of the tip. Registry `lastSeenHeight` covers the whole chain,
+   * so this is exact even beyond the in-memory block window. Distinct from
+   * `miners.length` (every account ever seen) and from the relay count
+   * (infrastructure nodes). Returns null when the tip or registry isn't known —
+   * an unknown count is never rendered as zero.
    */
-  _activeMinerCount() {
+  minerAccountsInWindow(windowBlocks = MINER_WINDOW_BLOCKS) {
     if (!Array.isArray(this.miners) || this.miners.length === 0) return null;
     if (!Number.isFinite(this.tipHeight) || this.tipHeight < 0) return null;
-    const cutoff = this.tipHeight - ACTIVE_MINER_WINDOW_BLOCKS;
+    const cutoff = this.tipHeight - windowBlocks + 1;
     return this.miners.reduce((n, m) => {
       const seen = Number(m?.lastSeenHeight);
       return n + (Number.isFinite(seen) && seen >= cutoff ? 1 : 0);
     }, 0);
+  }
+
+  /**
+   * Per-account block wins over the last `windowBlocks` heights, computed from the
+   * blocks actually retained in memory. Reports its own coverage honestly: when the
+   * store retains fewer than `windowBlocks` blocks, `coveredBlocks`/`complete` say
+   * exactly which sub-range the shares describe instead of pretending a full window.
+   */
+  windowMinerStats(windowBlocks = MINER_WINDOW_BLOCKS) {
+    const to = this.tipHeight;
+    if (!Number.isFinite(to) || to < 0) {
+      return { windowBlocks, fromHeight: null, toHeight: null, coveredBlocks: 0, complete: false, miners: [] };
+    }
+    const requestedFrom = Math.max(0, to - windowBlocks + 1);
+    const from = Math.max(requestedFrom, Number.isFinite(this.minHeight) ? this.minHeight : requestedFrom);
+    const byAccount = new Map();
+    let covered = 0;
+    for (let h = from; h <= to; h++) {
+      const b = this.blocksByHeight.get(h);
+      if (!b || !b.proposer) continue; // genesis mints nothing and has no miner
+      covered += 1;
+      const entry = byAccount.get(b.proposer) ?? { blocks: 0, lastHeight: -1 };
+      entry.blocks += 1;
+      entry.lastHeight = Math.max(entry.lastHeight, h);
+      byAccount.set(b.proposer, entry);
+    }
+    const miners = [...byAccount.entries()]
+      .map(([account, s]) => ({
+        account,
+        blocks: s.blocks,
+        share: covered > 0 ? s.blocks / covered : null,
+        lastHeight: s.lastHeight,
+      }))
+      .sort((a, b) => b.blocks - a.blocks || a.account.localeCompare(b.account));
+    return {
+      windowBlocks,
+      fromHeight: covered > 0 ? from : null,
+      toHeight: covered > 0 ? to : null,
+      coveredBlocks: covered,
+      complete: from === requestedFrom && covered >= to - from + 1,
+      miners,
+    };
+  }
+
+  /**
+   * BIP-9 signaling actually observed in retained headers: for each deployment bit,
+   * how many of the last `windowBlocks` retained blocks set it in `version_bits`.
+   * Blocks indexed before the explorer recorded `versionBits` are excluded from
+   * `coveredBlocks` rather than counted as non-signaling.
+   */
+  versionBitsSignaling(bits, windowBlocks = 288) {
+    const to = this.tipHeight;
+    const wanted = (Array.isArray(bits) ? bits : [])
+      .map(Number)
+      .filter((bit) => Number.isInteger(bit) && bit >= 0 && bit <= 28);
+    if (!Number.isFinite(to) || to < 0) {
+      return { windowBlocks, coveredBlocks: 0, byBit: Object.fromEntries(wanted.map((b) => [b, 0])) };
+    }
+    const from = Math.max(0, Math.max(to - windowBlocks + 1, Number.isFinite(this.minHeight) ? this.minHeight : 0));
+    const byBit = Object.fromEntries(wanted.map((b) => [b, 0]));
+    let covered = 0;
+    for (let h = from; h <= to; h++) {
+      const b = this.blocksByHeight.get(h);
+      const raw = b?.versionBits;
+      if (raw === null || raw === undefined) continue; // pre-retention block: excluded, not zero
+      const vb = Number(raw);
+      if (!Number.isFinite(vb)) continue;
+      covered += 1;
+      for (const bit of wanted) {
+        if ((vb >>> bit) & 1) byBit[bit] += 1;
+      }
+    }
+    return { windowBlocks, coveredBlocks: covered, byBit };
   }
 
   recordSupply(supply, height) {
@@ -371,12 +482,13 @@ export class Store {
   }
 
   transparentVolumeGrains(action) {
-    if (!action || typeof action !== 'object') return 0n;
+    const a = unwrapTipped(action); // a tipped envelope moves its inner action's value
+    if (!a || typeof a !== 'object') return 0n;
     try {
-      switch (action.type) {
+      switch (a.type) {
         case 'transfer':
         case 'htlc_lock':
-          return BigInt(action.amount ?? 0);
+          return BigInt(a.amount ?? 0);
         default:
           return 0n;
       }
@@ -391,6 +503,8 @@ export class Store {
     let transactions = 0;
     let volume = 0n;
     let txBytes = 0;
+    let tips = 0n;
+    let tippedTransactions = 0;
 
     for (const block of this.blocksByHeight.values()) {
       if ((block.timestampMs ?? 0) < cutoff) continue;
@@ -399,6 +513,11 @@ export class Store {
         transactions += 1;
         txBytes += tx.sizeBytes ?? 0;
         volume += this.transparentVolumeGrains(tx.action);
+        const tip = tipGrains(tx.action);
+        if (tip > 0n || tx.action?.type === 'tipped') {
+          tippedTransactions += 1;
+          tips += tip;
+        }
       }
     }
 
@@ -409,6 +528,8 @@ export class Store {
       transactionsPerSecond: transactions / Math.max(1, windowMs / 1000),
       blocks,
       volumeGrains: volume.toString(),
+      minerTipGrains: tips.toString(),
+      tippedTransactions,
       medianTransactionFeeUsd: null,
       averageTransactionFeeUsd: null,
       hashrate: this.difficulty?.hashrate ?? null,
@@ -465,6 +586,10 @@ export class Store {
       ? 0
       : Math.max(0, Math.min(span, this.tipHeight - this.syncStartHeight + 1));
     const progress = this.ready ? 1 : span ? completed / span : 0;
+    const recentMinerAccounts = this.minerAccountsInWindow();
+    const deploymentBits = (this.deployments?.deployments ?? [])
+      .map((d) => Number(d?.bit))
+      .filter((bit) => Number.isInteger(bit) && bit >= 0 && bit <= 28);
     const value = {
       chainId: this.chainId,
       genesisHash: this.genesisHash,
@@ -475,10 +600,27 @@ export class Store {
       indexedFromHeight: Number.isFinite(this.minHeight) ? this.minHeight : null,
       minersObserved: this.proposers.size,
       miners: this.miners.length,
-      minersActive: this._activeMinerCount(),
+      minersActive: recentMinerAccounts, // backward-compatible alias for minerWindow.accounts
+      // The miner-account count is only meaningful with its window, so the two are
+      // reported as one object. Accounts, not machines: several machines can pay
+      // the same coinbase account.
+      minerWindow: {
+        windowBlocks: MINER_WINDOW_BLOCKS,
+        accounts: recentMinerAccounts,
+        allTimeAccounts: this.miners.length || null,
+      },
       mempoolSize: this.mempoolSize,
       supply: this.supply,
       difficulty: this.difficulty,
+      shieldedInfo: this.shieldedInfo,
+      // BIP-9 deployment states straight from sov_getDeployments (null = the node
+      // does not expose them), plus signaling actually observed in retained headers.
+      deployments: this.deployments,
+      signaling: deploymentBits.length ? this.versionBitsSignaling(deploymentBits) : null,
+      // sov_estimateFee for a plain transfer (null = not exposed by the node). The
+      // mempool auction's dynamic floor has no RPC today and is reported as absent.
+      fees: this.feeEstimate,
+      peers: this.peerSummary,
       allTime: {
         circulationGrains: this.supply?.total ?? null,
         marketCapUsd: null,
@@ -486,7 +628,7 @@ export class Store {
         blockchainSizeBytes: this.totalBlockBytesIndexed,
         networkNodes: this.miners.length || null,
         minersSeen: this.miners.length || null,
-        minersActive: this._activeMinerCount(),
+        minersActive: recentMinerAccounts,
         difficulty: this.difficulty?.sha256d ?? null,
         // The PoW seal actually in force (RandomX on mainnet, SHA-256d on dev/test) —
         // reported by the node's sov_getDifficulty `algo`, not assumed.

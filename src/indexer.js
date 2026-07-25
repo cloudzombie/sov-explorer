@@ -44,6 +44,12 @@ export function normalizeBlock(block, digest, final) {
     stateRoot: h.state_root,
     timestampMs: h.timestamp_ms,
     proposer: h.proposer,
+    // Raw header consensus fields: the BIP-9 signal word, the PoW compact target,
+    // and the seal nonce — retained so signaling/difficulty are shown from real
+    // headers, never re-derived. Null when a (pre-upgrade) node omits them.
+    versionBits: h.version_bits ?? null,
+    bits: h.bits ?? null,
+    nonce: h.nonce ?? null,
     // The coinbase: this block's real height-keyed subsidy, computed by the node.
     // Current mainnet pays 100% to the proof-of-work miner. Null for genesis.
     coinbase: digest.coinbase ?? null,
@@ -51,6 +57,27 @@ export function normalizeBlock(block, digest, final) {
     sizeBytes: Buffer.byteLength(JSON.stringify(block)),
     transactions,
     final: !!final,
+  };
+}
+
+/**
+ * Reduce sov_getPeerInfo to what a public explorer may republish: counts and
+ * software-version distribution of the RELAY's own peers. Peer IP addresses are
+ * deliberately dropped — home miners' addresses are not the explorer's to publish.
+ * This is connectivity of one relay, NOT a census of network machines.
+ */
+export function summarizePeerInfo(info) {
+  if (!info || typeof info !== 'object') return null;
+  const agents = {};
+  for (const peer of Array.isArray(info.peerVersions) ? info.peerVersions : []) {
+    const agent = typeof peer?.agent === 'string' && peer.agent ? peer.agent : 'unknown';
+    agents[agent] = (agents[agent] ?? 0) + 1;
+  }
+  return {
+    peers: Number.isFinite(Number(info.peers)) ? Number(info.peers) : null,
+    relayVersion: typeof info.version === 'string' ? info.version : null,
+    protocolVersion: Number.isFinite(Number(info.protocolVersion)) ? Number(info.protocolVersion) : null,
+    agents,
   };
 }
 
@@ -314,21 +341,32 @@ export class Indexer {
   }
 
   async refreshChainStats(height) {
+    // Optional RPCs (absent on older nodes) fail soft to null and keep the last
+    // good value on a transient error — an unavailable datum renders as
+    // unavailable, never as a fabricated zero.
+    const optional = (name, ...args) => (typeof this.rpc[name] === 'function'
+      ? this.rpc[name](...args).catch(() => null)
+      : Promise.resolve(null));
     try {
-      const [supply, difficulty, miners, mempool, shieldedInfo] = await Promise.all([
-        this.rpc.supply(),
-        this.rpc.difficulty(),
-        this.rpc.miners(),
-        this.rpc.mempoolSize(),
-        typeof this.rpc.shieldedInfo === 'function'
-          ? this.rpc.shieldedInfo().catch(() => null)
-          : Promise.resolve(null),
-      ]);
+      const [supply, difficulty, miners, mempool, shieldedInfo, deployments, feeEstimate, peerInfo] =
+        await Promise.all([
+          this.rpc.supply(),
+          this.rpc.difficulty(),
+          this.rpc.miners(),
+          this.rpc.mempoolSize(),
+          optional('shieldedInfo'),
+          optional('deployments'),
+          optional('estimateFee', 'transfer'),
+          optional('peerInfo'),
+        ]);
       this.store.recordSupply(supply, height);
       this.store.difficulty = difficulty;
       this.store.miners = miners;
       this.store.mempoolSize = mempool;
       if (shieldedInfo) this.store.shieldedInfo = shieldedInfo;
+      if (deployments) this.store.deployments = deployments;
+      if (feeEstimate) this.store.feeEstimate = feeEstimate;
+      if (peerInfo) this.store.peerSummary = summarizePeerInfo(peerInfo);
     } catch {
       // Transient RPC hiccup; the next tick retries.
     }

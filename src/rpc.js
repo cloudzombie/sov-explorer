@@ -426,6 +426,12 @@ export class SovereignRpc {
   receiptProof(txId) { return this.call('sov_getReceiptProof', { txId }, { nonNull: true }); }
   miners() { return this.call('sov_getMiners'); }
   mempoolSize() { return this.call('sov_getMempoolSize'); }
+  /** BIP-9 miner-signaled deployment states (tx-domain, fee-auction, …). */
+  deployments() { return this.call('sov_getDeployments'); }
+  /** The exact runtime fee for one wallet send route at the live gas price. */
+  estimateFee(kind = 'transfer') { return this.call('sov_estimateFee', { kind }); }
+  /** Live node networking state (peer counts / versions). */
+  peerInfo() { return this.call('sov_getPeerInfo'); }
 
   listTokens(offset = 0, limit = 100) { return this.call('sov_listTokens', { offset, limit }); }
   tokenInfo(asset) { return this.call('sov_getTokenInfo', { hash: asset }); }
