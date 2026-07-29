@@ -77,3 +77,36 @@ export function shieldedActivation(deployment, head, opts = {}) {
     milestones,
   };
 }
+
+// ---- shielded-pool "blocky" migration chart helpers ----------------------
+// Pure, DOM-free quantisers shared by the Minecraft/Tetris-style pool chart in
+// app.js. Kept here (like RingBuffer in ticker.js) so they are unit-testable.
+
+// Choose a "nice" XUS-per-block unit on a 1/2/5×10ⁿ ladder so the tallest pool
+// stack is roughly `target` unit-blocks tall (never taller). Returns the XUS
+// value a single block denotes. `maxValueXus` ≤ 0 collapses to a unit of 1 so a
+// freshly-launched, empty pool still renders one honest empty column.
+export function blockUnit(maxValueXus, target = 20) {
+  const max = Math.max(0, Number(maxValueXus) || 0);
+  const t = Math.max(1, Number(target) || 20);
+  if (max <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(max / t)));
+  for (const step of [1, 2, 5]) {
+    const unit = step * mag;
+    if (max / unit <= t) return unit;
+  }
+  return 10 * mag;
+}
+
+// Quantise a pool's XUS value into discrete unit-blocks. `unit` is the XUS a
+// single block denotes. Returns whole `full` blocks plus a `partial` fraction
+// (0..1) for the remainder that sits below one unit — drawn as a short top
+// block. Pure — no DOM, no rounding surprises for the caller.
+export function poolBlocks(valueXus, unit) {
+  const v = Math.max(0, Number(valueXus) || 0);
+  const u = Number(unit) > 0 ? Number(unit) : 1;
+  const total = v / u;
+  const full = Math.floor(total + 1e-9);
+  const partial = Math.min(1, Math.max(0, total - full));
+  return { full, partial, total };
+}
