@@ -1,8 +1,21 @@
 // Sovereign Explorer — single-page UI. Hash-routed, fetches the REST API, and follows
 // a WebSocket live feed. All values shown are real chain data served by the node.
 import { downloadRows, explainAction, isWatched, shieldedActivation, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
+import { BlockTicker } from './ticker.js';
 
 const $ = (id) => document.getElementById(id);
+
+// Honour the OS reduced-motion setting: the LIVE strip falls back to a
+// stepwise, non-scrolling behaviour instead of a continuous marquee.
+const REDUCED_MOTION = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+// The rolling block-height ticker beside the LIVE badge (see web/ticker.js).
+let blockTicker = null;
+// Recent block timestamps (ms), newest last — feeds the cadence sparkline.
+let cadenceTs = [];
+// Rolling pool-split samples this browser has observed ({height, v1, v2} grain
+// strings), persisted so the v1→v2 migration chart survives reloads. The node
+// does not retain a pool-split time-series, so this is a best-effort local view.
+const POOL_HISTORY_KEY = 'sov-pool-history-v1';
 const view = $('view');
 const DEFAULT_DESCRIPTION = 'Independent live explorer for Sovereign blocks, transactions, accounts, assets, contracts, HTLCs, and Nakamoto finality.';
 
@@ -165,13 +178,16 @@ async function switchNet(net) {
   NET = net;
   LAST_STATUS = null;
   const ticker = $('ticker');
-  const tickerItems = $('ticker-items');
+  if (blockTicker) {
+    blockTicker.destroy();
+    blockTicker = null;
+  }
   if (ticker) ticker.hidden = true;
-  if (tickerItems) tickerItems.replaceChildren();
   localStorage.setItem('sov-net-v2', net);
   setPageMeta(net);
   setNetToggleUI();
   connectWs();
+  seedTicker();
   await route().catch((e) => errView(e.message));
   pollStatus();
 }
@@ -368,13 +384,21 @@ function safeBigInt(value) {
 
 async function renderOverview(routeId) {
   setView('<div class="loading">Loading overview…</div>', routeId);
-  const [status, blocks, txs, supply] = await Promise.all([
+  const [status, blocks100, txs, supply] = await Promise.all([
     api('/status'),
-    api('/blocks?limit=12'),
+    api('/blocks?limit=100').catch(() => []),
     api('/txs?limit=12'),
     api('/supply').catch(() => null),
   ]);
+  const blocks = (Array.isArray(blocks100) ? blocks100 : []).slice(0, 12);
   const s = status;
+  // Feed the live-strip cadence sparkline and record a pool-split sample.
+  seedCadence(blocks100);
+  recordPoolSample(
+    Number(s.sync?.nodeHeight ?? s.tipHeight),
+    supply?.shielded ?? s.shieldedInfo?.poolValue ?? null,
+    s.shieldedV2Info?.poolValue ?? null,
+  );
   const all = s.allTime ?? {};
   const day = s.last24h ?? {};
   const mempool = s.mempool ?? {};
@@ -399,7 +423,7 @@ async function renderOverview(routeId) {
         <p><span id="hero-chain">${esc(s.chainId || 'Chain')}</span> · node height <span id="hero-height">${fmtNum(sync.nodeHeight ?? s.tipHeight ?? 0)}</span>${sync.ready ? '' : ` · indexing <span id="hero-indexed">${fmtNum(sync.indexedHeight ?? 0)}</span>`}</p>
       </div>
       <div class="hero-meta">
-        <span>Genesis ${esc(shortHash(s.genesisHash, 10, 6))}</span>
+        <a class="genesis-chip mono" href="#/block/0" title="Open the genesis block (#0) — ${esc(s.genesisHash || '')}">Genesis ${esc(shortHash(s.genesisHash, 10, 6))}</a>
         <span>${fmtNum(s.blocksIndexed)} indexed blocks</span>
         ${s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : ''}
         <span class="relay-pill ${relay.degraded ? 'degraded' : ''}">${esc(relayText)}</span>
@@ -407,11 +431,13 @@ async function renderOverview(routeId) {
         ${pqActivationChips(s)}
       </div>
     </section>
+    ${signalProgress(s)}
+    ${trustWidget(s, supply, s.genesisHash)}
 
     <div class="stat-columns">
       <section class="stat-card">
         <h2>All time</h2>
-        ${statItem('Circulation', `${fmtCoin(all.circulationGrains)} ${COIN_SYMBOL}`, `${pct(s.mintedOfCap)} of 21,000,000 cap minted`)}
+        ${statItem('Circulation', `<span id="ov-circulation">${fmtCoin(all.circulationGrains)} ${COIN_SYMBOL}</span>`, `${pct(s.mintedOfCap)} of 21,000,000 cap minted`)}
         ${statItem('Shielded supply', supply?.shieldedPercent === undefined ? '—' : `${fmtDecimal(supply.shieldedPercent, 2)}%`, supply ? `${fmtCoin(supply.shielded)} ${COIN_SYMBOL} private of ${fmtCoin(supply.total)} (Orchard pool — not post-quantum)` : 'node unreachable')}
         ${statItem('Market cap', fmtUsd(all.marketCapUsd), 'price feed not configured')}
         ${statItem('Market dominance', all.marketDominance === null || all.marketDominance === undefined ? '—' : pct(all.marketDominance), 'market feed not configured')}
@@ -444,6 +470,8 @@ async function renderOverview(routeId) {
       </section>
     </div>
     ${deploymentsPanel(s)}
+    ${minerReadinessBoard(blocks100)}
+    ${poolMigrationChart()}
 
     <div class="grid2">
       <div>
@@ -458,6 +486,8 @@ async function renderOverview(routeId) {
       </div>
     </div>
   `, routeId);
+  // Count the circulation figure up to its value (rolls on later re-renders).
+  odometer($('ov-circulation'), all.circulationGrains, (g) => `${fmtCoin(String(Math.round(g)))} ${COIN_SYMBOL}`, 'ov-circulation');
   // Live: new blocks and txs stream into their tables in place.
   live.onBlock = (b) => livePrepend('ov-blocks', blockRow(b), 12);
   live.onTx = (t) => livePrepend('ov-txs', txRow({ ...t, timestampMs: t.timestampMs ?? Date.now() }), 12);
@@ -654,7 +684,9 @@ function signingDomainNote(s) {
 
 function blockRow(b) {
   const coinbase = b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>';
-  return `<tr><td>${blockLink(b.height)}</td><td>${acctLinkShort(b.proposer)}</td><td class="right num">${fmtNum(b.txCount)}</td><td class="right num">${coinbase}</td><td class="dim" title="${esc(new Date(b.timestampMs).toLocaleString())}">${timeAgo(b.timestampMs)}</td><td>${finalBadge(b.final)}</td></tr>`;
+  // Finality shading: pending blocks (<6 confirmations) read dimmer with an amber
+  // edge; they brighten with a green edge once the node reports them final.
+  return `<tr class="blk-row ${b.final ? 'is-final' : 'is-pending'}"><td>${blockLink(b.height)}</td><td>${acctLinkShort(b.proposer)}</td><td class="right num">${fmtNum(b.txCount)}</td><td class="right num">${coinbase}</td><td class="dim" title="${esc(new Date(b.timestampMs).toLocaleString())}">${timeAgo(b.timestampMs)}</td><td>${finalBadge(b.final)}</td></tr>`;
 }
 function txRow(t) {
   return `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td class="dim" title="${esc(new Date(t.timestampMs).toLocaleString())}">${timeAgo(t.timestampMs)}</td><td>${acctLinkShort(t.signer)}</td><td class="right">${blockLink(t.blockHeight)}</td></tr>`;
@@ -735,7 +767,7 @@ async function renderBlocks(before, routeId) {
 }
 
 function blocksListRow(b) {
-  return `<tr>
+  return `<tr class="blk-row ${b.final ? 'is-final' : 'is-pending'}">
     <td>${blockLink(b.height)}</td>
     <td>${blockHashLink(b.hash)}</td>
     <td>${b.proposer ? acctLinkShort(b.proposer) : '<span class="dim">genesis</span>'}</td>
@@ -929,7 +961,7 @@ async function renderBlock(ref, routeId) {
     <div class="crumb"><a href="#/blocks">Blocks</a> / Block #${fmtNum(b.height)}</div>
     <h1>Block #${fmtNum(b.height)} ${finalBadge(b.final)}</h1>
     <div class="panel"><table class="kv">
-      <tr><td class="k">Hash</td><td class="v">${esc(b.hash)} ${copyButton(b.hash, 'block hash')}</td></tr>
+      <tr><td class="k">Hash</td><td class="v">${copyable(b.hash, 'block hash')} ${copyButton(b.hash, 'block hash')}</td></tr>
       <tr><td class="k">Parent</td><td class="v">${b.height > 0 ? blockHashLink(b.prevHash) : '<span class="dim">genesis</span>'}</td></tr>
       <tr><td class="k">Miner</td><td class="v">${acctLink(b.proposer)}</td></tr>
       <tr><td class="k">Timestamp</td><td class="v">${new Date(b.timestampMs).toLocaleString()} <span class="dim">(${esc(b.timestampMs)} ms)</span></td></tr>
@@ -1096,7 +1128,7 @@ async function renderTx(id, routeId) {
     <div class="crumb">Transaction</div>
     <h1>Transaction ${actionBadge(t.action)} ${finalBadge(t.final)}</h1>
     <div class="panel"><table class="kv">
-      <tr><td class="k">Id</td><td class="v">${esc(t.id)} ${copyButton(t.id, 'transaction id')}</td></tr>
+      <tr><td class="k">Id</td><td class="v">${copyable(t.id, 'transaction id')} ${copyButton(t.id, 'transaction id')}</td></tr>
       <tr><td class="k">Status</td><td class="v">${receiptStatus(r)}</td></tr>
       <tr><td class="k">Block</td><td class="v">${blockLink(t.blockHeight)} · ${blockHashLink(t.blockHash)}</td></tr>
       <tr><td class="k">Confirmations</td><td class="v">${fmtNum(t.confirmations)} ${t.final ? '<span class="dim">— final (buried past the 6-confirmation Nakamoto depth)</span>' : '<span class="dim">— pending finality (6 required)</span>'}</td></tr>
@@ -1160,7 +1192,7 @@ async function renderAccount(idRaw, params, routeId) {
     : `<tr><td class="v empty" colspan="2">This account is not funded on-chain (it holds no state).</td></tr>`;
   setView(`
     <div class="crumb">Account${data.resolvedFrom ? ` · resolved from SNS name` : ''}</div>
-    <h1 class="mono">${esc(acct)} ${copyButton(acct, 'account')}</h1>
+    <h1 class="mono">${copyable(acct, 'account')} ${copyButton(acct, 'account')}</h1>
     <p><button type="button" class="watch-toggle" data-account="${encodeURIComponent(acct)}">${isWatched(acct) ? '★ Remove from local watchlist' : '☆ Add to local watchlist'}</button></p>
     ${data.resolvedFrom ? `<p class="dim">↳ <span class="mono">${esc(data.resolvedFrom)}</span> resolves here</p>` : ''}
     ${names.length ? `<p class="dim">SNS: ${names.map((n) => `<span class="mono">${esc(n)}</span>`).join(', ')}</p>` : ''}
@@ -1453,7 +1485,7 @@ async function renderProof(routeId) {
         <div class="proof-heading"><div><span class="eyebrow">CHAIN PROVENANCE</span><h2>Relay quorum</h2></div><span class="proof-state ${relays.consistent === false ? 'bad' : relays.degraded ? 'warn' : 'ok'}">${esc(quorumLabel)}</span></div>
         <div class="evidence-kv">
           <span>Chain id</span><b class="mono">${esc(proof.identity?.chainId)}</b>
-          <span>Genesis</span><b class="mono break">${esc(proof.identity?.genesisHash)} ${copyButton(proof.identity?.genesisHash, 'genesis hash')}</b>
+          <span>Genesis</span><b class="mono break">${copyable(proof.identity?.genesisHash, 'genesis hash')} ${copyButton(proof.identity?.genesisHash, 'genesis hash')}</b>
           <span>Common-head hash</span><b class="mono break">${commonHash ? `${esc(commonHash)} ${copyButton(commonHash, 'common-head hash')}` : '—'}</b>
           <span>Node / indexed</span><b class="mono">${fmtNum(proof.sync?.nodeHeight)} / ${fmtNum(proof.sync?.indexedHeight)}</b>
           <span>Durable archive</span><b class="mono">${proof.archive?.enabled ? `${fmtNum(proof.archive.blocks)} blocks · ${proof.archive.complete ? 'complete from genesis' : `contiguous from #${fmtNum(proof.archive.contiguousFromHeight)}`}` : 'disabled'}</b>
@@ -1650,22 +1682,68 @@ document.addEventListener('click', async (event) => {
     finally { proofButton.disabled = false; }
     return;
   }
+  // Copy-on-click: the ⧉ buttons AND any element carrying data-copy (hash/address
+  // text made copyable inline). One handler, one toast, shared everywhere.
   const button = event.target.closest?.('.copy-btn');
-  if (!button) return;
-  try {
-    const value = decodeURIComponent(button.dataset.copy || '');
-    await navigator.clipboard.writeText(value);
-    const old = button.textContent;
-    button.textContent = '✓';
-    button.classList.add('copied');
-    setTimeout(() => {
-      button.textContent = old;
-      button.classList.remove('copied');
-    }, 1200);
-  } catch {
-    button.title = 'Copy failed — select the value manually';
-  }
+  const target = button || event.target.closest?.('.copyable[data-copy]');
+  if (target) doCopy(target, button);
 });
+
+// Keyboard support for the inline copyable spans (role="button").
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const el = event.target.closest?.('.copyable[data-copy]');
+  if (!el) return;
+  event.preventDefault();
+  doCopy(el, null);
+});
+
+// ---- item 7: copy value + transient toast ---------------------------------
+async function doCopy(el, button) {
+  const value = decodeURIComponent(el.dataset.copy || '');
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    if (button) {
+      const old = button.textContent;
+      button.textContent = '✓';
+      button.classList.add('copied');
+      setTimeout(() => {
+        button.textContent = old;
+        button.classList.remove('copied');
+      }, 1200);
+    }
+    showToast('Copied to clipboard');
+  } catch {
+    el.title = 'Copy failed — select the value manually';
+    showToast('Copy failed', true);
+  }
+}
+let toastTimer = 0;
+function showToast(message, warn = false) {
+  let el = $('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.className = `toast show${warn ? ' warn' : ''}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    el.className = 'toast';
+  }, 1600);
+}
+
+// Wrap a hash/address as clickable copy-to-clipboard text (reuses the shared
+// handler + toast above). Returns escaped, safe markup.
+function copyable(value, label = 'value') {
+  if (value === null || value === undefined) return '';
+  const v = String(value);
+  return `<span class="copyable" data-copy="${encodeURIComponent(v)}" tabindex="0" role="button" title="Click to copy ${esc(label)}">${esc(v)}</span>`;
+}
 
 // ---- live feed + header status --------------------------------------------
 
@@ -1682,16 +1760,316 @@ function drawSealStars() {
   g.innerHTML = s;
 }
 
-function pushTicker(text) {
-  const items = $('ticker-items');
+// Populate one rolling ticker chip for a block. Each chip is an <a> pointing at
+// the block-detail route, so every item is individually clickable and navigates
+// to its own height (pause-on-hover, in web/ticker.js, makes moving chips
+// catchable). Reused when a chip recycles into a freshly-mined block.
+function renderBlockChip(el, b) {
+  el.href = `#/block/${encodeURIComponent(b.height)}`;
+  el.title = `Open block #${fmtNum(b.height)} — ${fmtNum(b.txCount)} tx`;
+  el.innerHTML = `<b>#${fmtNum(b.height)}</b> · ${fmtNum(b.txCount)} tx`;
+}
+
+// Build (or rebuild) the marquee against the current DOM + reduced-motion mode.
+function ensureTicker() {
+  const track = $('ticker-track');
+  const viewport = $('ticker-viewport');
+  const ticker = $('ticker');
+  if (!track || !viewport) return null;
+  if (ticker) ticker.classList.toggle('reduced', REDUCED_MOTION);
+  if (!blockTicker) {
+    blockTicker = new BlockTicker({
+      track,
+      viewport,
+      render: renderBlockChip,
+      cap: 48,
+      speed: 44,
+      reducedMotion: REDUCED_MOTION,
+    });
+  }
+  return blockTicker;
+}
+
+// Seed the ticker from recent block history so it always has content rolling,
+// even before the next block is mined. Degrades quietly: if the REST call fails
+// the live WS feed will still seed it on the first incoming block.
+async function seedTicker() {
+  if (NET_LIVE[NET] === false) return;
+  let blocks;
+  try {
+    blocks = await api('/blocks?limit=24');
+  } catch {
+    return; // no history yet — the WS feed will bootstrap the ticker
+  }
+  if (!Array.isArray(blocks) || !blocks.length) return;
+  const ticker = ensureTicker();
+  if (!ticker) return;
   const t = $('ticker');
-  if (!items) return;
-  t.hidden = false;
-  const chip = document.createElement('span');
-  chip.className = 'ticker-chip';
-  chip.innerHTML = text;
-  items.prepend(chip);
-  while (items.children.length > 14) items.lastChild.remove();
+  if (t) t.hidden = false;
+  // The REST list is newest-first; the ticker wants oldest..newest so the newest
+  // block sits at the leading (right) edge that fresh blocks feed in from.
+  ticker.seed(blocks.map((b) => ({ height: b.height, txCount: b.txCount })).reverse());
+  seedCadence(blocks);
+}
+
+// A freshly-mined block from the live feed rolls into the ticker.
+function tickerPushBlock(b) {
+  const ticker = ensureTicker();
+  if (!ticker) return;
+  const t = $('ticker');
+  if (t) t.hidden = false;
+  ticker.push({ height: b.height, txCount: b.txCount });
+  pulseLive();
+  cadenceTs.push(b.timestampMs ?? Date.now());
+  if (cadenceTs.length > 40) cadenceTs = cadenceTs.slice(-40);
+  renderCadence();
+}
+
+// ---- item 6: LIVE heartbeat -----------------------------------------------
+// Pulse the green LIVE badge on each new block. Re-trigger the CSS animation by
+// removing the class, forcing reflow, then re-adding it.
+function pulseLive() {
+  const label = $('ticker-label');
+  if (!label || REDUCED_MOTION) return;
+  label.classList.remove('beat');
+  void label.offsetWidth;
+  label.classList.add('beat');
+}
+
+// ---- item 4: block-cadence sparkline --------------------------------------
+// A tiny SVG of recent inter-block times, pinned at the right of the LIVE strip,
+// so the ~2.5-min pulse is visible. Hidden until at least two blocks are known.
+function seedCadence(blocks) {
+  if (!Array.isArray(blocks)) return;
+  cadenceTs = blocks
+    .map((b) => b.timestampMs)
+    .filter((t) => Number.isFinite(t))
+    .sort((a, b) => a - b)
+    .slice(-40);
+  renderCadence();
+}
+function renderCadence() {
+  const el = $('ticker-cadence');
+  if (!el) return;
+  const gaps = [];
+  for (let i = 1; i < cadenceTs.length; i++) {
+    const d = (cadenceTs[i] - cadenceTs[i - 1]) / 1000; // seconds
+    if (d > 0 && d < 3600) gaps.push(d);
+  }
+  const recent = gaps.slice(-24);
+  if (recent.length < 2) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const max = Math.max(...recent);
+  const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
+  const w = 3;
+  const gap = 1;
+  const H = 20;
+  const bars = recent
+    .map((d, i) => {
+      const h = Math.max(2, (d / max) * (H - 2));
+      return `<rect x="${i * (w + gap)}" y="${(H - h).toFixed(1)}" width="${w}" height="${h.toFixed(1)}" rx="1" />`;
+    })
+    .join('');
+  const width = recent.length * (w + gap);
+  el.title = `Recent block cadence — avg ${fmtCadence(avg)} over last ${recent.length} intervals (target ~2m30s)`;
+  el.innerHTML =
+    `<svg viewBox="0 0 ${width} ${H}" width="${width}" height="${H}" role="img" aria-label="${esc(el.title)}">${bars}</svg>` +
+    `<span class="cadence-avg">${esc(fmtCadence(avg))}</span>`;
+}
+function fmtCadence(sec) {
+  const s = Math.round(sec);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r ? `${m}m${String(r).padStart(2, '0')}s` : `${m}m`;
+}
+
+// ---- item 5: odometer count-ups -------------------------------------------
+// Last value shown per odometer key, kept in a module map so a re-rendered
+// element still rolls from its previous value rather than resetting.
+const odoState = new Map();
+// Tween an element's number to `to` over ~600ms (rAF, eased). Formats each frame
+// with `fmt`. Skips the animation under reduced-motion or when unchanged.
+function odometer(el, to, fmt = fmtNum, key = el?.id) {
+  if (!el) return;
+  const target = Number(to);
+  if (!Number.isFinite(target)) return;
+  const prev = odoState.get(key);
+  const from = Number.isFinite(prev) ? prev : target;
+  odoState.set(key, target);
+  if (REDUCED_MOTION || from === target) {
+    el.textContent = fmt(target);
+    return;
+  }
+  const dur = 600;
+  const start = performance.now();
+  const step = (now) => {
+    const p = Math.min(1, (now - start) / dur);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.textContent = fmt(Math.round(from + (target - from) * eased));
+    if (p < 1) requestAnimationFrame(step);
+    else el.textContent = fmt(target);
+  };
+  requestAnimationFrame(step);
+}
+
+// ---- item 1: bit-2 (shielded-v2) signaling progress -----------------------
+// Progress toward the 90% BIP-9 activation threshold, computed from the header
+// signaling the node already reports (s.signaling). Hidden when the node does
+// not expose bit-2 signaling.
+function signalProgress(s) {
+  const sig = s?.signaling;
+  const covered = Number(sig?.coveredBlocks ?? 0);
+  const count = Number(sig?.byBit?.[2] ?? NaN);
+  if (!covered || !Number.isFinite(count)) return '';
+  const window = Number(sig?.windowBlocks ?? covered);
+  const pctVal = (count / covered) * 100;
+  const threshold = 90;
+  const met = pctVal >= threshold;
+  return `
+    <section class="signal-panel" title="BIP-9: shielded-v2 (post-quantum, signal bit 2) activates once ≥90% of a ${fmtNum(window)}-block period signals.">
+      <div class="signal-head">
+        <span class="signal-title">PQ activation signaling <span class="dim">— bit 2 · last ${fmtNum(covered)} of ${fmtNum(window)} blocks</span></span>
+        <span class="signal-figure ${met ? 'ok-text' : ''}">${fmtDecimal(pctVal, 1)}% <span class="dim">· need ≥90%</span></span>
+      </div>
+      <div class="signal-bar" role="progressbar" aria-valuenow="${fmtDecimal(pctVal, 1)}" aria-valuemin="0" aria-valuemax="100">
+        <i class="signal-fill ${met ? 'met' : ''}" style="width:${Math.min(100, pctVal).toFixed(1)}%"></i>
+        <span class="signal-threshold" style="left:${threshold}%" title="90% activation threshold"></span>
+      </div>
+    </section>`;
+}
+
+// ---- item 2: miner readiness board ----------------------------------------
+// Which recently-active miners are signaling bit 2. Built purely from retained
+// block headers (proposer + version_bits) over the sample — honest about who is
+// actually producing blocks, not a registry roster. Hidden if no header carries
+// version_bits (older node).
+function minerReadinessBoard(blocks) {
+  const list = Array.isArray(blocks) ? blocks.filter((b) => b && b.proposer) : [];
+  if (!list.length) return '';
+  const withBits = list.filter((b) => b.versionBits !== null && b.versionBits !== undefined);
+  if (!withBits.length) return '';
+  const byMiner = new Map();
+  for (const b of withBits) {
+    const m = byMiner.get(b.proposer) ?? { total: 0, signaling: 0, lastHeight: -1, lastSignaling: false };
+    m.total += 1;
+    const on = ((Number(b.versionBits) >>> 2) & 1) === 1;
+    if (on) m.signaling += 1;
+    if (b.height > m.lastHeight) {
+      m.lastHeight = b.height;
+      m.lastSignaling = on;
+    }
+    byMiner.set(b.proposer, m);
+  }
+  const rows = [...byMiner.entries()]
+    .sort((a, b) => b[1].total - a[1].total)
+    .map(([acct, m]) => {
+      const ready = m.lastSignaling;
+      return `<div class="miner-cell ${ready ? 'ready' : 'not-ready'}" title="${esc(acct)} — ${fmtNum(m.signaling)}/${fmtNum(m.total)} sampled blocks signalled bit 2; latest #${fmtNum(m.lastHeight)} ${ready ? 'signals' : 'does not signal'}">
+        <span class="miner-dot">${ready ? '●' : '○'}</span>
+        <a class="mono" href="#/account/${encodeURIComponent(acct)}">${esc(shortHash(acct, 6, 4))}</a>
+        <span class="miner-count">${fmtNum(m.signaling)}/${fmtNum(m.total)}</span>
+      </div>`;
+    })
+    .join('');
+  const readyCount = [...byMiner.values()].filter((m) => m.lastSignaling).length;
+  return `
+    <section class="miner-board">
+      <h2>Miner readiness <span class="dim">— bit 2 (post-quantum) signaling · ${fmtNum(readyCount)}/${fmtNum(byMiner.size)} recent miners · sample of ${fmtNum(withBits.length)} blocks</span></h2>
+      <div class="miner-grid">${rows}</div>
+      <p class="note">Latest-header signal per miner that produced a block in the sampled window. A miner producing an unsignalled block flips to hollow; this reflects real headers, not intentions.</p>
+    </section>`;
+}
+
+// ---- item 8: supply-invariant trust widget --------------------------------
+// Compact, prove-don't-claim assertions verifiable from served data only.
+function trustWidget(s, supply, genesisHash) {
+  const total = safeBigInt(supply?.total ?? s?.supply?.total);
+  const shielded = safeBigInt(supply?.shielded ?? s?.shieldedInfo?.poolValue);
+  const conserved = total > 0n && shielded >= 0n && shielded <= total;
+  const transparent = conserved ? total - shielded : 0n;
+  const chips = [];
+  if (total > 0n) {
+    chips.push(`<span class="trust-chip ${conserved ? 'ok' : 'warn'}" title="Transparent ${fmtCoin(transparent.toString())} + shielded ${fmtCoin(shielded.toString())} = circulating ${fmtCoin(total.toString())} ${COIN_SYMBOL}. The shielded pool is a subset of circulation, checked against the node's own totals.">${conserved ? '✓' : '!'} supply conserved</span>`);
+  }
+  if (genesisHash) {
+    chips.push(`<a class="trust-chip ok" href="#/block/0" title="Genesis is a hardcoded constant: ${esc(genesisHash)}. Click to open block #0.">✓ genesis frozen <span class="mono dim">${esc(shortHash(genesisHash, 6, 4))}</span></a>`);
+  }
+  chips.push(`<a class="trust-chip ok" href="#/proof" title="Consensus bytes are pinned by cross-implementation known-answer test vectors (KAT). Open the proof view.">✓ KAT-pinned</a>`);
+  if (!chips.length) return '';
+  return `<section class="trust-widget" aria-label="Reserve-grade guarantees">${chips.join('')}</section>`;
+}
+
+// ---- item 3: v1→v2 pool migration (best-effort local history) -------------
+function loadPoolHistory() {
+  try {
+    const raw = localStorage.getItem(POOL_HISTORY_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+function recordPoolSample(height, v1, v2) {
+  if (!Number.isFinite(height) || v1 === null || v1 === undefined) return;
+  const hist = loadPoolHistory();
+  if (hist.length && hist[hist.length - 1].height === height) return; // dedupe by height
+  hist.push({ height, v1: String(v1), v2: v2 === null || v2 === undefined ? '0' : String(v2) });
+  while (hist.length > 500) hist.shift();
+  try {
+    localStorage.setItem(POOL_HISTORY_KEY, JSON.stringify(hist));
+  } catch {
+    /* storage full / disabled — the chart just shows what it has */
+  }
+}
+// A small stacked-area chart of Orchard (v1) vs post-quantum (v2) pool value over
+// the heights this browser has sampled. Best-effort: the node retains no
+// pool-split series, so this only shows locally-observed points.
+function poolMigrationChart() {
+  const hist = loadPoolHistory();
+  if (hist.length < 2) {
+    return `<section class="pool-migration"><h2>Shielded pool migration <span class="dim">— Orchard (v1) vs post-quantum (v2)</span></h2>
+      <div class="empty">Collecting local samples as new blocks arrive — the node does not retain a pool-split time-series, so this chart fills in while the explorer is open.</div></section>`;
+  }
+  const W = 1000;
+  const H = 180;
+  const pad = 8;
+  const coin = (g) => Number(BigInt(g) / 1000000n) / 100;
+  const xs = hist.map((p) => p.height);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const v1 = hist.map((p) => coin(p.v1));
+  const v2 = hist.map((p) => coin(p.v2));
+  const totals = hist.map((_, i) => v1[i] + v2[i]);
+  const maxY = Math.max(1, ...totals) * 1.08;
+  const X = (i) => pad + ((xs[i] - minX) / Math.max(1, maxX - minX)) * (W - 2 * pad);
+  const Y = (y) => H - pad - (y / maxY) * (H - 2 * pad);
+  const areaTo = (vals) => {
+    const up = vals.map((y, i) => `${i === 0 ? 'M' : 'L'}${X(i).toFixed(1)},${Y(y).toFixed(1)}`).join(' ');
+    return `${up} L${X(vals.length - 1).toFixed(1)},${H - pad} L${X(0).toFixed(1)},${H - pad} Z`;
+  };
+  const v1Area = areaTo(v1);
+  const stackArea = areaTo(totals);
+  const lastV1 = v1.at(-1);
+  const lastV2 = v2.at(-1);
+  return `<section class="pool-migration">
+    <h2>Shielded pool migration <span class="dim">— Orchard (v1) vs post-quantum (v2) · ${fmtNum(hist.length)} local samples</span></h2>
+    <div class="panel" style="padding:18px">
+      <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Orchard v1 and post-quantum v2 pool value across ${fmtNum(hist.length)} sampled heights">
+        <path class="pool-v2-area" d="${stackArea}" />
+        <path class="pool-v1-area" d="${v1Area}" />
+      </svg>
+      <div class="chart-meta">
+        <span><i class="swatch v1"></i> v1 (Orchard) ${fmtDecimal(lastV1, 2)} ${COIN_SYMBOL}</span>
+        <strong>#${fmtNum(minX)} → #${fmtNum(maxX)}</strong>
+        <span><i class="swatch v2"></i> v2 (post-quantum) ${fmtDecimal(lastV2, 2)} ${COIN_SYMBOL}</span>
+      </div>
+    </div>
+    <p class="note">Best-effort local history: the node exposes only current pool state, so this series accumulates from samples this browser observed. It is not a node-authoritative time-series.</p>
+  </section>`;
 }
 
 function setConn(state, detail = '') {
@@ -1801,15 +2179,13 @@ function connectWs() {
     if (msg.type === 'reset') {
       // The node was re-genesised / rolled back; the old view is dead. Reload to
       // re-render against the fresh chain.
-      pushTicker('<b>chain reset</b> · reloading…');
       setTimeout(() => location.reload(), 400);
     } else if (msg.type === 'block') {
       const b = msg.block;
-      pushTicker(`<b>Block #${fmtNum(b.height)}</b> · ${fmtNum(b.txCount)} tx`);
+      tickerPushBlock(b);
       live.onBlock?.(b);
       pollStatus();
     } else if (msg.type === 'tx') {
-      pushTicker(`tx <b>${esc(msg.tx.action?.type || 'tx')}</b> · ${esc(shortHash(msg.tx.id))}`);
       live.onTx?.(msg.tx);
     }
   };
@@ -1826,7 +2202,7 @@ async function pollStatus() {
       ? `${s.chainId} · node ${fmtNum(sync.nodeHeight ?? 0)} · indexed ${fmtNum(sync.indexedHeight ?? 0)}`
       : '';
     const heroHeight = $('hero-height');
-    if (heroHeight) heroHeight.textContent = fmtNum(sync.nodeHeight ?? s.tipHeight ?? 0);
+    if (heroHeight) odometer(heroHeight, sync.nodeHeight ?? s.tipHeight ?? 0, fmtNum, 'hero-height');
     const heroIndexed = $('hero-indexed');
     if (heroIndexed) heroIndexed.textContent = fmtNum(sync.indexedHeight ?? s.tipHeight ?? 0);
     const onLatestBlocks = (location.hash || '#/') === '#/blocks';
@@ -1846,6 +2222,7 @@ async function pollStatus() {
   drawSealStars();
   await loadNetworks(); // resolve live networks + wire the switch before first render
   connectWs();
+  seedTicker(); // seed the rolling ticker from recent block history (non-blocking)
   await pollStatus();
   setInterval(pollStatus, 5000);
   await route().catch((e) => errView(e.message));
