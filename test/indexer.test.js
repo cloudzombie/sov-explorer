@@ -4,7 +4,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { confirmationCount, finalAtDepth, Indexer, normalizeBlock } from '../src/indexer.js';
+import { confirmationCount, finalAtDepth, Indexer, normalizeBlock, summarizePeerInfo } from '../src/indexer.js';
 import { Store } from '../src/store.js';
 
 test('normalizeBlock maps real RPC shapes', () => {
@@ -17,6 +17,9 @@ test('normalizeBlock maps real RPC shapes', () => {
       state_root: '0x' + '18'.repeat(32),
       timestamp_ms: 1_780_000_000_000,
       proposer: 'val01.node.sovereign',
+      version_bits: 3,
+      bits: 507091653,
+      nonce: 7761,
     },
     transactions: [
       {
@@ -40,6 +43,9 @@ test('normalizeBlock maps real RPC shapes', () => {
   assert.equal(rec.proposer, 'val01.node.sovereign');
   assert.equal(rec.final, true);
   assert.equal(rec.txCount, 1);
+  assert.equal(rec.versionBits, 3, 'BIP-9 signal word retained from the real header');
+  assert.equal(rec.bits, 507091653);
+  assert.equal(rec.nonce, 7761);
 
   const t = rec.transactions[0];
   assert.equal(t.id, '0x' + '21'.repeat(32), 'canonical tx id from digest');
@@ -49,6 +55,50 @@ test('normalizeBlock maps real RPC shapes', () => {
   assert.equal(t.action.to, 'ecb.reserve.sovereign');
   assert.equal(t.blockHeight, 1);
   assert.equal(t.blockHash, rec.hash);
+});
+
+test('normalizeBlock reports missing header signal fields as null, never zero', () => {
+  const block = {
+    header: {
+      height: 1,
+      prev_hash: '0x' + 'd5'.repeat(32),
+      tx_root: '0x' + 'ef'.repeat(32),
+      receipts_root: '0x' + '30'.repeat(32),
+      state_root: '0x' + '18'.repeat(32),
+      timestamp_ms: 1,
+      proposer: 'val01.node.sovereign',
+    },
+    transactions: [],
+  };
+  const rec = normalizeBlock(block, { hash: '0x' + 'ac'.repeat(32), txIds: [] }, false);
+  assert.equal(rec.versionBits, null);
+  assert.equal(rec.bits, null);
+  assert.equal(rec.nonce, null);
+});
+
+test('peer info is summarized without republishing peer addresses', () => {
+  const summary = summarizePeerInfo({
+    peers: 3,
+    version: 'v0.2.0',
+    protocolVersion: 2,
+    connectedPeers: ['137.184.83.91:9645', '192.168.0.197:9645'],
+    peerVersions: [
+      { addr: '137.184.83.91:9645', agent: 'sov/v0.2.0', protocol: 2 },
+      { addr: '164.92.141.24:9645', agent: 'sov/v0.2.0', protocol: 2 },
+      { addr: '192.168.0.197:9645', agent: 'sov/v0.1.99', protocol: 2 },
+    ],
+  });
+  assert.deepEqual(summary, {
+    peers: 3,
+    relayVersion: 'v0.2.0',
+    protocolVersion: 2,
+    agents: { 'sov/v0.2.0': 2, 'sov/v0.1.99': 1 },
+  });
+  assert.equal(JSON.stringify(summary).includes('137.184'), false, 'no peer addresses leak');
+  assert.equal(summarizePeerInfo(null), null);
+  assert.deepEqual(summarizePeerInfo({}), {
+    peers: null, relayVersion: null, protocolVersion: null, agents: {},
+  });
 });
 
 test('finality follows the chain confirmation convention', () => {
@@ -128,4 +178,72 @@ test('a relay range must form one canonical parent-linked chain', async () => {
 
   await assert.rejects(indexer.indexRange(1, 3), /does not extend/);
   assert.equal(store.blocksByHeight.size, 0, 'the malformed batch is rejected atomically');
+});
+
+test('receipts are fetched per block and matched by id, not by position', async () => {
+  const store = new Store();
+  let blockReceiptCalls = 0;
+  let perTxCalls = 0;
+  const rpc = {
+    blockReceipts(height) {
+      blockReceiptCalls += 1;
+      assert.equal(height, 7);
+      // Deliberately RETURNED OUT OF ORDER: matching by array position would
+      // label each transaction with the other one's execution status.
+      return Promise.resolve([
+        { tx_id: '0xbb', status: { status: 'failure' }, gas_used: 2 },
+        { tx_id: '0xAA', status: { status: 'success' }, gas_used: 1 },
+      ]);
+    },
+    receipt() {
+      perTxCalls += 1;
+      return Promise.resolve(null);
+    },
+  };
+  const indexer = new Indexer(rpc, store);
+  const record = {
+    height: 7,
+    transactions: [{ id: '0xaa' }, { id: '0xbb' }],
+  };
+  await indexer.attachReceipts(record);
+
+  assert.equal(blockReceiptCalls, 1, 'one request for the whole block');
+  assert.equal(perTxCalls, 0, 'no per-transaction fallback when the batch is complete');
+  assert.equal(record.transactions[0].executionStatus, 'success');
+  assert.equal(record.transactions[1].executionStatus, 'failure');
+});
+
+test('a node without batch receipts still gets exact per-transaction statuses', async () => {
+  const store = new Store();
+  let perTxCalls = 0;
+  const rpc = {
+    blockReceipts() { return Promise.resolve(null); }, // method not supported
+    receipt(id) {
+      perTxCalls += 1;
+      return Promise.resolve({ tx_id: id, status: { status: 'success' } });
+    },
+  };
+  const record = { height: 1, transactions: [{ id: '0xaa' }, { id: '0xbb' }] };
+  await new Indexer(rpc, store).attachReceipts(record);
+  assert.equal(perTxCalls, 2);
+  assert.equal(record.transactions[1].executionStatus, 'success');
+});
+
+test('a partial receipt batch is completed rather than trusted as final', async () => {
+  const store = new Store();
+  let perTxCalls = 0;
+  const rpc = {
+    blockReceipts() {
+      return Promise.resolve([{ tx_id: '0xaa', status: { status: 'success' } }]);
+    },
+    receipt(id) {
+      perTxCalls += 1;
+      return Promise.resolve({ tx_id: id, status: { status: 'failure' } });
+    },
+  };
+  const record = { height: 1, transactions: [{ id: '0xaa' }, { id: '0xbb' }] };
+  await new Indexer(rpc, store).attachReceipts(record);
+  assert.equal(perTxCalls, 1, 'only the missing transaction is re-requested');
+  assert.equal(record.transactions[0].executionStatus, 'success');
+  assert.equal(record.transactions[1].executionStatus, 'failure');
 });

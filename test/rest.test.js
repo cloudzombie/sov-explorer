@@ -62,6 +62,27 @@ test('proof capabilities are advertised before the UI offers verification', asyn
   });
 });
 
+test('the proof endpoint serves pool-v2 privacy state, and null when the node is too old', async () => {
+  const ctx = context();
+  // Older node: sov_getShieldedV2Info never answered, so nothing was stored.
+  let response = await handleRest('GET', '/api/proof', new URLSearchParams(), ctx);
+  assert.equal(response.status, 200);
+  assert.equal(JSON.parse(response.body).privacy.shieldedV2Info, null, 'absent, not a fake empty pool');
+
+  // v0.2.5 node: the dormant pool-v2 state is surfaced verbatim under privacy.
+  ctx.store.shieldedV2Info = {
+    active: false, poolValue: '0', noteCount: 0, nullifierCount: 0,
+    anchor: 'e6efef0131865379f23c3fb340e2510abb012791cd41f5ac9bee742000a75566',
+    deshieldableNowGrains: '0', deshieldLimitGrains: '2100000000000000',
+    deshieldWindowBlocks: 576, windowResetsAtHeight: 576, height: 13804,
+  };
+  response = await handleRest('GET', '/api/proof', new URLSearchParams(), ctx);
+  const privacy = JSON.parse(response.body).privacy;
+  assert.equal(privacy.shieldedV2Info.active, false);
+  assert.equal(privacy.shieldedV2Info.poolValue, '0');
+  assert.equal(privacy.shieldedV2Info.anchor, ctx.store.shieldedV2Info.anchor);
+});
+
 test('chain-object catalog and token detail merge live state with archived activity', async () => {
   const ctx = context();
   const issue = {

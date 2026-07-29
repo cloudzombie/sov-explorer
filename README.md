@@ -29,6 +29,47 @@ It deliberately distinguishes source agreement from independent consensus valida
 the explorer cross-checks relays, while a full node is still required to re-execute the
 chain independently.
 
+## Counts always carry their window
+
+Two rules govern every population figure the explorer prints.
+
+**A count without a window is meaningless.** How many miners you "see" is a property of
+how far back you looked, not of the network. On this chain the last 20–30 blocks contain
+4 distinct coinbase accounts, the last 288 contain 5, and the last 576 contain 6 — the
+smallest participant currently wins about 1.4% of blocks. The recent-miner window is
+therefore **576 blocks (~24 h at the 150 s target)**, chosen so a 2%-hashrate account is
+missed with probability ≈9×10⁻⁶ instead of being silently dropped. Every count is
+published together with `windowBlocks`, and windowed distributions additionally report
+`fromHeight`/`toHeight`/`complete` so partial coverage is declared rather than implied.
+
+**A coinbase account is not a machine, and a miner is not a node.** Several physical
+machines can pay one coinbase account, so a machine count is not derivable from chain
+data and is never claimed. `allTime.networkNodes` reports peers of one relay
+(`sov_getPeerInfo`) — a lower bound on one node's neighbourhood, labelled as such in
+`networkNodesBasis` — and never borrows the miner-account count.
+
+## Derived statistics and their methods
+
+| Field | Source / method |
+|---|---|
+| `blockTime` | Median **and** mean of consecutive header-timestamp differences over the stated window. PoW intervals are ~exponential, so median ≪ mean is expected; both are given with the protocol `targetMs`. Backwards headers are excluded and counted in `nonMonotonicIntervals`, never clamped to zero. |
+| `minerWindow` / `windowMinerStats` | Coinbase accounts winning ≥1 block in 576 blocks; registry `lastSeenHeight` for the count, retained headers for the distribution. |
+| `signaling` | BIP-9 bits actually set in retained headers. Blocks indexed before signal-word retention are excluded from `coveredBlocks`, not counted as non-signaling. |
+| `deployments` | Verbatim `sov_getDeployments` state; absent ⇒ said outright. |
+| `feeRoutes` | Exact `sov_estimateFee` for every route the node prices (`transfer`, `tokenTransfer`, `shielded`). A route the node refuses is **absent**, not zero. |
+| `signingDomain` | `sov_getSigningDomain` — the runtime effect of the activated `tx-domain` deployment. |
+| `mintedOfCap` | `null` when supply is unknown; a `0.00%` reading would be indistinguishable from a real one. |
+| Auction floor | The mempool's dynamic tip floor has **no RPC**. It renders as unavailable and is never estimated. |
+
+Anything the node does not supply renders as an em dash, never as a plausible zero.
+
+**Request budget.** Chain statistics are refreshed as one batch of 12 RPCs at most once
+per `statsIntervalMs` (10 s) against one relay — ≈1.2 req/s, fixed, and independent of
+browser traffic, because every client is served from that one cached snapshot. Receipts
+are fetched with `sov_getBlockReceipts` (one request per block, matched by transaction
+id) instead of one request per transaction, which is a large reduction on cold backfill;
+per-transaction `sov_getReceipt` remains only as a fallback.
+
 ## Testnet ⇄ Mainnet
 
 The explorer serves every network from one process. Each network is an independent

@@ -4,6 +4,7 @@
 // reads (blocks, transactions) come from the index.
 
 import { confirmationCount, finalAtDepth, normalizeBlock } from './indexer.js';
+import { MINER_WINDOW_BLOCKS } from './store.js';
 
 function json(status, body) {
   return { status, body: JSON.stringify(body) };
@@ -560,7 +561,34 @@ export async function handleRest(method, pathname, query, ctx) {
         return json(200, store.supply ?? (await rpc.supply()));
 
       case 'observed-miners':
-        return json(200, { miners: store.observedMiners() });
+        // `window` is the per-account distribution over the recent-miner window,
+        // computed from retained blocks and reporting its own coverage; `miners`
+        // is every proposer in the whole retained index (window unstated ⇒ use
+        // the windowed form for any "how many miners" statement).
+        return json(200, {
+          miners: store.observedMiners(),
+          window: store.windowMinerStats(),
+          registry: {
+            windowBlocks: MINER_WINDOW_BLOCKS,
+            recentAccounts: store.minerAccountsInWindow(),
+            allTimeAccounts: Array.isArray(store.miners) ? store.miners.length : null,
+          },
+        });
+
+      // BIP-9 consensus deployments (tx-domain, fee-auction, …): node-reported
+      // states plus header signaling observed in retained blocks.
+      case 'deployments': {
+        const deployments = store.deployments;
+        const bits = (deployments?.deployments ?? [])
+          .map((d) => Number(d?.bit))
+          .filter((bit) => Number.isInteger(bit) && bit >= 0 && bit <= 28);
+        return json(200, {
+          available: !!deployments,
+          height: deployments?.height ?? null,
+          deployments: deployments?.deployments ?? [],
+          signaling: bits.length ? store.versionBitsSignaling(bits) : null,
+        });
+      }
 
       case 'validators': {
         return json(200, { validators: store.validators() });
@@ -596,7 +624,7 @@ export async function handleRest(method, pathname, query, ctx) {
             difficulty: store.difficulty,
           },
           cryptography: store.cryptographyStats(),
-          privacy: { supply: store.supply, shieldedInfo: store.shieldedInfo },
+          privacy: { supply: store.supply, shieldedInfo: store.shieldedInfo, shieldedV2Info: store.shieldedV2Info },
           commitments: { deterministicEmpty: roots(empty), latestNonEmpty: roots(nonEmpty) },
           archive: stats.archive,
         });

@@ -3,7 +3,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store, transactionCrypto, txCounterparty } from '../src/store.js';
+import {
+  MINER_WINDOW_BLOCKS,
+  Store,
+  tipGrains,
+  transactionCrypto,
+  txCounterparty,
+  unwrapTipped,
+} from '../src/store.js';
 
 const hx = (n) => '0x' + BigInt(n).toString(16).padStart(64, '0');
 
@@ -44,6 +51,101 @@ test('counterparty extraction', () => {
   assert.equal(txCounterparty({ type: 'transfer', to: 'b.sovereign' }), 'b.sovereign');
   assert.equal(txCounterparty({ type: 'call', contract: 'c.sovereign' }), 'c.sovereign');
   assert.equal(txCounterparty({ type: 'mine' }), null);
+  // A fee-auction tipped envelope touches its inner action's counterparty.
+  assert.equal(
+    txCounterparty({ type: 'tipped', tip: '5', inner: { type: 'transfer', to: 'b.sovereign' } }),
+    'b.sovereign',
+  );
+});
+
+test('tipped envelope unwrap and tip extraction are exact and bounded', () => {
+  const inner = { type: 'transfer', to: 'b.sovereign', amount: '7' };
+  const tipped = { type: 'tipped', tip: '250000', inner };
+  assert.equal(unwrapTipped(tipped), inner);
+  assert.equal(unwrapTipped(inner), inner, 'untipped action passes through');
+  assert.equal(tipGrains(tipped), 250000n);
+  assert.equal(tipGrains(inner), 0n);
+  assert.equal(tipGrains({ type: 'tipped', tip: 'garbage' }), 0n, 'malformed tip is 0, not NaN');
+  // Consensus forbids nesting, but a hostile relay must not loop the explorer.
+  let nested = inner;
+  for (let i = 0; i < 10; i++) nested = { type: 'tipped', tip: '1', inner: nested };
+  assert.ok(unwrapTipped(nested) !== undefined);
+});
+
+test('window stats count tipped volume and miner tips', () => {
+  const s = new Store();
+  const plain = tx(hx(4001), 'a.sovereign', { type: 'transfer', to: 'b.sovereign', amount: '100' });
+  const tipped = tx(hx(4002), 'a.sovereign', {
+    type: 'tipped',
+    tip: '25',
+    inner: { type: 'transfer', to: 'b.sovereign', amount: '300' },
+  });
+  const b = block(1, [plain, tipped]);
+  b.timestampMs = Date.now();
+  s.addBlock(b);
+  const day = s.stats().last24h;
+  assert.equal(day.volumeGrains, '400', 'tipped inner transfer counts toward volume');
+  assert.equal(day.minerTipGrains, '25');
+  assert.equal(day.tippedTransactions, 1);
+});
+
+test('miner accounts in window come from the registry with an explicit window', () => {
+  const s = new Store();
+  assert.equal(s.minerAccountsInWindow(), null, 'no registry yet — unknown, never zero');
+  s.addBlock(block(1000));
+  s.tipHeight = 1000;
+  s.miners = [
+    { account: 'in-window', lastSeenHeight: 1000 },
+    { account: 'edge-in', lastSeenHeight: 1000 - MINER_WINDOW_BLOCKS + 1 },
+    { account: 'edge-out', lastSeenHeight: 1000 - MINER_WINDOW_BLOCKS },
+    { account: 'ancient', lastSeenHeight: 3 },
+    { account: 'malformed' },
+  ];
+  assert.equal(s.minerAccountsInWindow(), 2, 'inclusive window boundary');
+  assert.equal(s.minerAccountsInWindow(10_000), 4, 'wider window counts all well-formed entries');
+  const st = s.stats();
+  assert.equal(st.minerWindow.windowBlocks, MINER_WINDOW_BLOCKS);
+  assert.equal(st.minerWindow.accounts, 2);
+  assert.equal(st.minersActive, 2, 'backward-compatible alias');
+});
+
+test('windowed miner distribution reports coverage honestly', () => {
+  const s = new Store();
+  for (let h = 5; h <= 14; h++) {
+    const b = block(h);
+    b.proposer = h % 2 === 0 ? 'alice' : 'bob';
+    s.addBlock(b);
+  }
+  const w = s.windowMinerStats(8); // heights 7..14, fully retained
+  assert.equal(w.coveredBlocks, 8);
+  assert.equal(w.complete, true);
+  assert.deepEqual(w.miners.map((m) => [m.account, m.blocks]), [['alice', 4], ['bob', 4]]);
+  assert.equal(w.miners[0].share, 0.5);
+
+  const partial = s.windowMinerStats(100); // asks below minHeight (5)
+  assert.equal(partial.coveredBlocks, 10);
+  assert.equal(partial.complete, false, 'partial coverage is declared, not hidden');
+  assert.equal(partial.fromHeight, 5);
+  assert.equal(partial.toHeight, 14);
+
+  const empty = new Store();
+  assert.equal(empty.windowMinerStats(8).coveredBlocks, 0);
+  assert.equal(empty.windowMinerStats(8).complete, false);
+});
+
+test('version-bits signaling counts only headers that carry the signal word', () => {
+  const s = new Store();
+  for (let h = 0; h < 6; h++) {
+    const b = block(h);
+    // heights 0-1 pre-date versionBits retention; 2-3 signal bits 0+1; 4-5 signal none
+    b.versionBits = h < 2 ? null : h < 4 ? 0b11 : 0;
+    s.addBlock(b);
+  }
+  const sig = s.versionBitsSignaling([0, 1], 10);
+  assert.equal(sig.coveredBlocks, 4, 'null signal words are excluded, not counted as zero');
+  assert.deepEqual(sig.byBit, { 0: 2, 1: 2 });
+  assert.deepEqual(s.versionBitsSignaling([0], 2).byBit, { 0: 0 }, 'window restricts to newest blocks');
+  assert.deepEqual(s.versionBitsSignaling([99], 10).byBit, {}, 'invalid bits are rejected');
 });
 
 test('hybrid65 key and signature evidence is measured from retained transactions', () => {
@@ -179,7 +281,11 @@ test('stats expose blockchair-style explorer parameters', () => {
   assert.equal(st.supplyCapGrains, '2100000000000000');
   assert.equal(st.allTime.circulationGrains, '100000000000000');
   assert.equal(st.allTime.blockchainSizeBytes, 4096);
-  assert.equal(st.allTime.networkNodes, 1);
+  // A miner ACCOUNT is not a node: with no peer information available, the node
+  // count must be unavailable rather than borrowing the miner-account count.
+  assert.equal(st.allTime.networkNodes, null);
+  assert.equal(st.allTime.networkNodesBasis, null);
+  assert.equal(st.allTime.minersSeen, 1, 'miner accounts are still reported, as accounts');
   assert.equal(st.allTime.difficulty, '181019021');
   assert.equal(st.last24h.transactions, 1);
   assert.equal(st.last24h.blocks, 1);
@@ -189,4 +295,136 @@ test('stats expose blockchair-style explorer parameters', () => {
   assert.equal(st.mempool.sizeBytes, null);
   assert.equal('stakingRatio' in st, false);
   assert.ok(st.mintedOfCap > 0 && st.mintedOfCap < 0.02, 'mined/cap small but nonzero');
+});
+
+test('block-time statistics are measured from header timestamps with a stated window', () => {
+  const s = new Store();
+  s.difficulty = { targetBlockMs: 150_000 };
+  // Intervals: 100s, 200s, 300s → median 200s, mean 200s.
+  const stamps = [0, 100_000, 300_000, 600_000];
+  stamps.forEach((ts, i) => {
+    const b = block(i, []);
+    b.timestampMs = ts;
+    s.addBlock(b);
+  });
+
+  const bt = s.blockTimeStats(3);
+  assert.equal(bt.intervals, 3);
+  assert.equal(bt.medianMs, 200_000);
+  assert.equal(bt.meanMs, 200_000);
+  assert.equal(bt.minMs, 100_000);
+  assert.equal(bt.maxMs, 300_000);
+  assert.equal(bt.targetMs, 150_000, 'the protocol target is reported alongside, not substituted');
+  assert.equal(bt.fromHeight, 0);
+  assert.equal(bt.toHeight, 3);
+  assert.equal(bt.complete, true);
+  assert.equal(bt.nonMonotonicIntervals, 0);
+});
+
+test('block-time statistics exclude backwards headers instead of clamping them', () => {
+  const s = new Store();
+  // Height 2 has a timestamp EARLIER than height 1 — legal for a miner-supplied
+  // header. It must not be counted as a zero-length block.
+  for (const [h, ts] of [[0, 0], [1, 200_000], [2, 150_000], [3, 350_000]]) {
+    const b = block(h, []);
+    b.timestampMs = ts;
+    s.addBlock(b);
+  }
+  const bt = s.blockTimeStats(3);
+  assert.equal(bt.nonMonotonicIntervals, 1);
+  assert.equal(bt.intervals, 2, 'only the two forward intervals are measured');
+  // 200_000 (0→1) and 200_000 (2→3); the backwards step contributes nothing.
+  assert.equal(bt.meanMs, 200_000);
+  assert.equal(bt.complete, true, 'every height still produced a decision');
+});
+
+test('block-time statistics report nulls, never zeros, without a usable interval', () => {
+  const s = new Store();
+  assert.deepEqual(
+    { medianMs: s.blockTimeStats().medianMs, meanMs: s.blockTimeStats().meanMs, intervals: s.blockTimeStats().intervals },
+    { medianMs: null, meanMs: null, intervals: 0 },
+  );
+  const b = block(5, []);
+  b.timestampMs = 1_000;
+  s.addBlock(b);
+  const one = s.blockTimeStats(576);
+  assert.equal(one.intervals, 0, 'a single block yields no interval');
+  assert.equal(one.medianMs, null);
+  assert.equal(one.complete, false, 'a partial window says so');
+});
+
+test('the node count comes from peers, never from miner accounts', () => {
+  const s = new Store();
+  const b = block(1, []);
+  b.timestampMs = Date.now();
+  s.addBlock(b);
+  s.miners = [{ account: 'a' }, { account: 'b' }, { account: 'c' }];
+  s.recordSupply({ total: '1', mined: '1' }, 1);
+
+  assert.equal(s.stats().allTime.networkNodes, null, 'three miner accounts are not three nodes');
+
+  s.peerSummary = { peers: 3, relayVersion: 'v0.2.0', protocolVersion: 2, agents: {} };
+  s._touchStats(); // chain-stat fields are assigned directly; the snapshot is memoized
+  const st = s.stats();
+  assert.equal(st.allTime.networkNodes, 3);
+  assert.match(st.allTime.networkNodesBasis, /not a network census/);
+  assert.equal(st.allTime.minersSeen, 3, 'miner accounts remain reported separately');
+});
+
+test('fee routes only contain the routes the node actually priced', () => {
+  const s = new Store();
+  s.feeRoutes = { transfer: { kind: 'transfer', feeGrains: '1651760' } };
+  s._touchStats();
+  const st = s.stats();
+  assert.deepEqual(Object.keys(st.feeRoutes), ['transfer']);
+  assert.equal(st.feeRoutes.shielded, undefined, 'an unpriced route is absent, not zero');
+});
+
+test('pool-v2 shielded state surfaces exactly as the node reported it', () => {
+  const s = new Store();
+  // Shape from sov_getShieldedV2Info on a live v0.2.5 node (dormant pool).
+  s.shieldedV2Info = {
+    active: false,
+    poolValue: '0',
+    noteCount: 0,
+    nullifierCount: 0,
+    anchor: 'e6efef0131865379f23c3fb340e2510abb012791cd41f5ac9bee742000a75566',
+    deshieldLimitGrains: '2100000000000000',
+    deshieldWindowBlocks: 576,
+    windowStartHeight: 0,
+    windowSpentGrains: '0',
+    deshieldableNowGrains: '0',
+    windowResetsAtHeight: 576,
+    height: 13804,
+  };
+  s._touchStats();
+  const st = s.stats();
+  assert.equal(st.shieldedV2Info.active, false, 'dormant is reported honestly, not hidden');
+  assert.equal(st.shieldedV2Info.poolValue, '0');
+  assert.equal(st.shieldedV2Info.anchor, s.shieldedV2Info.anchor);
+});
+
+test('a node too old for pool v2 yields null, never a fake empty pool', () => {
+  const s = new Store(); // sov_getShieldedV2Info never answered (pre-v0.2.5 node)
+  assert.equal(s.stats().shieldedV2Info, null);
+});
+
+test('an outage yields unavailable values, never fabricated zeros', () => {
+  const s = new Store(); // nothing indexed, node never answered
+  const st = s.stats();
+  assert.equal(st.mintedOfCap, null, 'a 0.00%-of-cap reading would look like a real answer');
+  assert.equal(st.supply, null);
+  assert.equal(st.difficulty, null);
+  assert.equal(st.shieldedV2Info, null);
+  assert.equal(st.deployments, null);
+  assert.equal(st.feeRoutes, null);
+  assert.equal(st.mintRewardGrains, null);
+  assert.equal(st.signingDomain, null);
+  assert.equal(st.minerWindow.accounts, null);
+  assert.equal(st.blockTime.medianMs, null);
+  assert.equal(st.allTime.networkNodes, null);
+
+  // Once supply is known the ratio becomes a real number again.
+  s.recordSupply({ total: '2100000000000000', mined: '2100000000000000' }, 1);
+  assert.equal(s.stats().mintedOfCap, 1);
 });

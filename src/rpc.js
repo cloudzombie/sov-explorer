@@ -417,15 +417,32 @@ export class SovereignRpc {
   blockDigest(height) { return this.call('sov_getBlockDigest', { height }, { nonNull: true }); }
   supply() { return this.call('sov_getSupply'); }
   shieldedInfo() { return this.call('sov_getShieldedInfo'); }
+  /** Pool v2 (post-quantum, ML-KEM-768 / STARK) shielded state. Optional: a node
+   * older than v0.2.5 does not know this method and errors, handled non-fatally. */
+  shieldedV2Info() { return this.call('sov_getShieldedV2Info'); }
   account(account) { return this.call('sov_getAccount', { account }); }
   difficulty() { return this.call('sov_getDifficulty'); }
   stateRoot() { return this.call('sov_getStateRoot'); }
   isFinal(hash) { return this.call('sov_isFinal', { hash }); }
   receipt(txId) { return this.call('sov_getReceipt', { txId }, { nonNull: true }); }
+  /** Every receipt in one block in ONE request. Preferred over N per-transaction
+   * `sov_getReceipt` calls: it cuts the cold-backfill receipt load on a production
+   * node from one request per transaction to one per block. */
+  blockReceipts(height) { return this.call('sov_getBlockReceipts', { height }, { nonNull: true }); }
   transactionProof(txId) { return this.call('sov_getTransactionProof', { txId }, { nonNull: true }); }
   receiptProof(txId) { return this.call('sov_getReceiptProof', { txId }, { nonNull: true }); }
   miners() { return this.call('sov_getMiners'); }
   mempoolSize() { return this.call('sov_getMempoolSize'); }
+  /** BIP-9 miner-signaled deployment states (tx-domain, fee-auction, …). */
+  deployments() { return this.call('sov_getDeployments'); }
+  /** The exact runtime fee for one wallet send route at the live gas price. */
+  estimateFee(kind = 'transfer') { return this.call('sov_estimateFee', { kind }); }
+  /** Live node networking state (peer counts / versions). */
+  peerInfo() { return this.call('sov_getPeerInfo'); }
+  /** The height-keyed coinbase subsidy the node would pay for the next block. */
+  mintReward() { return this.call('sov_getMintReward'); }
+  /** The chain/genesis-bound signing tags the ACTIVE tx-domain deployment enforces. */
+  signingDomain() { return this.call('sov_getSigningDomain'); }
 
   listTokens(offset = 0, limit = 100) { return this.call('sov_listTokens', { offset, limit }); }
   tokenInfo(asset) { return this.call('sov_getTokenInfo', { hash: asset }); }

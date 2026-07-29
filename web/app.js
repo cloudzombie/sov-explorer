@@ -80,6 +80,30 @@ function fmtHashrate(hps) {
   }
   return `${fmtDecimal(value, value >= 100 ? 0 : 2)} ${units[i]}`;
 }
+/** Human label for a block-count window, e.g. "last 576 blocks (~24 h)". The
+ * duration is derived from the node-reported block target when known; without it
+ * only the block count is claimed. */
+function minerWindowLabel(blocks, targetBlockMs = LAST_STATUS?.difficulty?.targetBlockMs) {
+  const n = Number(blocks);
+  if (!Number.isFinite(n) || n <= 0) return 'window pending';
+  const target = Number(targetBlockMs);
+  if (!Number.isFinite(target) || target <= 0) return `last ${fmtNum(n)} blocks`;
+  const hours = (n * target) / 3_600_000;
+  const approx = hours >= 48 ? `${fmtDecimal(hours / 24, 1)} d` : `${fmtDecimal(hours, hours < 10 ? 1 : 0)} h`;
+  return `last ${fmtNum(n)} blocks (~${approx})`;
+}
+/** Format a duration given in milliseconds as seconds/minutes, or an em dash. */
+function fmtDuration(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n < 1000) return `${Math.round(n)} ms`;
+  const s = n / 1000;
+  if (s < 90) return `${fmtDecimal(s, s < 10 ? 2 : 1)} s`;
+  const m = s / 60;
+  return `${fmtDecimal(m, m < 10 ? 2 : 1)} min`;
+}
+
 function shortHash(h, head = 10, tail = 8) {
   if (!h) return '—';
   const value = String(h);
@@ -259,6 +283,11 @@ function actionSummary(action) {
       return `asset ${objectLink('token', action.asset, shortHash(action.asset, 8, 6))} · <b>${fmtCoin(action.amount)}</b>`;
     case 'shielded':
       return `shielded bundle (${fmtBytes((action.bundle || []).length)})`;
+    case 'shielded_v2':
+      // Pool-v2 post-quantum spend. The bundle is opaque at this layer (ML-KEM-768
+      // ciphertexts + STARK proof + nullifiers/commitments are encoded inside it);
+      // only its size is public. Amounts stay private, same disclosure model as v1.
+      return `pool-v2 (post-quantum) shielded spend · bundle (${fmtBytes((action.bundle || []).length)})`;
     case 'htlc_lock':
       return `HTLC lock → ${acctLink(action.recipient)} · <b>${fmtCoin(action.amount)}</b> ${COIN_SYMBOL}`;
     case 'htlc_claim':
@@ -281,6 +310,32 @@ function actionSummary(action) {
       return `NFT ${objectLink('nft', `${action.collection}:${bytesHex(action.token_id)}`, shortHash(bytesHex(action.token_id), 8, 6))} → ${acctLink(action.to)}`;
     case 'nft_set_meta':
       return `set NFT ${objectLink('nft', `${action.collection}:${bytesHex(action.token_id)}`, shortHash(bytesHex(action.token_id), 8, 6))} metadata`;
+    case 'tipped':
+      // Fee-auction envelope (v0.1.98): the tip goes to the block's miner, then
+      // the inner action executes.
+      return `miner tip <b>${fmtCoin(action.tip)}</b> ${COIN_SYMBOL} · ${action.inner ? `${esc(action.inner.type ?? 'action')} — ${actionSummary(action.inner)}` : ''}`;
+    case 'vault_deposit':
+      return `deposit <b>${fmtCoin(action.amount)}</b> ${COIN_SYMBOL} vault collateral`;
+    case 'vault_mint':
+      return `mint <b>${fmtCoin(action.amount)}</b> xUSD against vault collateral`;
+    case 'vault_burn':
+      return `repay <b>${fmtCoin(action.amount)}</b> xUSD vault debt`;
+    case 'vault_withdraw':
+      return `withdraw <b>${fmtCoin(action.amount)}</b> ${COIN_SYMBOL} vault collateral`;
+    case 'oracle_update':
+      return `oracle price update`;
+    case 'rotate_key':
+      return `rotate account key`;
+    case 'set_multisig':
+      return `configure M-of-N multisig`;
+    case 'multisig_exec':
+      return action.inner ? `multisig-execute ${esc(action.inner.type ?? 'action')}` : 'multisig execution';
+    case 'propose_multisig':
+      return 'propose multisig action';
+    case 'approve_multisig':
+      return 'approve multisig proposal';
+    case 'cancel_multisig':
+      return 'cancel multisig proposal';
     default:
       return '';
   }
@@ -328,13 +383,15 @@ async function renderOverview(routeId) {
   const relayText = relay.healthy !== undefined
     ? `${fmtNum(relay.healthy)}/${fmtNum(relay.verified)} relays${relay.consistent === false ? ' · disagreement' : relay.degraded ? ' · degraded' : ' · consistent'}`
     : 'relay status pending';
-  // Active miners = registry entries that mined near the tip (the home rig / laptop /
-  // Windows machine appear here when they mine). Distinct from relays and from all
-  // miners ever seen. Its own chip so it reads at a glance.
-  const minersActive = all.minersActive;
-  const minersText = minersActive === null || minersActive === undefined
+  // Mining accounts seen in the server-stated recent window (24h at the 150s
+  // target). The window is always shown WITH the count: a short sample hides
+  // low-hashrate miners, and coinbase accounts are not machines — several
+  // machines can pay the same account.
+  const mw = s.minerWindow ?? {};
+  const windowLabel = minerWindowLabel(mw.windowBlocks);
+  const minersText = mw.accounts === null || mw.accounts === undefined
     ? 'miners pending'
-    : `${fmtNum(minersActive)} active miner${minersActive === 1 ? '' : 's'}`;
+    : `${fmtNum(mw.accounts)} mining account${mw.accounts === 1 ? '' : 's'} · ${windowLabel}`;
   setView(`
     <section class="hero-strip">
       <div>
@@ -346,7 +403,7 @@ async function renderOverview(routeId) {
         <span>${fmtNum(s.blocksIndexed)} indexed blocks</span>
         ${s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : ''}
         <span class="relay-pill ${relay.degraded ? 'degraded' : ''}">${esc(relayText)}</span>
-        <span class="miners-pill ${minersActive ? '' : 'idle'}">${esc(minersText)}</span>
+        <span class="miners-pill ${mw.accounts ? '' : 'idle'}" title="Coinbase accounts that won at least one of the last ${esc(String(mw.windowBlocks ?? '—'))} blocks. Accounts, not machines — several machines can pay one account.">${esc(minersText)}</span>
       </div>
     </section>
 
@@ -354,12 +411,12 @@ async function renderOverview(routeId) {
       <section class="stat-card">
         <h2>All time</h2>
         ${statItem('Circulation', `${fmtCoin(all.circulationGrains)} ${COIN_SYMBOL}`, `${pct(s.mintedOfCap)} of 21,000,000 cap minted`)}
-        ${statItem('Shielded supply', supply ? `${fmtDecimal(supply.shieldedPercent ?? 0, 2)}%` : '—', supply ? `${fmtCoin(supply.shielded)} ${COIN_SYMBOL} private of ${fmtCoin(supply.total)} (Zcash-style)` : 'node unreachable')}
+        ${statItem('Shielded supply', supply?.shieldedPercent === undefined ? '—' : `${fmtDecimal(supply.shieldedPercent, 2)}%`, supply ? `${fmtCoin(supply.shielded)} ${COIN_SYMBOL} private of ${fmtCoin(supply.total)} (Orchard pool — not post-quantum)` : 'node unreachable')}
         ${statItem('Market cap', fmtUsd(all.marketCapUsd), 'price feed not configured')}
         ${statItem('Market dominance', all.marketDominance === null || all.marketDominance === undefined ? '—' : pct(all.marketDominance), 'market feed not configured')}
         ${statItem('Blockchain size', fmtBytes(all.blockchainSizeBytes), 'indexed window')}
-        ${statItem('Active miners', all.minersActive === null || all.minersActive === undefined ? '—' : fmtNum(all.minersActive), 'mined a block near the tip')}
-        ${statItem('Miners seen', (all.minersSeen ?? all.networkNodes) == null ? '—' : fmtNum(all.minersSeen ?? all.networkNodes), 'all-time miner registry')}
+        ${statItem('Mining accounts', mw.accounts === null || mw.accounts === undefined ? '—' : fmtNum(mw.accounts), `won a block in the ${windowLabel} — accounts, not machines`)}
+        ${statItem('Mining accounts (all time)', (all.minersSeen ?? all.networkNodes) == null ? '—' : fmtNum(all.minersSeen ?? all.networkNodes), 'every coinbase account in the node registry')}
         ${statItem('Relays', relay.verified === undefined ? '—' : fmtNum(relay.verified), 'pinned infrastructure nodes')}
         ${statItem('Difficulty', all.difficulty === null || all.difficulty === undefined ? '—' : esc(fmtNum(all.difficulty)), esc(all.difficultyAlgo === 'Sha256d' ? 'SHA-256d' : (all.difficultyAlgo || 'PoW')))}
       </section>
@@ -370,21 +427,22 @@ async function renderOverview(routeId) {
         ${statItem('Transactions per second', fmtDecimal(day.transactionsPerSecond ?? 0, 4))}
         ${statItem('Blocks', fmtNum(day.blocks))}
         ${statItem('Volume', `${fmtCoin(day.volumeGrains)} ${COIN_SYMBOL}`, `transparent ${COIN_SYMBOL} volume`)}
-        ${statItem('Median transaction fee', fmtUsd(day.medianTransactionFeeUsd), 'fee index not exposed by node')}
-        ${statItem('Average transaction fee', fmtUsd(day.averageTransactionFeeUsd), 'fee index not exposed by node')}
-        ${statItem('Hashrate', fmtHashrate(day.hashrate), day.hashrate == null ? 'measuring — needs a few blocks' : 'estimated from recent block work')}
+        ${statItem('Miner tips', day.minerTipGrains === undefined ? '—' : `${fmtCoin(day.minerTipGrains)} ${COIN_SYMBOL}`, day.tippedTransactions ? `${fmtNum(day.tippedTransactions)} fee-auction tipped tx` : 'fee-auction tips in indexed window')}
+        ${statItem('Hashrate', fmtHashrate(day.hashrate), day.hashrate == null ? 'measuring — needs a few blocks' : 'node estimate from recent block work (sov_getDifficulty)')}
+        ${blockTimeStat(s.blockTime)}
         ${!day.windowComplete ? `<p class="stat-footnote">Building the recent window; values become a full 24h view after synchronization.</p>` : ''}
       </section>
 
       <section class="stat-card">
-        <h2>Mempool</h2>
-        ${statItem('Transactions', fmtNum(mempool.transactions))}
-        ${statItem('Transactions per second', mempool.transactionsPerSecond === null || mempool.transactionsPerSecond === undefined ? '—' : fmtDecimal(mempool.transactionsPerSecond, 4))}
-        ${statItem('Outputs', mempool.outputs === null || mempool.outputs === undefined ? '—' : fmtNum(mempool.outputs))}
-        ${statItem('Fee total', fmtUsd(mempool.feeTotalUsd), 'fee index not exposed by node')}
+        <h2>Mempool &amp; fees</h2>
+        ${statItem('Pending transactions', fmtNum(mempool.transactions), 'sov_getMempoolSize')}
+        ${feeRouteStats(s)}
+        ${statItem('Auction floor', '—', auctionFloorNote(s))}
+        ${statItem('Block subsidy', s.mintRewardGrains == null ? '—' : `${fmtCoin(s.mintRewardGrains)} ${COIN_SYMBOL}`, s.mintRewardGrains == null ? 'not exposed by node' : 'next coinbase at this height (sov_getMintReward)')}
         ${statItem('Size', fmtBytes(mempool.sizeBytes), 'mempool bytes not exposed')}
       </section>
     </div>
+    ${deploymentsPanel(s)}
 
     <div class="grid2">
       <div>
@@ -402,6 +460,138 @@ async function renderOverview(routeId) {
   // Live: new blocks and txs stream into their tables in place.
   live.onBlock = (b) => livePrepend('ov-blocks', blockRow(b), 12);
   live.onTx = (t) => livePrepend('ov-txs', txRow({ ...t, timestampMs: t.timestampMs ?? Date.now() }), 12);
+}
+
+/** Why the mempool auction floor is a dash. The floor genuinely has no RPC, but the
+ * reason must not assert the fee-auction's state when the node has not reported it —
+ * during an outage `deployments` is null and nothing about activation is known. */
+function auctionFloorNote(s) {
+  const feeAuction = (s.deployments?.deployments ?? []).find((d) => d?.name === 'fee-auction');
+  if (!feeAuction) return 'mempool tip floor is not exposed by the node RPC';
+  return feeAuction.state === 'Active'
+    ? 'fee-auction is active, but the mempool tip floor has no RPC — not estimated here'
+    : `fee-auction is ${String(feeAuction.state).toLowerCase()}; the mempool tip floor has no RPC either way`;
+}
+
+/** Observed block spacing, measured from real header timestamps. The window and the
+ * method are shown with the number; a window too small to yield an interval renders
+ * as a dash, never as a zero or as the protocol target dressed up as a measurement. */
+function blockTimeStat(bt) {
+  if (!bt || bt.intervals === 0) {
+    return statItem('Block time', '—', 'not enough retained headers to measure yet');
+  }
+  const target = bt.targetMs == null ? '' : ` · target ${fmtDuration(bt.targetMs)}`;
+  const coverage = bt.complete
+    ? `${fmtNum(bt.intervals)} intervals`
+    : `${fmtNum(bt.intervals)} intervals (partial window)`;
+  const skipped = bt.nonMonotonicIntervals
+    ? ` · ${fmtNum(bt.nonMonotonicIntervals)} backwards header${bt.nonMonotonicIntervals === 1 ? '' : 's'} excluded`
+    : '';
+  return statItem(
+    'Block time (median)',
+    fmtDuration(bt.medianMs),
+    `mean ${fmtDuration(bt.meanMs)}${target} · ${coverage} over #${fmtNum(bt.fromHeight)}–#${fmtNum(bt.toHeight)}${skipped}`,
+  );
+}
+
+/** Every send route the node prices, each an exact runtime fee. Routes the node did
+ * not price are simply not shown rather than rendered as a zero fee. */
+function feeRouteStats(s) {
+  const LABELS = {
+    transfer: 'Transfer fee',
+    tokenTransfer: 'Token transfer fee',
+    shielded: 'Shielded fee',
+  };
+  const routes = s.feeRoutes ?? (s.fees ? { [s.fees.kind]: s.fees } : null);
+  if (!routes || !Object.keys(routes).length) {
+    return statItem('Transfer fee', '—', 'fee estimate not exposed by node');
+  }
+  return Object.entries(LABELS)
+    .filter(([kind]) => routes[kind])
+    .map(([kind, label]) => {
+      const fee = routes[kind];
+      return statItem(
+        label,
+        `${fmtCoin(fee.feeGrains)} ${COIN_SYMBOL}`,
+        `exact runtime fee · gas ${fmtNum(fee.gasUsed)} × ${fmtNum(fee.gasPriceGrains)} grains`,
+      );
+    })
+    .join('');
+}
+
+/** Badge for a BIP-9 deployment state, textual — never colour-only. */
+function deploymentStateBadge(state) {
+  const s = String(state ?? 'Unknown');
+  const cls = s === 'Active' ? 'ok' : s === 'Failed' ? 'fail' : s === 'LockedIn' ? 'final' : 'pending';
+  return `<span class="badge ${cls}">${esc(s)}</span>`;
+}
+
+/** Earliest possible BIP-9 activation schedule for a deployment, derived purely
+ * from the RPC-carried startHeight + period — never hardcoded per deployment. A
+ * deployment can lock in no earlier than the first full period after its start,
+ * and activates one period after lock-in, so:
+ *   earliest lock-in  = startHeight + period
+ *   earliest active   = startHeight + 2 × period
+ * (e.g. shielded-v2: start 14,976, period 288 → lock-in 15,264 → active 15,552).
+ * Returns null when the object lacks the fields. The word "earliest" is load-
+ * bearing: real activation slips later if signaling misses the 90% threshold. */
+function projectedActivation(d) {
+  const start = Number(d?.startHeight);
+  const period = Number(d?.period);
+  if (!Number.isFinite(start) || !Number.isFinite(period) || period <= 0) return null;
+  return { lockin: start + period, active: start + 2 * period };
+}
+
+/** Consensus deployments (BIP-9 miner signaling): states from sov_getDeployments
+ * plus signaling observed in retained headers, with the observation window stated.
+ * When the node does not expose deployment states, that is said outright. */
+function deploymentsPanel(s) {
+  const dep = s.deployments;
+  if (!dep) {
+    return `<h2>Consensus upgrades</h2><div class="panel"><p class="note" style="margin:12px">Deployment states are not exposed by the connected node (sov_getDeployments unavailable).</p></div>`;
+  }
+  const signaling = s.signaling;
+  const rows = (dep.deployments ?? []).map((d) => {
+    const observed = signaling && signaling.coveredBlocks > 0 && signaling.byBit?.[d.bit] !== undefined
+      ? `${fmtNum(signaling.byBit[d.bit])}/${fmtNum(signaling.coveredBlocks)} recent headers (${fmtDecimal((signaling.byBit[d.bit] / signaling.coveredBlocks) * 100, 1)}%)`
+      : 'no retained headers yet';
+    const proj = projectedActivation(d);
+    // Only meaningful before the outcome is settled; once Active/Failed the
+    // projection is moot and would mislead.
+    const projLine = proj && d.state !== 'Active' && d.state !== 'Failed'
+      ? `<div class="dim" style="font-size:12px">earliest lock-in #${fmtNum(proj.lockin)} → active #${fmtNum(proj.active)}</div>`
+      : '';
+    return `<tr>
+      <td><b>${esc(d.name)}</b>${projLine}</td>
+      <td class="right num">${fmtNum(d.bit)}</td>
+      <td>${deploymentStateBadge(d.state)}</td>
+      <td class="right num">${fmtNum(d.startHeight)}</td>
+      <td class="right num">${fmtNum(d.timeoutHeight)}</td>
+      <td class="right num">${fmtNum(d.period)}</td>
+      <td>${esc(observed)}</td>
+    </tr>`;
+  }).join('');
+  return `
+    <h2>Consensus upgrades <span class="dim">— BIP-9 miner signaling, evaluated by the node at height ${fmtNum(dep.height)}</span></h2>
+    <div class="panel"><table><thead><tr><th>Deployment</th><th class="right">Bit</th><th>State</th><th class="right">Start</th><th class="right">Timeout</th><th class="right">Period</th><th>Header signaling observed</th></tr></thead>
+    <tbody>${rows || emptyRow(7)}</tbody></table></div>
+    ${signingDomainNote(s)}`;
+}
+
+/** The observable RUNTIME EFFECT of an activated tx-domain deployment: the exact
+ * chain/genesis-bound tags every signature is now checked against. This is what
+ * makes a transaction from another SOV network unreplayable here, and the node
+ * reports it directly (sov_getSigningDomain) rather than it being inferred. */
+function signingDomainNote(s) {
+  const d = s.signingDomain;
+  if (!d) return '';
+  const state = d.active
+    ? '<span class="badge ok">ENFORCED</span>'
+    : '<span class="badge pending">NOT YET ENFORCED</span>';
+  return `<p class="note">Transaction signing domain ${state} — signatures are bound to
+    <code>${esc(d.chainId ?? '—')}</code> and genesis <code>${esc(shortHash(d.genesis, 10, 6))}</code>
+    with tags <code>${esc(d.txTag ?? '—')}</code> / <code>${esc(d.intentTag ?? '—')}</code>.
+    A transaction signed for a different Sovereign network cannot be replayed onto this one.</p>`;
 }
 
 function blockRow(b) {
@@ -499,10 +689,13 @@ function blocksListRow(b) {
 }
 
 const TX_ACTION_TYPES = [
-  'transfer', 'token_issue', 'token_transfer', 'token_burn', 'shielded',
+  'transfer', 'tipped', 'token_issue', 'token_transfer', 'token_burn', 'shielded',
   'htlc_lock', 'htlc_claim', 'htlc_refund', 'call', 'deploy',
   'claim_vesting', 'register_name', 'transfer_name', 'nft_mint',
-  'nft_transfer', 'nft_set_meta',
+  'nft_transfer', 'nft_set_meta', 'set_multisig', 'multisig_exec',
+  'propose_multisig', 'approve_multisig', 'cancel_multisig',
+  'vault_deposit', 'vault_mint', 'vault_burn', 'vault_withdraw', 'oracle_update',
+  'rotate_key', 'intent_settle', 'intent_cancel', 'token_set_policy',
 ];
 
 function transactionListRow(tx) {
@@ -686,6 +879,9 @@ async function renderBlock(ref, routeId) {
       <tr><td class="k">State root</td><td class="v">${esc(b.stateRoot)} ${copyButton(b.stateRoot, 'state root')}</td></tr>
       <tr><td class="k">Tx root</td><td class="v">${esc(b.txRoot)} ${emptyRootBadge(b.txCount === 0)} ${copyButton(b.txRoot, 'transaction root')}</td></tr>
       <tr><td class="k">Receipts root</td><td class="v">${esc(b.receiptsRoot)} ${emptyRootBadge(b.txCount === 0)} ${copyButton(b.receiptsRoot, 'receipts root')}</td></tr>
+      ${versionBitsRow(b.versionBits)}
+      ${b.bits !== null && b.bits !== undefined ? `<tr><td class="k">Difficulty bits</td><td class="v mono">${fmtNum(b.bits)} <span class="dim">(compact PoW target, 0x${Number(b.bits).toString(16)})</span></td></tr>` : ''}
+      ${b.nonce !== null && b.nonce !== undefined ? `<tr><td class="k">Nonce</td><td class="v mono">${fmtNum(b.nonce)}</td></tr>` : ''}
       <tr><td class="k">Finality</td><td class="v">${b.final ? 'Final — buried past the Nakamoto confirmation depth' : 'Pending — waiting for more confirmations'}</td></tr>
     </table></div>
     ${coinbasePanel(b.coinbase)}
@@ -693,6 +889,24 @@ async function renderBlock(ref, routeId) {
     <div class="panel"><table><thead><tr><th>Tx</th><th>Type</th><th>Signer</th><th>Detail</th></tr></thead>
     <tbody>${txs.map((t) => `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td>${acctLinkShort(t.signer)}</td><td>${actionSummary(t.action)}</td></tr>`).join('') || emptyRow(4)}</tbody></table></div>
   `, routeId);
+}
+
+/** The header's BIP-9 signal word with per-deployment bit decode (from the last
+ * polled /status deployments; raw value is always shown). Blocks indexed before
+ * the explorer retained this field render as "not retained", not as zero. */
+function versionBitsRow(versionBits) {
+  if (versionBits === null || versionBits === undefined) {
+    return `<tr><td class="k">Version bits</td><td class="v dim">not retained for this block (re-indexed data will include the header's signal word)</td></tr>`;
+  }
+  const vb = Number(versionBits);
+  const deployments = LAST_STATUS?.deployments?.deployments ?? [];
+  const set = deployments
+    .filter((d) => Number.isInteger(Number(d.bit)) && ((vb >>> Number(d.bit)) & 1))
+    .map((d) => `bit ${fmtNum(d.bit)} · ${esc(d.name)}`);
+  const detail = deployments.length
+    ? (set.length ? `signaling ${set.join(', ')}` : 'no known deployment bits set')
+    : 'deployment names unavailable';
+  return `<tr><td class="k">Version bits</td><td class="v mono">${fmtNum(vb)} <span class="dim">(0b${vb.toString(2)}) — ${detail}</span></td></tr>`;
 }
 
 /** Human label for a coinbase recipient's role. */
@@ -724,13 +938,16 @@ function coinbasePanel(cb) {
     <tbody>${rows || emptyRow(3)}</tbody></table></div>`;
 }
 
-/** The XUS value a transaction moves, when its action carries one. */
+/** The XUS value a transaction moves, when its action carries one. A fee-auction
+ * `tipped` envelope moves its inner action's value (the tip is shown separately). */
 function actionValue(action) {
   if (!action) return null;
   switch (action.type) {
     case 'transfer':
     case 'htlc_lock':
       return action.amount;
+    case 'tipped':
+      return action.inner ? actionValue(action.inner) : null;
     default:
       return null;
   }
@@ -831,6 +1048,8 @@ async function renderTx(id, routeId) {
       <tr><td class="k">Nonce</td><td class="v">${fmtNum(t.nonce)}</td></tr>
       <tr><td class="k">Action</td><td class="v">${esc(t.action?.type)} — ${actionSummary(t.action)}</td></tr>
       ${value !== null ? `<tr><td class="k">Value</td><td class="v"><b>${fmtCoin(value)}</b> ${COIN_SYMBOL}</td></tr>` : ''}
+      ${t.action?.type === 'tipped' ? `<tr><td class="k">Miner tip</td><td class="v"><b>${fmtCoin(t.action.tip)}</b> ${COIN_SYMBOL} <span class="dim">— fee-auction priority bid paid to this block's miner on top of the intrinsic fee</span></td></tr>` : ''}
+      ${t.action?.type === 'shielded_v2' ? `<tr><td class="k">Privacy</td><td class="v">pool-v2 (post-quantum) shielded spend <span class="dim">— ML-KEM-768 + STARK. The ${fmtBytes((t.action.bundle || []).length)} bundle carries the nullifiers, commitments and proof; amounts and parties stay private, only the bundle size is public.</span></td></tr>` : ''}
       ${r ? `<tr><td class="k">Gas used</td><td class="v">${fmtNum(r.gas_used ?? r.gasUsed ?? 0)}</td></tr>` : ''}
       <tr><td class="k">Public key</td><td class="v">${rawBlob(t.publicKey)}</td></tr>
       <tr><td class="k">Signature</td><td class="v">${rawBlob(t.signature)}</td></tr>
@@ -925,20 +1144,48 @@ async function renderWatchlist(routeId) {
 
 async function renderMiners(routeId) {
   setView('<div class="loading">Loading miners…</div>', routeId);
-  const [observed, miners] = await Promise.all([api('/observed-miners'), api('/miners')]);
+  const [observed, miners, status] = await Promise.all([
+    api('/observed-miners'),
+    api('/miners'),
+    api('/status').catch(() => null),
+  ]);
+  const w = observed.window ?? {};
+  const registry = observed.registry ?? {};
+  const target = status?.difficulty?.targetBlockMs;
+  const windowLabel = minerWindowLabel(registry.windowBlocks ?? w.windowBlocks, target);
+  const coverage = w.coveredBlocks
+    ? (w.complete
+      ? `all ${fmtNum(w.coveredBlocks)} blocks #${fmtNum(w.fromHeight)}–#${fmtNum(w.toHeight)}`
+      : `partial coverage: ${fmtNum(w.coveredBlocks)} retained blocks #${fmtNum(w.fromHeight)}–#${fmtNum(w.toHeight)} — the explorer has not yet indexed the full window`)
+    : 'no retained blocks yet';
+  const peers = status?.peers;
+  const agentList = peers?.agents
+    ? Object.entries(peers.agents).map(([agent, count]) => `${esc(agent)} × ${fmtNum(count)}`).join(' · ')
+    : null;
   setView(`
     <h1>Miners</h1>
+    <p class="note"><b>A coinbase account is not a machine.</b> Several physical machines can — and on this network do — pay the same account, so a machine count cannot be derived from chain data and is never claimed here. Every count below states the exact window it was measured over; a short sample systematically misses low-hashrate miners, which is why the recent window spans ${esc(windowLabel.replace(/^last /, ''))}.</p>
     <div class="cards">
-      <div class="card"><div class="label">Active miners</div><div class="value num">${observed.miners.length}</div><div class="sub">observed in indexed blocks</div></div>
-      <div class="card"><div class="label">Registered miners</div><div class="value num">${miners.length}</div><div class="sub">reported by the node</div></div>
-      <div class="card"><div class="label">Consensus</div><div class="value mono" style="font-size:16px">Nakamoto</div><div class="sub">heaviest-work fork choice</div></div>
+      <div class="card"><div class="label">Mining accounts · ${esc(windowLabel)}</div><div class="value num">${registry.recentAccounts === null || registry.recentAccounts === undefined ? '—' : fmtNum(registry.recentAccounts)}</div><div class="sub">won ≥ 1 block in the window (node registry)</div></div>
+      <div class="card"><div class="label">Mining accounts · all time</div><div class="value num">${registry.allTimeAccounts === null || registry.allTimeAccounts === undefined ? '—' : fmtNum(registry.allTimeAccounts)}</div><div class="sub">every coinbase account since genesis</div></div>
+      <div class="card"><div class="label">Consensus</div><div class="value mono" style="font-size:16px">Nakamoto</div><div class="sub">pure proof-of-work, heaviest-work fork choice</div></div>
     </div>
-    <h2>Observed Block Miners</h2>
-    <div class="panel"><table><thead><tr><th>Miner</th><th class="right">Blocks mined</th><th class="right">Last height</th></tr></thead>
-    <tbody>${observed.miners.map((x) => `<tr><td>${acctLink(x.account)}</td><td class="right num">${fmtNum(x.blocksMined)}</td><td class="right">${blockLink(x.lastHeight)}</td></tr>`).join('') || emptyRow(3)}</tbody></table></div>
-    <h2>Miner Registry</h2>
-    <div class="panel"><table><thead><tr><th>Miner</th><th class="right">Blocks mined</th><th class="right">First seen</th><th class="right">Last seen</th></tr></thead>
+    <h2>Block wins — ${esc(windowLabel)}</h2>
+    <p class="note">Share of blocks each account won, measured over ${esc(coverage)}.</p>
+    <div class="panel"><table><thead><tr><th>Account</th><th class="right">Blocks won</th><th class="right">Share</th><th class="right">Latest win</th></tr></thead>
+    <tbody>${(w.miners ?? []).map((x) => `<tr><td>${acctLink(x.account)}</td><td class="right num">${fmtNum(x.blocks)}</td><td class="right num">${x.share === null ? '—' : pct(x.share)}</td><td class="right">${blockLink(x.lastHeight)}</td></tr>`).join('') || emptyRow(4)}</tbody></table></div>
+    <h2>All-time registry <span class="dim">— sov_getMiners, whole chain</span></h2>
+    <div class="panel"><table><thead><tr><th>Account</th><th class="right">Blocks mined</th><th class="right">First seen</th><th class="right">Last seen</th></tr></thead>
     <tbody>${miners.map((m) => `<tr><td>${acctLink(m.account)}</td><td class="right num">${fmtNum(m.blocksMined ?? m.mineTxs ?? 0)}</td><td class="right">${blockLink(m.firstSeenHeight)}</td><td class="right">${blockLink(m.lastSeenHeight)}</td></tr>`).join('') || emptyRow(4)}</tbody></table></div>
+    <h2>Relay connectivity <span class="dim">— a different, weaker signal than mining accounts</span></h2>
+    ${peers
+      ? `<div class="panel"><table class="kv">
+          <tr><td class="k">Authenticated peers of the relay</td><td class="v num">${peers.peers === null ? '—' : fmtNum(peers.peers)}</td></tr>
+          <tr><td class="k">Peer software</td><td class="v">${agentList || '<span class="dim">not reported</span>'}</td></tr>
+          <tr><td class="k">Relay version</td><td class="v mono">${esc(peers.relayVersion ?? '—')}${peers.protocolVersion === null ? '' : ` · protocol ${fmtNum(peers.protocolVersion)}`}</td></tr>
+        </table></div>
+        <p class="note">These are the nodes one relay is directly connected to (sov_getPeerInfo) — evidence of live machines, but neither a full network census nor a miner count: non-mining nodes appear here and distant miners may not. Peer addresses are deliberately not republished.</p>`
+      : '<div class="panel"><p class="note" style="margin:12px">Peer information is not exposed by the connected node.</p></div>'}
   `, routeId);
 }
 
@@ -1007,7 +1254,7 @@ async function renderAnalytics(routeId) {
     <div class="cards">
       <div class="card"><div class="label">Total supply</div><div class="value num">${fmtCoin(stats.supply?.total)}<span class="unit">${COIN_SYMBOL}</span></div></div>
       <div class="card"><div class="label">Mined (PoW)</div><div class="value num">${fmtCoin(stats.supply?.mined)}<span class="unit">${COIN_SYMBOL}</span></div><div class="sub">${pct(stats.mintedOfCap)} of 21M cap</div><div class="bar"><i style="width:${Math.min(100, (stats.mintedOfCap ?? 0) * 100)}%"></i></div></div>
-      <div class="card"><div class="label">Shielded supply</div><div class="value num">${fmtDecimal(stats.supply?.shieldedPercent ?? 0, 2)}<span class="unit">%</span></div><div class="sub">${fmtCoin(stats.supply?.shielded)} ${COIN_SYMBOL} private (Zcash-style)</div><div class="bar"><i style="width:${Math.min(100, stats.supply?.shieldedPercent ?? 0)}%"></i></div></div>
+      <div class="card"><div class="label">Shielded supply</div><div class="value num">${stats.supply?.shieldedPercent === undefined ? '—' : fmtDecimal(stats.supply.shieldedPercent, 2)}<span class="unit">%</span></div><div class="sub">${fmtCoin(stats.supply?.shielded)} ${COIN_SYMBOL} private (Orchard pool — not post-quantum)</div><div class="bar"><i style="width:${Math.min(100, stats.supply?.shieldedPercent ?? 0)}%"></i></div></div>
       <div class="card"><div class="label">Finality depth</div><div class="value num">6</div><div class="sub">confirmation convention</div></div>
       <div class="card"><div class="label">Mempool</div><div class="value num">${fmtNum(stats.mempoolSize)}</div></div>
       <div class="card"><div class="label">Blocks indexed</div><div class="value num">${fmtNum(stats.blocksIndexed)}</div></div>
@@ -1056,6 +1303,44 @@ function issuanceChart(series) {
   <div class="chart-meta"><span>Block #${fmtNum(minX)}</span><strong>+${fmtDecimal(change, 2)} ${COIN_SYMBOL} in indexed window</strong><span>Block #${fmtNum(maxX)}</span></div>`;
 }
 
+/** Pool v2 (post-quantum) shielded-state card for the proof view. Mirrors the v1
+ * shielded card but is driven by sov_getShieldedV2Info. A node older than v0.2.5
+ * does not expose the method, so `v2` is null — say so outright rather than
+ * fabricate an empty pool. The pool is DORMANT until the `shielded-v2` deployment
+ * (signal bit 2) activates at mainnet height 15,552; `v2.active` is the node's
+ * authoritative answer for whether it can be transacted with right now. */
+function poolV2ProofCard(v2) {
+  if (!v2) {
+    return `
+      <section class="proof-card">
+        <div class="proof-heading"><div><span class="eyebrow">POST-QUANTUM PRIVACY</span><h2>Shielded pool v2</h2></div><span class="proof-state warn">not reported by this node</span></div>
+        <p class="proof-note">This node does not expose <code>sov_getShieldedV2Info</code> — it predates the v0.2.5 pool-v2 release. Point the explorer at a v0.2.5+ node to surface the post-quantum pool's state. Nothing is assumed about the pool in its absence.</p>
+      </section>`;
+  }
+  const pool = safeBigInt(v2.poolValue);
+  const available = safeBigInt(v2.deshieldableNowGrains);
+  const limit = safeBigInt(v2.deshieldLimitGrains);
+  const active = v2.active === true;
+  const resetHeight = Number(v2.windowResetsAtHeight ?? 0);
+  const windowElapsed = resetHeight > 0 && Number(v2.height ?? 0) >= resetHeight;
+  const stateLabel = active ? 'ACTIVE — spendable' : 'DORMANT — not yet active';
+  return `
+      <section class="proof-card">
+        <div class="proof-heading"><div><span class="eyebrow">POST-QUANTUM PRIVACY</span><h2>Shielded pool v2</h2></div><span class="proof-state ${active ? 'ok' : 'warn'}">${esc(stateLabel)}</span></div>
+        <div class="proof-metric"><b>${fmtCoin(pool.toString())} ${COIN_SYMBOL}</b><span>inside the post-quantum pool</span><small>${fmtNum(v2.noteCount)} notes · ${fmtNum(v2.nullifierCount)} nullifiers spent</small></div>
+        <div class="evidence-kv compact">
+          <span>Anchor (Merkle root)</span><b class="mono break">${v2.anchor ? `${esc(shortHash(v2.anchor, 12, 10))} ${copyButton(v2.anchor, 'pool-v2 anchor')}` : '—'}</b>
+          <span>De-shieldable now</span><b>${fmtCoin(available.toString())} ${COIN_SYMBOL}</b>
+          <span>Policy ceiling</span><b>${fmtCoin(limit.toString())} ${COIN_SYMBOL} / ${fmtNum(v2.deshieldWindowBlocks)} blocks</b>
+          <span>Window state</span><b>${windowElapsed ? 'elapsed · resets on next de-shield' : `resets at #${fmtNum(resetHeight)}`}</b>
+        </div>
+        <p class="proof-note"><b>Cryptography:</b> pool v2 is post-quantum — ML-KEM-768 note encryption and a STARK spend proof (hash-based, no elliptic curves, no trusted setup), unlike the v1 Orchard/Halo2 pool above.</p>
+        <p class="proof-note">${active
+          ? 'The <code>shielded-v2</code> deployment (signal bit 2) is active at this height, so the pool accepts spends. Every field above is the node\'s live answer.'
+          : 'The pool is <b>dormant</b>: the <code>shielded-v2</code> deployment (signal bit 2) activates at mainnet height 15,552, until which an <code>Action::ShieldedV2</code> is rejected on every node. The state above is real and simply empty until then.'}</p>
+      </section>`;
+}
+
 async function renderProof(routeId) {
   setView('<div class="loading">Loading Sovereign proof…</div>', routeId);
   const proof = await api('/proof');
@@ -1064,6 +1349,7 @@ async function renderProof(routeId) {
   const layout = crypto.hybrid65Layout ?? {};
   const supply = proof.privacy?.supply ?? {};
   const shielded = proof.privacy?.shieldedInfo ?? {};
+  const shieldedV2 = proof.privacy?.shieldedV2Info ?? null;
   const empty = proof.commitments?.deterministicEmpty;
   const nonEmpty = proof.commitments?.latestNonEmpty;
   const commonHash = relays.commonHash
@@ -1080,6 +1366,7 @@ async function renderProof(routeId) {
   const fullyExitCapable = pool > 0n && available >= pool;
   const resetHeight = Number(shielded.windowResetsAtHeight ?? 0);
   const windowElapsed = resetHeight > 0 && Number(shielded.height ?? 0) >= resetHeight;
+  const poolV2Card = poolV2ProofCard(shieldedV2);
   const coverage = crypto.hybridCoverage === null || crypto.hybridCoverage === undefined
     ? 'awaiting transactions'
     : `${fmtDecimal(Number(crypto.hybridCoverage) * 100, 2)}% of retained transactions`;
@@ -1136,8 +1423,11 @@ async function renderProof(routeId) {
           <span>Spent this window</span><b>${fmtCoin(shielded.windowSpentGrains)} ${COIN_SYMBOL}</b>
           <span>Window state</span><b>${windowElapsed ? 'elapsed · resets on next de-shield' : `resets at #${fmtNum(resetHeight)}`}</b>
         </div>
-        <p class="proof-note">The limiter is visible policy, separate from shielded-pool validity. Because the configured ceiling exceeds the live pool, it does not currently throttle a full pool exit.</p>
+        <p class="proof-note">The limiter is visible policy, separate from shielded-pool validity. ${fullyExitCapable ? 'Because the configured ceiling exceeds the live pool, it does not currently throttle a full pool exit.' : 'The window ceiling currently caps how fast the pool can be exited.'}</p>
+        <p class="proof-note"><b>Cryptography disclosure:</b> this shielded pool is Orchard (Halo2, no trusted setup) — classical elliptic-curve cryptography, <b>not post-quantum</b>, unlike the chain's hybrid transaction signatures. This is disclosed in the project's quantum posture; the post-quantum pool v2 below is the successor design.</p>
       </section>
+
+      ${poolV2Card}
 
       <section class="proof-card proof-wide">
         <div class="proof-heading"><div><span class="eyebrow">COMMITMENT SEMANTICS</span><h2>Why the roots repeat — and when they change</h2></div><span class="proof-state ok">content committed</span></div>

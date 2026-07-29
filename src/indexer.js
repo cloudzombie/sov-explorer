@@ -44,6 +44,12 @@ export function normalizeBlock(block, digest, final) {
     stateRoot: h.state_root,
     timestampMs: h.timestamp_ms,
     proposer: h.proposer,
+    // Raw header consensus fields: the BIP-9 signal word, the PoW compact target,
+    // and the seal nonce — retained so signaling/difficulty are shown from real
+    // headers, never re-derived. Null when a (pre-upgrade) node omits them.
+    versionBits: h.version_bits ?? null,
+    bits: h.bits ?? null,
+    nonce: h.nonce ?? null,
     // The coinbase: this block's real height-keyed subsidy, computed by the node.
     // Current mainnet pays 100% to the proof-of-work miner. Null for genesis.
     coinbase: digest.coinbase ?? null,
@@ -51,6 +57,27 @@ export function normalizeBlock(block, digest, final) {
     sizeBytes: Buffer.byteLength(JSON.stringify(block)),
     transactions,
     final: !!final,
+  };
+}
+
+/**
+ * Reduce sov_getPeerInfo to what a public explorer may republish: counts and
+ * software-version distribution of the RELAY's own peers. Peer IP addresses are
+ * deliberately dropped — home miners' addresses are not the explorer's to publish.
+ * This is connectivity of one relay, NOT a census of network machines.
+ */
+export function summarizePeerInfo(info) {
+  if (!info || typeof info !== 'object') return null;
+  const agents = {};
+  for (const peer of Array.isArray(info.peerVersions) ? info.peerVersions : []) {
+    const agent = typeof peer?.agent === 'string' && peer.agent ? peer.agent : 'unknown';
+    agents[agent] = (agents[agent] ?? 0) + 1;
+  }
+  return {
+    peers: Number.isFinite(Number(info.peers)) ? Number(info.peers) : null,
+    relayVersion: typeof info.version === 'string' ? info.version : null,
+    protocolVersion: Number.isFinite(Number(info.protocolVersion)) ? Number(info.protocolVersion) : null,
+    agents,
   };
 }
 
@@ -126,15 +153,54 @@ export class Indexer {
     // block (thousands of requests on a cold start).
     const final = finalAtDepth(head, height, this.finalityDepth);
     const record = normalizeBlock(block, digest, final);
-    if (typeof this.rpc.receipt === 'function' && record.transactions.length) {
-      await Promise.all(record.transactions.map(async (tx) => {
-        const receipt = await this.rpc.receipt(tx.id).catch(() => null);
-        if (!receipt) return;
-        tx.receipt = receipt;
-        tx.executionStatus = receipt.status?.status ?? receipt.status ?? null;
-      }));
-    }
+    await this.attachReceipts(record);
     return record;
+  }
+
+  /**
+   * Attach execution receipts to a block's transactions.
+   *
+   * Prefers `sov_getBlockReceipts` — ONE request for the whole block — and only falls
+   * back to per-transaction `sov_getReceipt` when the node does not serve the batch
+   * form. On a 640-block cold backfill of this chain that is the difference between
+   * roughly one request per transaction (thousands) and one per block, against a
+   * production node the explorer does not own.
+   *
+   * Receipts are matched by transaction id, never by array position: a node that
+   * returns them in another order (or omits one) must not mislabel a transaction's
+   * execution status. Anything unmatched simply stays without a status.
+   */
+  async attachReceipts(record) {
+    if (!record.transactions.length) return;
+    if (typeof this.rpc.blockReceipts === 'function') {
+      const receipts = await this.rpc.blockReceipts(record.height).catch(() => null);
+      if (Array.isArray(receipts)) {
+        const byId = new Map();
+        for (const receipt of receipts) {
+          const id = receipt?.tx_id ?? receipt?.txId ?? null;
+          if (id) byId.set(comparableHash(id), receipt);
+        }
+        let matched = 0;
+        for (const tx of record.transactions) {
+          const receipt = byId.get(comparableHash(tx.id));
+          if (!receipt) continue;
+          matched += 1;
+          tx.receipt = receipt;
+          tx.executionStatus = receipt.status?.status ?? receipt.status ?? null;
+        }
+        // A complete batch is authoritative; a partial one falls through so the
+        // remaining transactions still get their real status.
+        if (matched === record.transactions.length) return;
+      }
+    }
+    if (typeof this.rpc.receipt !== 'function') return;
+    await Promise.all(record.transactions.map(async (tx) => {
+      if (tx.receipt) return;
+      const receipt = await this.rpc.receipt(tx.id).catch(() => null);
+      if (!receipt) return;
+      tx.receipt = receipt;
+      tx.executionStatus = receipt.status?.status ?? receipt.status ?? null;
+    }));
   }
 
   /** Commit one normalized record and optionally announce it as genuinely live. */
@@ -314,21 +380,58 @@ export class Indexer {
   }
 
   async refreshChainStats(height) {
+    // Optional RPCs (absent on older nodes) fail soft to null and keep the last
+    // good value on a transient error — an unavailable datum renders as
+    // unavailable, never as a fabricated zero.
+    const optional = (name, ...args) => (typeof this.rpc[name] === 'function'
+      ? this.rpc[name](...args).catch(() => null)
+      : Promise.resolve(null));
     try {
-      const [supply, difficulty, miners, mempool, shieldedInfo] = await Promise.all([
+      // Request budget: this whole batch runs at most once per `statsIntervalMs`
+      // (10 s by default), i.e. ≈1.2 requests/second amortized against ONE relay —
+      // the chain-stat cost of the explorer is fixed and does not grow with traffic,
+      // because every browser is served from this one cached snapshot.
+      const [
+        supply, difficulty, miners, mempool, shieldedInfo, shieldedV2Info, deployments,
+        feeTransfer, feeToken, feeShielded, peerInfo, mintReward, signingDomain,
+      ] = await Promise.all([
         this.rpc.supply(),
         this.rpc.difficulty(),
         this.rpc.miners(),
         this.rpc.mempoolSize(),
-        typeof this.rpc.shieldedInfo === 'function'
-          ? this.rpc.shieldedInfo().catch(() => null)
-          : Promise.resolve(null),
+        optional('shieldedInfo'),
+        optional('shieldedV2Info'),
+        optional('deployments'),
+        optional('estimateFee', 'transfer'),
+        optional('estimateFee', 'tokenTransfer'),
+        optional('estimateFee', 'shielded'),
+        optional('peerInfo'),
+        optional('mintReward'),
+        optional('signingDomain'),
       ]);
       this.store.recordSupply(supply, height);
       this.store.difficulty = difficulty;
       this.store.miners = miners;
       this.store.mempoolSize = mempool;
       if (shieldedInfo) this.store.shieldedInfo = shieldedInfo;
+      if (shieldedV2Info) this.store.shieldedV2Info = shieldedV2Info;
+      if (deployments) this.store.deployments = deployments;
+      if (feeTransfer) this.store.feeEstimate = feeTransfer;
+      // Only routes the node actually priced appear; a route it refused is absent
+      // rather than present-and-zero.
+      const routes = {};
+      for (const estimate of [feeTransfer, feeToken, feeShielded]) {
+        if (estimate && typeof estimate.kind === 'string') routes[estimate.kind] = estimate;
+      }
+      if (Object.keys(routes).length) this.store.feeRoutes = routes;
+      if (peerInfo) this.store.peerSummary = summarizePeerInfo(peerInfo);
+      if (mintReward !== null && mintReward !== undefined) this.store.mintReward = String(mintReward);
+      if (signingDomain) this.store.signingDomain = signingDomain;
+      // These fields are assigned directly rather than through addBlock/recordSupply,
+      // so the memoized stats snapshot must be invalidated explicitly — otherwise a
+      // refresh that changes only chain stats (difficulty, fees, deployments, peers)
+      // could be served from a stale cached snapshot.
+      this.store._touchStats();
     } catch {
       // Transient RPC hiccup; the next tick retries.
     }
