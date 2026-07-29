@@ -624,7 +624,7 @@ export async function handleRest(method, pathname, query, ctx) {
             difficulty: store.difficulty,
           },
           cryptography: store.cryptographyStats(),
-          privacy: { supply: store.supply, shieldedInfo: store.shieldedInfo },
+          privacy: { supply: store.supply, shieldedInfo: store.shieldedInfo, shieldedV2Info: store.shieldedV2Info },
           commitments: { deterministicEmpty: roots(empty), latestNonEmpty: roots(nonEmpty) },
           archive: stats.archive,
         });

@@ -392,7 +392,7 @@ export class Indexer {
       // the chain-stat cost of the explorer is fixed and does not grow with traffic,
       // because every browser is served from this one cached snapshot.
       const [
-        supply, difficulty, miners, mempool, shieldedInfo, deployments,
+        supply, difficulty, miners, mempool, shieldedInfo, shieldedV2Info, deployments,
         feeTransfer, feeToken, feeShielded, peerInfo, mintReward, signingDomain,
       ] = await Promise.all([
         this.rpc.supply(),
@@ -400,6 +400,7 @@ export class Indexer {
         this.rpc.miners(),
         this.rpc.mempoolSize(),
         optional('shieldedInfo'),
+        optional('shieldedV2Info'),
         optional('deployments'),
         optional('estimateFee', 'transfer'),
         optional('estimateFee', 'tokenTransfer'),
@@ -413,6 +414,7 @@ export class Indexer {
       this.store.miners = miners;
       this.store.mempoolSize = mempool;
       if (shieldedInfo) this.store.shieldedInfo = shieldedInfo;
+      if (shieldedV2Info) this.store.shieldedV2Info = shieldedV2Info;
       if (deployments) this.store.deployments = deployments;
       if (feeTransfer) this.store.feeEstimate = feeTransfer;
       // Only routes the node actually priced appear; a route it refused is absent

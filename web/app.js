@@ -283,6 +283,11 @@ function actionSummary(action) {
       return `asset ${objectLink('token', action.asset, shortHash(action.asset, 8, 6))} · <b>${fmtCoin(action.amount)}</b>`;
     case 'shielded':
       return `shielded bundle (${fmtBytes((action.bundle || []).length)})`;
+    case 'shielded_v2':
+      // Pool-v2 post-quantum spend. The bundle is opaque at this layer (ML-KEM-768
+      // ciphertexts + STARK proof + nullifiers/commitments are encoded inside it);
+      // only its size is public. Amounts stay private, same disclosure model as v1.
+      return `pool-v2 (post-quantum) shielded spend · bundle (${fmtBytes((action.bundle || []).length)})`;
     case 'htlc_lock':
       return `HTLC lock → ${acctLink(action.recipient)} · <b>${fmtCoin(action.amount)}</b> ${COIN_SYMBOL}`;
     case 'htlc_claim':
@@ -521,6 +526,22 @@ function deploymentStateBadge(state) {
   return `<span class="badge ${cls}">${esc(s)}</span>`;
 }
 
+/** Earliest possible BIP-9 activation schedule for a deployment, derived purely
+ * from the RPC-carried startHeight + period — never hardcoded per deployment. A
+ * deployment can lock in no earlier than the first full period after its start,
+ * and activates one period after lock-in, so:
+ *   earliest lock-in  = startHeight + period
+ *   earliest active   = startHeight + 2 × period
+ * (e.g. shielded-v2: start 14,976, period 288 → lock-in 15,264 → active 15,552).
+ * Returns null when the object lacks the fields. The word "earliest" is load-
+ * bearing: real activation slips later if signaling misses the 90% threshold. */
+function projectedActivation(d) {
+  const start = Number(d?.startHeight);
+  const period = Number(d?.period);
+  if (!Number.isFinite(start) || !Number.isFinite(period) || period <= 0) return null;
+  return { lockin: start + period, active: start + 2 * period };
+}
+
 /** Consensus deployments (BIP-9 miner signaling): states from sov_getDeployments
  * plus signaling observed in retained headers, with the observation window stated.
  * When the node does not expose deployment states, that is said outright. */
@@ -534,8 +555,14 @@ function deploymentsPanel(s) {
     const observed = signaling && signaling.coveredBlocks > 0 && signaling.byBit?.[d.bit] !== undefined
       ? `${fmtNum(signaling.byBit[d.bit])}/${fmtNum(signaling.coveredBlocks)} recent headers (${fmtDecimal((signaling.byBit[d.bit] / signaling.coveredBlocks) * 100, 1)}%)`
       : 'no retained headers yet';
+    const proj = projectedActivation(d);
+    // Only meaningful before the outcome is settled; once Active/Failed the
+    // projection is moot and would mislead.
+    const projLine = proj && d.state !== 'Active' && d.state !== 'Failed'
+      ? `<div class="dim" style="font-size:12px">earliest lock-in #${fmtNum(proj.lockin)} → active #${fmtNum(proj.active)}</div>`
+      : '';
     return `<tr>
-      <td><b>${esc(d.name)}</b></td>
+      <td><b>${esc(d.name)}</b>${projLine}</td>
       <td class="right num">${fmtNum(d.bit)}</td>
       <td>${deploymentStateBadge(d.state)}</td>
       <td class="right num">${fmtNum(d.startHeight)}</td>
@@ -1022,6 +1049,7 @@ async function renderTx(id, routeId) {
       <tr><td class="k">Action</td><td class="v">${esc(t.action?.type)} — ${actionSummary(t.action)}</td></tr>
       ${value !== null ? `<tr><td class="k">Value</td><td class="v"><b>${fmtCoin(value)}</b> ${COIN_SYMBOL}</td></tr>` : ''}
       ${t.action?.type === 'tipped' ? `<tr><td class="k">Miner tip</td><td class="v"><b>${fmtCoin(t.action.tip)}</b> ${COIN_SYMBOL} <span class="dim">— fee-auction priority bid paid to this block's miner on top of the intrinsic fee</span></td></tr>` : ''}
+      ${t.action?.type === 'shielded_v2' ? `<tr><td class="k">Privacy</td><td class="v">pool-v2 (post-quantum) shielded spend <span class="dim">— ML-KEM-768 + STARK. The ${fmtBytes((t.action.bundle || []).length)} bundle carries the nullifiers, commitments and proof; amounts and parties stay private, only the bundle size is public.</span></td></tr>` : ''}
       ${r ? `<tr><td class="k">Gas used</td><td class="v">${fmtNum(r.gas_used ?? r.gasUsed ?? 0)}</td></tr>` : ''}
       <tr><td class="k">Public key</td><td class="v">${rawBlob(t.publicKey)}</td></tr>
       <tr><td class="k">Signature</td><td class="v">${rawBlob(t.signature)}</td></tr>
@@ -1275,6 +1303,44 @@ function issuanceChart(series) {
   <div class="chart-meta"><span>Block #${fmtNum(minX)}</span><strong>+${fmtDecimal(change, 2)} ${COIN_SYMBOL} in indexed window</strong><span>Block #${fmtNum(maxX)}</span></div>`;
 }
 
+/** Pool v2 (post-quantum) shielded-state card for the proof view. Mirrors the v1
+ * shielded card but is driven by sov_getShieldedV2Info. A node older than v0.2.5
+ * does not expose the method, so `v2` is null — say so outright rather than
+ * fabricate an empty pool. The pool is DORMANT until the `shielded-v2` deployment
+ * (signal bit 2) activates at mainnet height 15,552; `v2.active` is the node's
+ * authoritative answer for whether it can be transacted with right now. */
+function poolV2ProofCard(v2) {
+  if (!v2) {
+    return `
+      <section class="proof-card">
+        <div class="proof-heading"><div><span class="eyebrow">POST-QUANTUM PRIVACY</span><h2>Shielded pool v2</h2></div><span class="proof-state warn">not reported by this node</span></div>
+        <p class="proof-note">This node does not expose <code>sov_getShieldedV2Info</code> — it predates the v0.2.5 pool-v2 release. Point the explorer at a v0.2.5+ node to surface the post-quantum pool's state. Nothing is assumed about the pool in its absence.</p>
+      </section>`;
+  }
+  const pool = safeBigInt(v2.poolValue);
+  const available = safeBigInt(v2.deshieldableNowGrains);
+  const limit = safeBigInt(v2.deshieldLimitGrains);
+  const active = v2.active === true;
+  const resetHeight = Number(v2.windowResetsAtHeight ?? 0);
+  const windowElapsed = resetHeight > 0 && Number(v2.height ?? 0) >= resetHeight;
+  const stateLabel = active ? 'ACTIVE — spendable' : 'DORMANT — not yet active';
+  return `
+      <section class="proof-card">
+        <div class="proof-heading"><div><span class="eyebrow">POST-QUANTUM PRIVACY</span><h2>Shielded pool v2</h2></div><span class="proof-state ${active ? 'ok' : 'warn'}">${esc(stateLabel)}</span></div>
+        <div class="proof-metric"><b>${fmtCoin(pool.toString())} ${COIN_SYMBOL}</b><span>inside the post-quantum pool</span><small>${fmtNum(v2.noteCount)} notes · ${fmtNum(v2.nullifierCount)} nullifiers spent</small></div>
+        <div class="evidence-kv compact">
+          <span>Anchor (Merkle root)</span><b class="mono break">${v2.anchor ? `${esc(shortHash(v2.anchor, 12, 10))} ${copyButton(v2.anchor, 'pool-v2 anchor')}` : '—'}</b>
+          <span>De-shieldable now</span><b>${fmtCoin(available.toString())} ${COIN_SYMBOL}</b>
+          <span>Policy ceiling</span><b>${fmtCoin(limit.toString())} ${COIN_SYMBOL} / ${fmtNum(v2.deshieldWindowBlocks)} blocks</b>
+          <span>Window state</span><b>${windowElapsed ? 'elapsed · resets on next de-shield' : `resets at #${fmtNum(resetHeight)}`}</b>
+        </div>
+        <p class="proof-note"><b>Cryptography:</b> pool v2 is post-quantum — ML-KEM-768 note encryption and a STARK spend proof (hash-based, no elliptic curves, no trusted setup), unlike the v1 Orchard/Halo2 pool above.</p>
+        <p class="proof-note">${active
+          ? 'The <code>shielded-v2</code> deployment (signal bit 2) is active at this height, so the pool accepts spends. Every field above is the node\'s live answer.'
+          : 'The pool is <b>dormant</b>: the <code>shielded-v2</code> deployment (signal bit 2) activates at mainnet height 15,552, until which an <code>Action::ShieldedV2</code> is rejected on every node. The state above is real and simply empty until then.'}</p>
+      </section>`;
+}
+
 async function renderProof(routeId) {
   setView('<div class="loading">Loading Sovereign proof…</div>', routeId);
   const proof = await api('/proof');
@@ -1283,6 +1349,7 @@ async function renderProof(routeId) {
   const layout = crypto.hybrid65Layout ?? {};
   const supply = proof.privacy?.supply ?? {};
   const shielded = proof.privacy?.shieldedInfo ?? {};
+  const shieldedV2 = proof.privacy?.shieldedV2Info ?? null;
   const empty = proof.commitments?.deterministicEmpty;
   const nonEmpty = proof.commitments?.latestNonEmpty;
   const commonHash = relays.commonHash
@@ -1299,6 +1366,7 @@ async function renderProof(routeId) {
   const fullyExitCapable = pool > 0n && available >= pool;
   const resetHeight = Number(shielded.windowResetsAtHeight ?? 0);
   const windowElapsed = resetHeight > 0 && Number(shielded.height ?? 0) >= resetHeight;
+  const poolV2Card = poolV2ProofCard(shieldedV2);
   const coverage = crypto.hybridCoverage === null || crypto.hybridCoverage === undefined
     ? 'awaiting transactions'
     : `${fmtDecimal(Number(crypto.hybridCoverage) * 100, 2)}% of retained transactions`;
@@ -1356,8 +1424,10 @@ async function renderProof(routeId) {
           <span>Window state</span><b>${windowElapsed ? 'elapsed · resets on next de-shield' : `resets at #${fmtNum(resetHeight)}`}</b>
         </div>
         <p class="proof-note">The limiter is visible policy, separate from shielded-pool validity. ${fullyExitCapable ? 'Because the configured ceiling exceeds the live pool, it does not currently throttle a full pool exit.' : 'The window ceiling currently caps how fast the pool can be exited.'}</p>
-        <p class="proof-note"><b>Cryptography disclosure:</b> this shielded pool is Orchard (Halo2, no trusted setup) — classical elliptic-curve cryptography, <b>not post-quantum</b>, unlike the chain's hybrid transaction signatures. This is disclosed in the project's quantum posture; a post-quantum shielded design is in development and is not live on this chain.</p>
+        <p class="proof-note"><b>Cryptography disclosure:</b> this shielded pool is Orchard (Halo2, no trusted setup) — classical elliptic-curve cryptography, <b>not post-quantum</b>, unlike the chain's hybrid transaction signatures. This is disclosed in the project's quantum posture; the post-quantum pool v2 below is the successor design.</p>
       </section>
+
+      ${poolV2Card}
 
       <section class="proof-card proof-wide">
         <div class="proof-heading"><div><span class="eyebrow">COMMITMENT SEMANTICS</span><h2>Why the roots repeat — and when they change</h2></div><span class="proof-state ok">content committed</span></div>

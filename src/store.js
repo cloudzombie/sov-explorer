@@ -114,6 +114,7 @@ export class Store {
     this.difficulty = null; // { sha256d, algo, hashrate, targetBlockMs } from sov_getDifficulty
     this.mempoolSize = 0;
     this.shieldedInfo = null;
+    this.shieldedV2Info = null; // pool v2 (post-quantum) state from sov_getShieldedV2Info (null = node too old)
     this.deployments = null; // { height, deployments: [...] } from sov_getDeployments
     this.feeEstimate = null; // { kind, gasUsed, gasPriceGrains, feeGrains } from sov_estimateFee
     this.feeRoutes = null; // { <kind>: estimate } for every route the node prices
@@ -150,6 +151,7 @@ export class Store {
     this.difficulty = null;
     this.mempoolSize = 0;
     this.shieldedInfo = null;
+    this.shieldedV2Info = null;
     this.deployments = null;
     this.feeEstimate = null;
     this.feeRoutes = null;
@@ -698,6 +700,9 @@ export class Store {
       supply: this.supply,
       difficulty: this.difficulty,
       shieldedInfo: this.shieldedInfo,
+      // Pool v2 (post-quantum) state from sov_getShieldedV2Info (null = the node is
+      // older than v0.2.5 and does not expose it — never fabricated).
+      shieldedV2Info: this.shieldedV2Info,
       // BIP-9 deployment states straight from sov_getDeployments (null = the node
       // does not expose them), plus signaling actually observed in retained headers.
       deployments: this.deployments,

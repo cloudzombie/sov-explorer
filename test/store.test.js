@@ -380,12 +380,42 @@ test('fee routes only contain the routes the node actually priced', () => {
   assert.equal(st.feeRoutes.shielded, undefined, 'an unpriced route is absent, not zero');
 });
 
+test('pool-v2 shielded state surfaces exactly as the node reported it', () => {
+  const s = new Store();
+  // Shape from sov_getShieldedV2Info on a live v0.2.5 node (dormant pool).
+  s.shieldedV2Info = {
+    active: false,
+    poolValue: '0',
+    noteCount: 0,
+    nullifierCount: 0,
+    anchor: 'e6efef0131865379f23c3fb340e2510abb012791cd41f5ac9bee742000a75566',
+    deshieldLimitGrains: '2100000000000000',
+    deshieldWindowBlocks: 576,
+    windowStartHeight: 0,
+    windowSpentGrains: '0',
+    deshieldableNowGrains: '0',
+    windowResetsAtHeight: 576,
+    height: 13804,
+  };
+  s._touchStats();
+  const st = s.stats();
+  assert.equal(st.shieldedV2Info.active, false, 'dormant is reported honestly, not hidden');
+  assert.equal(st.shieldedV2Info.poolValue, '0');
+  assert.equal(st.shieldedV2Info.anchor, s.shieldedV2Info.anchor);
+});
+
+test('a node too old for pool v2 yields null, never a fake empty pool', () => {
+  const s = new Store(); // sov_getShieldedV2Info never answered (pre-v0.2.5 node)
+  assert.equal(s.stats().shieldedV2Info, null);
+});
+
 test('an outage yields unavailable values, never fabricated zeros', () => {
   const s = new Store(); // nothing indexed, node never answered
   const st = s.stats();
   assert.equal(st.mintedOfCap, null, 'a 0.00%-of-cap reading would look like a real answer');
   assert.equal(st.supply, null);
   assert.equal(st.difficulty, null);
+  assert.equal(st.shieldedV2Info, null);
   assert.equal(st.deployments, null);
   assert.equal(st.feeRoutes, null);
   assert.equal(st.mintRewardGrains, null);

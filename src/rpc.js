@@ -417,6 +417,9 @@ export class SovereignRpc {
   blockDigest(height) { return this.call('sov_getBlockDigest', { height }, { nonNull: true }); }
   supply() { return this.call('sov_getSupply'); }
   shieldedInfo() { return this.call('sov_getShieldedInfo'); }
+  /** Pool v2 (post-quantum, ML-KEM-768 / STARK) shielded state. Optional: a node
+   * older than v0.2.5 does not know this method and errors, handled non-fatally. */
+  shieldedV2Info() { return this.call('sov_getShieldedV2Info'); }
   account(account) { return this.call('sov_getAccount', { account }); }
   difficulty() { return this.call('sov_getDifficulty'); }
   stateRoot() { return this.call('sov_getStateRoot'); }
