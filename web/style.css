@@ -1816,33 +1816,154 @@ a.trust-chip:hover {
   font-weight: 400;
 }
 
-/* item 3: v1 -> v2 pool migration chart. */
+/* item 3: v1 -> v2 pool migration — "blocky" (Tetris/Minecraft) towers. */
 .pool-migration {
   margin-top: 26px;
 }
-.pool-v2-area {
-  fill: rgba(82, 214, 141, 0.22);
-  stroke: var(--ok);
-  stroke-width: 1.5;
+.pm-panel {
+  padding: 18px;
 }
-.pool-v1-area {
-  fill: rgba(63, 111, 255, 0.28);
-  stroke: var(--blue);
-  stroke-width: 1.5;
+.pm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-bottom: 12px;
 }
-.chart-meta .swatch {
+.pm-legend b {
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+.pm-legend .pm-sw {
   display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 3px;
-  margin-right: 5px;
-  vertical-align: middle;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
 }
-.chart-meta .swatch.v1 {
+.pm-legend .pm-sw.v1 {
   background: var(--blue);
 }
-.chart-meta .swatch.v2 {
+.pm-legend .pm-sw.v2 {
   background: var(--ok);
+}
+.pm-legend .pm-unit {
+  margin-left: auto;
+  font-family: var(--mono);
+  color: var(--dim);
+}
+.pm-legend .pm-split {
+  font-family: var(--mono);
+  color: var(--ok);
+}
+.pm-towers {
+  display: block;
+  width: 100%;
+  max-width: 340px;
+  margin: 0 auto;
+  height: auto;
+}
+/* The Tetris look: crisp block cells with a gradient bevel + 1px inset edge. */
+.pm-block {
+  stroke: rgba(0, 0, 0, 0.45);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+.pm-block.v1 {
+  fill: url(#pm-grad-v1);
+}
+.pm-block.v2 {
+  fill: url(#pm-grad-v2);
+}
+.pm-partial {
+  opacity: 0.72;
+}
+.pm-grid {
+  stroke: var(--line);
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
+}
+.pm-axis {
+  fill: var(--dim);
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+.pm-total {
+  fill: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+.pm-tag {
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.pm-tag-v1 {
+  fill: var(--blue);
+}
+.pm-tag-v2 {
+  fill: var(--ok);
+}
+.pm-foot {
+  fill: var(--muted);
+  font-size: 9.5px;
+}
+.pm-foot.pm-dim {
+  fill: var(--dim);
+  font-family: var(--mono);
+}
+.pm-dim {
+  color: var(--dim);
+}
+.pm-strip-wrap {
+  margin-top: 18px;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 12px;
+}
+.pm-strip-head {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.pm-strip {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.pm-strip .pm-block.v1 {
+  fill: url(#pm-grad-v1b);
+}
+.pm-strip .pm-block.v2 {
+  fill: url(#pm-grad-v2b);
+}
+/* Subtle build/settle on the newest block; disabled for reduced-motion. */
+@keyframes pm-settle {
+  from {
+    transform: translateY(-7px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+.pm-block.is-new {
+  animation: pm-settle 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pm-block.is-new {
+    animation: none;
+  }
 }
 
 /* item 9: finality shading in block tables. */
