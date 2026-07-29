@@ -571,6 +571,43 @@ h3 {
   color: var(--muted, #94a3b8);
 }
 
+/* PQ-TX (shielded-v2) activation marker chips — same pill shell as the strip's
+   other chips, colour-coded by milestone status. */
+.hero-meta .pq-pill {
+  border-color: rgba(148, 163, 184, 0.3);
+  color: var(--muted, #94a3b8);
+}
+.hero-meta .pq-pill b {
+  color: inherit;
+  font-weight: 600;
+}
+.hero-meta .pq-pill.lead {
+  border-color: rgba(178, 148, 254, 0.42);
+  color: #b294fe;
+  letter-spacing: 0.04em;
+}
+.hero-meta .pq-pill.lead.failed {
+  border-color: rgba(229, 167, 79, 0.42);
+  color: var(--warn, #e5a74f);
+}
+.hero-meta .pq-pill.done {
+  border-color: rgba(82, 214, 141, 0.32);
+  color: var(--ok, #52d68d);
+}
+.hero-meta .pq-pill.next {
+  border-color: rgba(178, 148, 254, 0.5);
+  color: #c7b3ff;
+}
+.hero-meta .pq-pill.pending {
+  border-color: rgba(148, 163, 184, 0.26);
+  color: var(--muted, #94a3b8);
+}
+.hero-meta .pq-pill.live {
+  border-color: rgba(178, 148, 254, 0.6);
+  color: #c7b3ff;
+  letter-spacing: 0.04em;
+}
+
 .stat-columns {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
