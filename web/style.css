@@ -626,6 +626,11 @@ h3 {
   color: var(--warn);
 }
 
+.hero-meta .relay-pill.reduced {
+  border-color: rgba(63, 111, 255, 0.45);
+  color: #8faaff;
+}
+
 .hero-meta .miners-pill {
   border-color: rgba(110, 168, 254, 0.38);
   color: var(--accent, #6ea8fe);
@@ -1154,6 +1159,11 @@ details.raw pre {
 .proof-state.ok {
   border-color: rgba(82, 214, 141, 0.34);
   color: var(--ok);
+}
+
+.proof-state.info {
+  border-color: rgba(63, 111, 255, 0.45);
+  color: #8faaff;
 }
 
 .proof-state.warn {

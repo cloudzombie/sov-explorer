@@ -131,6 +131,26 @@ test('a single lagging relay does not degrade a healthy, consistent quorum', asy
   assert.equal(status.reducedRedundancy, true, 'but reduced redundancy is still reported');
 });
 
+test('reports reduced redundancy when a configured relay was unavailable at startup', async (t) => {
+  const a = await fakeRelay();
+  const b = await fakeRelay();
+  const unavailable = await fakeRelay({ failMethod: 'sov_getHeight' });
+  t.after(() => Promise.all([a.close(), b.close(), unavailable.close()]));
+  const rpc = new SovereignRpc([a.url, b.url, unavailable.url], {
+    expectedChainId: 'sov-mainnet',
+    expectedGenesisHash: hx('a'),
+    probeTtlMs: 0,
+  });
+
+  const status = await rpc.verifyRelays();
+  assert.equal(status.configured, 3);
+  assert.equal(status.verified, 2);
+  assert.equal(status.healthy, 2);
+  assert.equal(status.consistent, true);
+  assert.equal(status.degraded, false, 'two agreeing relays preserve the cross-check quorum');
+  assert.equal(status.reducedRedundancy, true, 'the unavailable configured relay remains visible');
+});
+
 test('degrades when only one relay is left (no independent cross-check)', async (t) => {
   const only = await fakeRelay();
   const down = await fakeRelay({ failMethod: 'sov_getHeight' });

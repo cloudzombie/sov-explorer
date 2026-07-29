@@ -10,6 +10,34 @@ export function explainAction(action) { return ({ transfer: 'Moves transparent X
 function hex(bytes) { return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join(''); }
 export async function verifyMerkleProof(proof, expectedRoot) { if (!proof) return { verified: false, reason: 'proof unavailable from relay' }; if (String(proof.algorithm || '').toLowerCase() !== 'sha256') return { verified: false, reason: `browser verifier does not support ${proof.algorithm || 'unspecified'} proofs` }; let current = String(proof.leaf || '').replace(/^0x/, '').toLowerCase(); for (const step of proof.path || []) { const sibling = String(step.hash || step.sibling || '').replace(/^0x/, '').toLowerCase(); const combined = step.side === 'left' ? sibling + current : current + sibling; const bytes = Uint8Array.from(combined.match(/../g) || [], (x) => parseInt(x, 16)); current = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); } const verified = current === String(expectedRoot || proof.root || '').replace(/^0x/, '').toLowerCase(); return { verified, reason: verified ? 'proof recomputed to the block header root' : 'proof does not match the block header root' }; }
 
+// Convert relay probe state into one consistent, DOM-free presentation model.
+// `configured` is the denominator so a relay that never verified because it was
+// unavailable at startup remains visible instead of producing a misleading 2/2.
+export function relayAvailability(relays = {}) {
+  const finiteCount = (value) => {
+    const count = Number(value);
+    return Number.isFinite(count) && count >= 0 ? Math.trunc(count) : null;
+  };
+  const healthy = finiteCount(relays.healthy);
+  const configured = finiteCount(relays.configured) ?? finiteCount(relays.verified) ?? healthy;
+  let state = 'pending';
+  let tone = 'pending';
+  if (relays.consistent === false) {
+    state = 'disagreement';
+    tone = 'bad';
+  } else if (relays.degraded) {
+    state = 'degraded';
+    tone = 'warn';
+  } else if (relays.reducedRedundancy) {
+    state = 'reduced redundancy';
+    tone = 'info';
+  } else if (relays.consistent === true) {
+    state = 'consistent';
+    tone = 'ok';
+  }
+  return { healthy, configured, state, tone };
+}
+
 // ---- shielded-v2 (post-quantum TX) activation model -----------------------
 // Pure, framework-free derivation of the BIP-9 activation milestones for the
 // post-quantum shielded pool ("PQ TX"). Heights are DERIVED from the node-

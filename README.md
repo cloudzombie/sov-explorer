@@ -11,6 +11,8 @@ Everything it shows is real chain data read from live nodes. Nothing is simulate
 Mainnet defaults to both public relays; each must identify as `sov-mainnet` and
 reproduce the frozen `cb0272ff…e72d` genesis. The explorer fails over when one relay
 is unavailable and halts indexing if two healthy relays disagree at a common height.
+Two or more agreeing relays keep the explorer live even when a configured minority is
+unavailable; the API and UI report that condition separately as reduced redundancy.
 
 ## What makes it Sovereign
 
