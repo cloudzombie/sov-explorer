@@ -2025,157 +2025,129 @@ function recordPoolSample(height, v1, v2) {
     /* storage full / disabled — the chart just shows what it has */
   }
 }
-// A "blocky" (Tetris/Minecraft-style) view of the shielded-pool migration:
-// Orchard v1 (NON-PQ) vs the post-quantum v2 pool, each rendered as a stack of
-// discrete unit-blocks so the amounts read as physical towers. Best-effort: the
-// node retains no pool-split series, so the current towers are the live served
-// pool state and the optional history strip only shows heights this browser has
-// sampled while open — never a fabricated series.
+// A voxel-vault view of the shielded-pool migration: Orchard v1 (NON-PQ) and
+// the post-quantum v2 pool rendered as isometric block stacks — each cube a
+// fixed XUS quantum — so the amounts read as two physical vaults. The v2 vault
+// ghosts out while it is dormant (0 XUS) rather than showing an empty column.
+// Honest: values are the node's live served pool state, quantised for display;
+// the node retains no pool-split time-series so nothing here is a fabricated
+// history.
 function poolMigrationChart() {
   const hist = loadPoolHistory();
   if (hist.length < 1) {
     return `<section class="pool-migration"><h2>Shielded pool migration <span class="dim">— Orchard v1 (NON-PQ) vs post-quantum v2 (PQ)</span></h2>
-      <div class="empty">Collecting local samples as new blocks arrive — the node does not retain a pool-split time-series, so this chart fills in while the explorer is open.</div></section>`;
+      <div class="empty">Reading the live pool state — the node exposes current pool value only, so this fills in on the first sampled block.</div></section>`;
   }
   const coin = (g) => Number(BigInt(g) / 1000000n) / 100;
-  const v1all = hist.map((p) => coin(p.v1));
-  const v2all = hist.map((p) => coin(p.v2));
-  // One block denotes this many XUS — sized so the tallest single pool is ~20
-  // blocks tall. Shared by the towers and the history strip so both read on the
-  // same scale.
-  const poolMax = Math.max(1, ...v1all, ...v2all);
-  const unit = blockUnit(poolMax, 20);
   const cur = hist.at(-1);
   const v1c = coin(cur.v1);
   const v2c = coin(cur.v2);
+  // One cube denotes this many XUS — sized so the taller vault is ~14 cubes.
+  const unit = blockUnit(Math.max(1, v1c, v2c), 14);
   const b1 = poolBlocks(v1c, unit);
   const b2 = poolBlocks(v2c, unit);
   const priv = v1c + v2c;
   const pctPq = priv > 0 ? (v2c / priv) * 100 : 0;
   const pctV1 = priv > 0 ? (v1c / priv) * 100 : 0;
 
-  // ---- towers (current live state) ----------------------------------------
-  const BH = 15;
-  const SLOT = BH + 3; // 3px gap → the Tetris seam between blocks
-  const rows = Math.min(40, Math.max(3, Math.ceil(Math.max(b1.total, b2.total))));
-  const grid = rows <= 8 ? 2 : rows <= 22 ? 5 : 10;
-  const topPad = 30;
-  const botPad = 46;
-  const axisW = 58;
-  const colW = 70;
-  const gap = 40;
-  const plotH = rows * SLOT;
-  const baseY = topPad + plotH;
-  const W = axisW + colW * 2 + gap + 14;
-  const H = topPad + plotH + botPad;
+  // --- isometric geometry ---------------------------------------------------
+  const CW = 74; // cube front-face width
+  const CH = 22; // cube front-face height
+  const DP = 13; // isometric depth (top/right face offset)
+  const GAP = 6; // seam between stacked cubes
+  const STEP = CH + GAP;
+  const rows = Math.min(20, Math.max(4, Math.ceil(Math.max(b1.total, b2.total, 4))));
+  const topPad = 60; // room for the total + tag above each vault
+  const botPad = 58; // room for the vault label below
+  const sideL = 78; // left scale gutter
+  const towerGap = 132; // breathing room between the two vaults
+  const foot = CW + DP;
+  const W = sideL + foot * 2 + towerGap + 46;
+  const groundY = topPad + rows * STEP;
+  const H = groundY + botPad;
+  const x1 = sideL;
+  const x2 = sideL + foot + towerGap;
+  const fc1 = x1 + CW / 2; // front-face centre (for centred labels)
+  const fc2 = x2 + CW / 2;
 
-  const stack = (x, info, poolCls, newest) => {
+  // One isometric cube: front rect + lighter top face + darker right face.
+  const cube = (x, yTop, h, cls) => `
+    <g class="vx-cube">
+      <polygon class="vx-top ${cls}" points="${x},${yTop} ${x + DP},${yTop - DP} ${x + CW + DP},${yTop - DP} ${x + CW},${yTop}" />
+      <polygon class="vx-side ${cls}" points="${x + CW},${yTop} ${x + CW + DP},${yTop - DP} ${x + CW + DP},${(yTop - DP + h).toFixed(1)} ${x + CW},${(yTop + h).toFixed(1)}" />
+      <rect class="vx-face ${cls}" x="${x}" y="${yTop}" width="${CW}" height="${h.toFixed(1)}" />
+    </g>`;
+
+  // Build a vault: solid cubes if it holds value, else a ghost outline that
+  // reserves the space and reads as "dormant / awaiting migration".
+  const vault = (x, info, cls, dormant) => {
     const out = [];
-    for (let i = 0; i < Math.min(info.full, rows); i++) {
-      const isTop = newest && i === info.full - 1 && info.partial === 0;
-      out.push(`<rect class="pm-block ${poolCls}${isTop ? ' is-new' : ''}" x="${x}" y="${(baseY - BH - i * SLOT).toFixed(1)}" width="${colW}" height="${BH}" rx="2" />`);
+    if (dormant) {
+      for (let i = 0; i < 3; i++) {
+        out.push(cube(x, groundY - i * STEP - CH, CH, `${cls} vx-ghost`));
+      }
+      return out.join('');
     }
-    if (info.partial > 0 && info.full < rows) {
-      const ph = Math.max(3, BH * info.partial);
-      out.push(`<rect class="pm-block ${poolCls} pm-partial${newest ? ' is-new' : ''}" x="${x}" y="${(baseY - info.full * SLOT - ph).toFixed(1)}" width="${colW}" height="${ph.toFixed(1)}" rx="2" />`);
+    const full = Math.min(info.full, rows);
+    for (let i = 0; i < full; i++) {
+      out.push(cube(x, groundY - i * STEP - CH, CH, cls));
+    }
+    if (info.partial > 0 && full < rows) {
+      const ph = Math.max(6, CH * info.partial);
+      out.push(cube(x, groundY - full * STEP - ph, ph, `${cls} vx-partial`));
     }
     return out.join('');
   };
-  const gridlines = [];
-  for (let k = 0; k <= rows; k += grid) {
-    const y = baseY - k * SLOT;
-    gridlines.push(`<line class="pm-grid" x1="${axisW - 6}" y1="${y.toFixed(1)}" x2="${W - 6}" y2="${y.toFixed(1)}" />`);
+
+  // Slim value scale on the left: a few clean ticks, no busy gridlines.
+  const ticks = [];
+  const tickEvery = rows <= 6 ? 2 : rows <= 12 ? 3 : 5;
+  for (let k = 0; k <= rows; k += tickEvery) {
+    const y = groundY - k * STEP;
+    ticks.push(`<line class="vx-tick" x1="${sideL - 16}" y1="${y}" x2="${sideL - 8}" y2="${y}" />`);
     const label = unit < 1 ? fmtDecimal(k * unit, 2) : fmtNum(Math.round(k * unit));
-    gridlines.push(`<text class="pm-axis" x="${axisW - 12}" y="${(y + 3).toFixed(1)}" text-anchor="end">${label}</text>`);
+    ticks.push(`<text class="vx-tick-lbl" x="${sideL - 22}" y="${y + 3.5}" text-anchor="end">${label}</text>`);
   }
-  const x1 = axisW;
-  const x2 = axisW + colW + gap;
-  const cx1 = x1 + colW / 2;
-  const cx2 = x2 + colW / 2;
+
+  const dormantV2 = v2c <= 0;
+  const fmtXus = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const towers = `
-    <svg class="pm-towers" viewBox="0 0 ${W} ${H}" role="img" aria-label="Current shielded pool composition: v1 Orchard ${fmtDecimal(v1c, 2)} ${COIN_SYMBOL} and post-quantum v2 ${fmtDecimal(v2c, 2)} ${COIN_SYMBOL}">
-      <defs>
-        <linearGradient id="pm-grad-v1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5f86ff"/><stop offset="1" stop-color="#2a4fd4"/></linearGradient>
-        <linearGradient id="pm-grad-v2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#77e6a8"/><stop offset="1" stop-color="#2fae6b"/></linearGradient>
-      </defs>
-      ${gridlines.join('')}
-      <text class="pm-total" x="${cx1}" y="${topPad - 14}" text-anchor="middle">${fmtDecimal(v1c, 2)} ${COIN_SYMBOL}</text>
-      <text class="pm-tag pm-tag-v1" x="${cx1}" y="${topPad - 1}" text-anchor="middle">NON-PQ</text>
-      <text class="pm-total" x="${cx2}" y="${topPad - 14}" text-anchor="middle">${fmtDecimal(v2c, 2)} ${COIN_SYMBOL}</text>
-      <text class="pm-tag pm-tag-v2" x="${cx2}" y="${topPad - 1}" text-anchor="middle">PQ</text>
-      ${stack(x1, b1, 'v1', true)}
-      ${stack(x2, b2, 'v2', true)}
-      <text class="pm-foot" x="${cx1}" y="${baseY + 20}" text-anchor="middle">v1 Orchard · Halo2</text>
-      <text class="pm-foot pm-dim" x="${cx1}" y="${baseY + 35}" text-anchor="middle">${fmtDecimal(pctV1, 1)}% of private</text>
-      <text class="pm-foot" x="${cx2}" y="${baseY + 20}" text-anchor="middle">v2 · ML-KEM-768 · STARK</text>
-      <text class="pm-foot pm-dim" x="${cx2}" y="${baseY + 35}" text-anchor="middle">${fmtDecimal(pctPq, 1)}% of private</text>
+    <svg class="pm-vaults" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Shielded pool vaults: v1 Orchard ${fmtDecimal(v1c, 2)} ${COIN_SYMBOL}, post-quantum v2 ${fmtDecimal(v2c, 2)} ${COIN_SYMBOL}">
+      <line class="vx-axis" x1="${sideL - 16}" y1="${topPad - 8}" x2="${sideL - 16}" y2="${groundY}" />
+      <line class="vx-ground" x1="${sideL - 16}" y1="${groundY + DP + 2}" x2="${W - 24}" y2="${groundY + DP + 2}" />
+      ${ticks.join('')}
+      <text class="vx-total vx-t1" x="${fc1}" y="${topPad - 28}" text-anchor="middle">${fmtXus(v1c)}</text>
+      <text class="vx-unit-lbl" x="${fc1}" y="${topPad - 14}" text-anchor="middle">${COIN_SYMBOL} · ${fmtDecimal(pctV1, 1)}% of private</text>
+      <text class="vx-total vx-t2 ${dormantV2 ? 'vx-muted' : ''}" x="${fc2}" y="${topPad - 28}" text-anchor="middle">${dormantV2 ? '0' : fmtXus(v2c)}</text>
+      <text class="vx-unit-lbl" x="${fc2}" y="${topPad - 14}" text-anchor="middle">${COIN_SYMBOL} · ${dormantV2 ? 'dormant' : `${fmtDecimal(pctPq, 1)}% of private`}</text>
+      ${vault(x1, b1, 'v1', false)}
+      ${vault(x2, b2, 'v2', dormantV2)}
+      <text class="vx-name" x="${fc1}" y="${groundY + DP + 26}" text-anchor="middle">v1 · Orchard</text>
+      <text class="vx-sub" x="${fc1}" y="${groundY + DP + 40}" text-anchor="middle">Halo2 · classical</text>
+      <text class="vx-name" x="${fc2}" y="${groundY + DP + 26}" text-anchor="middle">v2 · post-quantum</text>
+      <text class="vx-sub" x="${fc2}" y="${groundY + DP + 40}" text-anchor="middle">ML-KEM-768 · STARK</text>
     </svg>`;
 
-  // ---- history strip (only real sampled heights) --------------------------
-  let strip = '';
-  if (hist.length >= 3) {
-    const MAXCOLS = 24;
-    const stepN = Math.ceil(hist.length / MAXCOLS);
-    const pts = hist.filter((_, i) => i % stepN === 0 || i === hist.length - 1);
-    const sB1 = pts.map((p) => poolBlocks(coin(p.v1), unit));
-    const sB2 = pts.map((p) => poolBlocks(coin(p.v2), unit));
-    const sRows = Math.min(46, Math.max(4, Math.ceil(Math.max(...pts.map((_, i) => sB1[i].total + sB2[i].total)))));
-    const sBH = 5;
-    const sSLOT = sBH + 1;
-    const sTop = 14;
-    const sBot = 26;
-    const sColW = 12;
-    const sGap = 6;
-    const sBaseY = sTop + sRows * sSLOT;
-    const sW = Math.max(W, pts.length * (sColW + sGap) + 24);
-    const sH = sTop + sRows * sSLOT + sBot;
-    const cells = [];
-    pts.forEach((p, i) => {
-      const x = 12 + i * (sColW + sGap);
-      let lvl = 0;
-      const put = (info, cls) => {
-        for (let j = 0; j < Math.min(info.full, sRows - lvl); j++, lvl++) {
-          cells.push(`<rect class="pm-block ${cls}" x="${x}" y="${(sBaseY - sBH - lvl * sSLOT).toFixed(1)}" width="${sColW}" height="${sBH}" rx="1.5" />`);
-        }
-        if (info.partial > 0 && lvl < sRows) {
-          const ph = Math.max(2, sBH * info.partial);
-          cells.push(`<rect class="pm-block ${cls} pm-partial" x="${x}" y="${(sBaseY - lvl * sSLOT - ph).toFixed(1)}" width="${sColW}" height="${ph.toFixed(1)}" rx="1.5" />`);
-          lvl += 1;
-        }
-      };
-      put(sB1[i], 'v1');
-      put(sB2[i], 'v2');
-      // Height ticks at the ends and roughly-even interior marks.
-      if (i === 0 || i === pts.length - 1 || i % Math.ceil(pts.length / 5) === 0) {
-        cells.push(`<text class="pm-axis" x="${x + sColW / 2}" y="${sBaseY + 16}" text-anchor="middle">#${fmtNum(p.height)}</text>`);
-      }
-    });
-    strip = `
-      <div class="pm-strip-wrap">
-        <div class="pm-strip-head">Composition at sampled heights <span class="pm-dim">— stacked v1 + v2, ${fmtNum(pts.length)} of ${fmtNum(hist.length)} local samples</span></div>
-        <svg class="pm-strip" viewBox="0 0 ${sW} ${sH}" preserveAspectRatio="xMinYMid meet" role="img" aria-label="Stacked v1 and v2 pool composition across ${fmtNum(pts.length)} sampled block heights">
-          <defs>
-            <linearGradient id="pm-grad-v1b" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5f86ff"/><stop offset="1" stop-color="#2a4fd4"/></linearGradient>
-            <linearGradient id="pm-grad-v2b" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#77e6a8"/><stop offset="1" stop-color="#2fae6b"/></linearGradient>
-          </defs>
-          ${cells.join('')}
-        </svg>
-      </div>`;
-  }
+  // Clean segmented migration meter: N cells filled green for the PQ share.
+  const SEG = 28;
+  const pqCells = Math.round((pctPq / 100) * SEG);
+  const meter = Array.from({ length: SEG }, (_, i) => `<i class="${i < pqCells ? 'on' : ''}"></i>`).join('');
 
   return `<section class="pool-migration">
-    <h2>Shielded pool migration <span class="dim">— Orchard v1 (NON-PQ) vs post-quantum v2 (PQ)</span></h2>
+    <h2>Shielded pool migration <span class="dim">— Orchard v1 (NON-PQ) → post-quantum v2 (PQ)</span></h2>
     <div class="panel pm-panel">
       <div class="pm-legend">
         <span><i class="pm-sw v1"></i> v1 Orchard <b>NON-PQ</b></span>
         <span><i class="pm-sw v2"></i> v2 post-quantum <b>PQ</b></span>
-        <span class="pm-unit">1 block = ${fmtNum(unit)} ${COIN_SYMBOL}</span>
-        <span class="pm-split">${fmtDecimal(pctPq, 1)}% post-quantum</span>
+        <span class="pm-unit">1 cube = ${fmtNum(unit)} ${COIN_SYMBOL}</span>
       </div>
       ${towers}
-      ${strip}
+      <div class="pm-meter" role="img" aria-label="${fmtDecimal(pctPq, 1)} percent of the private supply is post-quantum">
+        <div class="pm-meter-cells">${meter}</div>
+        <div class="pm-meter-cap"><b>${fmtDecimal(pctPq, 1)}%</b> post-quantum${dormantV2 ? ' · v2 vault dormant, awaiting migration' : ''}</div>
+      </div>
     </div>
-    <p class="note">Blocky view of live pool state: the towers are the node's current v1/v2 pool values quantised into ${fmtNum(unit)}-${COIN_SYMBOL} blocks (the top block is the sub-unit remainder). The node exposes only current pool state, so any height strip is a best-effort local sample — not a node-authoritative time-series.</p>
+    <p class="note">Live pool state, quantised at ${fmtNum(unit)} ${COIN_SYMBOL} per cube (the top cube is the sub-unit remainder). The node exposes only the current pool value — this is a snapshot, not a node-authoritative time-series.</p>
   </section>`;
 }
 

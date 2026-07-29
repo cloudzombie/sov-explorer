@@ -1816,36 +1816,41 @@ a.trust-chip:hover {
   font-weight: 400;
 }
 
-/* item 3: v1 -> v2 pool migration — "blocky" (Tetris/Minecraft) towers. */
+/* item 3: v1 -> v2 pool migration — isometric voxel vaults. */
 .pool-migration {
   margin-top: 26px;
 }
 .pm-panel {
-  padding: 18px;
+  padding: 22px 20px 18px;
+  background:
+    radial-gradient(120% 90% at 50% -10%, rgba(63, 111, 255, 0.06), transparent 60%),
+    var(--panel);
 }
 .pm-legend {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px 18px;
+  gap: 8px 20px;
   font-size: 12.5px;
   color: var(--muted);
-  margin-bottom: 12px;
+  margin-bottom: 6px;
 }
 .pm-legend b {
   color: var(--text);
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  font-size: 10.5px;
 }
 .pm-legend .pm-sw {
   display: inline-block;
   width: 12px;
   height: 12px;
-  border-radius: 2px;
+  border-radius: 3px;
   margin-right: 6px;
   vertical-align: -1px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.4),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.28);
 }
 .pm-legend .pm-sw.v1 {
   background: var(--blue);
@@ -1857,111 +1862,156 @@ a.trust-chip:hover {
   margin-left: auto;
   font-family: var(--mono);
   color: var(--dim);
+  font-size: 11.5px;
 }
-.pm-legend .pm-split {
-  font-family: var(--mono);
-  color: var(--ok);
-}
-.pm-towers {
+
+/* The isometric vaults. */
+.pm-vaults {
   display: block;
   width: 100%;
-  max-width: 340px;
-  margin: 0 auto;
-  height: auto;
-}
-/* The Tetris look: crisp block cells with a gradient bevel + 1px inset edge. */
-.pm-block {
-  stroke: rgba(0, 0, 0, 0.45);
-  stroke-width: 1;
-  shape-rendering: crispEdges;
-}
-.pm-block.v1 {
-  fill: url(#pm-grad-v1);
-}
-.pm-block.v2 {
-  fill: url(#pm-grad-v2);
-}
-.pm-partial {
-  opacity: 0.72;
-}
-.pm-grid {
-  stroke: var(--line);
-  stroke-width: 1;
-  stroke-dasharray: 2 4;
-}
-.pm-axis {
-  fill: var(--dim);
-  font-family: var(--mono);
-  font-size: 9.5px;
-}
-.pm-total {
-  fill: var(--text);
-  font-family: var(--mono);
-  font-size: 12px;
-  font-weight: 600;
-}
-.pm-tag {
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-.pm-tag-v1 {
-  fill: var(--blue);
-}
-.pm-tag-v2 {
-  fill: var(--ok);
-}
-.pm-foot {
-  fill: var(--muted);
-  font-size: 9.5px;
-}
-.pm-foot.pm-dim {
-  fill: var(--dim);
-  font-family: var(--mono);
-}
-.pm-dim {
-  color: var(--dim);
-}
-.pm-strip-wrap {
-  margin-top: 18px;
-  border-top: 1px solid var(--line-soft);
-  padding-top: 12px;
-}
-.pm-strip-head {
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-.pm-strip {
-  display: block;
-  width: 100%;
+  max-width: 560px;
+  margin: 4px auto 2px;
   height: auto;
   overflow: visible;
 }
-.pm-strip .pm-block.v1 {
-  fill: url(#pm-grad-v1b);
+/* Cube faces — three tones per pool give the clean voxel/Minecraft read. */
+.vx-face {
+  shape-rendering: geometricPrecision;
 }
-.pm-strip .pm-block.v2 {
-  fill: url(#pm-grad-v2b);
+.vx-face.v1 {
+  fill: #3f6fff;
 }
-/* Subtle build/settle on the newest block; disabled for reduced-motion. */
-@keyframes pm-settle {
+.vx-top.v1 {
+  fill: #7b9dff;
+}
+.vx-side.v1 {
+  fill: #274cc4;
+}
+.vx-face.v2 {
+  fill: #52d68d;
+}
+.vx-top.v2 {
+  fill: #86ecb2;
+}
+.vx-side.v2 {
+  fill: #2ea267;
+}
+.vx-face,
+.vx-top,
+.vx-side {
+  stroke: rgba(6, 9, 16, 0.55);
+  stroke-width: 1;
+  stroke-linejoin: round;
+}
+.vx-partial .vx-face,
+.vx-partial .vx-top,
+.vx-partial .vx-side {
+  opacity: 0.62;
+}
+/* Dormant v2: a reserved, hollow outline instead of solid cubes. */
+.vx-face.vx-ghost,
+.vx-top.vx-ghost,
+.vx-side.vx-ghost {
+  fill: rgba(82, 214, 141, 0.05);
+  stroke: rgba(82, 214, 141, 0.36);
+  stroke-dasharray: 3 3;
+}
+.vx-axis,
+.vx-ground {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+.vx-ground {
+  stroke: var(--line-soft);
+}
+.vx-tick {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+.vx-tick-lbl {
+  fill: var(--dim);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+.vx-total {
+  font-family: var(--mono);
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.vx-t1 {
+  fill: #7b9dff;
+}
+.vx-t2 {
+  fill: #86ecb2;
+}
+.vx-muted {
+  fill: var(--dim);
+}
+.vx-unit-lbl {
+  fill: var(--muted);
+  font-size: 10.5px;
+}
+.vx-name {
+  fill: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.vx-sub {
+  fill: var(--dim);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+}
+
+/* Segmented migration meter — how much of the private supply is post-quantum. */
+.pm-meter {
+  margin: 14px auto 2px;
+  max-width: 560px;
+}
+.pm-meter-cells {
+  display: flex;
+  gap: 3px;
+}
+.pm-meter-cells i {
+  flex: 1;
+  height: 12px;
+  border-radius: 2px;
+  background: rgba(63, 111, 255, 0.9);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.3);
+}
+.pm-meter-cells i.on {
+  background: var(--ok);
+}
+.pm-meter-cap {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+.pm-meter-cap b {
+  color: var(--ok);
+  font-family: var(--mono);
+  font-weight: 700;
+}
+
+/* A single, gentle fade-in of the whole panel — no per-cube motion, so the
+   vaults never flash or re-drop when the overview re-renders on a new block. */
+@keyframes pm-fade {
   from {
-    transform: translateY(-7px);
     opacity: 0;
   }
   to {
-    transform: translateY(0);
     opacity: 1;
   }
 }
-.pm-block.is-new {
-  animation: pm-settle 0.42s cubic-bezier(0.22, 1, 0.36, 1);
-  transform-box: fill-box;
-  transform-origin: center;
+.pm-vaults {
+  animation: pm-fade 0.45s ease both;
 }
 @media (prefers-reduced-motion: reduce) {
-  .pm-block.is-new {
+  .pm-vaults {
     animation: none;
   }
 }
