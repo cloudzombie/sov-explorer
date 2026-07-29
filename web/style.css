@@ -429,26 +429,74 @@ tr.live-new > td:first-child {
   padding: 2px 7px;
 }
 
-.ticker-items {
+/* Viewport clips the rolling track; the soft edge mask lets chips emerge and
+   vanish rather than pop at the boundaries. */
+.ticker-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    transparent,
+    #000 34px,
+    #000 calc(100% - 34px),
+    transparent
+  );
+  mask-image: linear-gradient(90deg, transparent, #000 34px, #000 calc(100% - 34px), transparent);
+}
+
+/* The moving element: only its transform is animated (from JS via rAF), so the
+   roll is GPU-composited and never triggers a per-frame reflow. */
+.ticker-track {
   display: flex;
   gap: 8px;
-  overflow: hidden;
+  width: max-content;
   white-space: nowrap;
+  will-change: transform;
 }
 
 .ticker-chip {
-  animation: chipIn 0.3s ease;
+  flex: none;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--muted);
+  cursor: pointer;
   font-family: var(--mono);
   font-size: 12px;
   padding: 3px 9px;
+  text-decoration: none;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.ticker-chip:hover,
+.ticker-chip:focus-visible {
+  border-color: rgba(82, 214, 141, 0.55);
+  color: var(--text);
+  outline: none;
 }
 
 .ticker-chip b {
   color: var(--text);
+}
+
+/* Reduced-motion fallback: no continuous roll — new blocks step in and the
+   strip animates them the old way. */
+.ticker.reduced .ticker-track {
+  transform: none !important;
+}
+
+.ticker.reduced .ticker-chip {
+  animation: chipIn 0.3s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ticker-track {
+    transform: none !important;
+  }
 }
 
 @keyframes chipIn {
@@ -541,7 +589,8 @@ h3 {
   gap: 8px;
 }
 
-.hero-meta span {
+.hero-meta span,
+.hero-meta a.genesis-chip {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -549,6 +598,22 @@ h3 {
   font-family: var(--mono);
   font-size: 12px;
   padding: 6px 9px;
+}
+
+/* The genesis pill navigates to block #0 like any other block link. */
+.hero-meta a.genesis-chip {
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.hero-meta a.genesis-chip:hover,
+.hero-meta a.genesis-chip:focus-visible {
+  border-color: rgba(82, 214, 141, 0.55);
+  color: var(--text);
+  outline: none;
 }
 
 .hero-meta .relay-pill {

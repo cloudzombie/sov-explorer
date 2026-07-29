@@ -1,8 +1,15 @@
 // Sovereign Explorer — single-page UI. Hash-routed, fetches the REST API, and follows
 // a WebSocket live feed. All values shown are real chain data served by the node.
 import { downloadRows, explainAction, isWatched, shieldedActivation, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
+import { BlockTicker } from './ticker.js';
 
 const $ = (id) => document.getElementById(id);
+
+// Honour the OS reduced-motion setting: the LIVE strip falls back to a
+// stepwise, non-scrolling behaviour instead of a continuous marquee.
+const REDUCED_MOTION = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+// The rolling block-height ticker beside the LIVE badge (see web/ticker.js).
+let blockTicker = null;
 const view = $('view');
 const DEFAULT_DESCRIPTION = 'Independent live explorer for Sovereign blocks, transactions, accounts, assets, contracts, HTLCs, and Nakamoto finality.';
 
@@ -165,13 +172,16 @@ async function switchNet(net) {
   NET = net;
   LAST_STATUS = null;
   const ticker = $('ticker');
-  const tickerItems = $('ticker-items');
+  if (blockTicker) {
+    blockTicker.destroy();
+    blockTicker = null;
+  }
   if (ticker) ticker.hidden = true;
-  if (tickerItems) tickerItems.replaceChildren();
   localStorage.setItem('sov-net-v2', net);
   setPageMeta(net);
   setNetToggleUI();
   connectWs();
+  seedTicker();
   await route().catch((e) => errView(e.message));
   pollStatus();
 }
@@ -399,7 +409,7 @@ async function renderOverview(routeId) {
         <p><span id="hero-chain">${esc(s.chainId || 'Chain')}</span> · node height <span id="hero-height">${fmtNum(sync.nodeHeight ?? s.tipHeight ?? 0)}</span>${sync.ready ? '' : ` · indexing <span id="hero-indexed">${fmtNum(sync.indexedHeight ?? 0)}</span>`}</p>
       </div>
       <div class="hero-meta">
-        <span>Genesis ${esc(shortHash(s.genesisHash, 10, 6))}</span>
+        <a class="genesis-chip mono" href="#/block/0" title="Open the genesis block (#0) — ${esc(s.genesisHash || '')}">Genesis ${esc(shortHash(s.genesisHash, 10, 6))}</a>
         <span>${fmtNum(s.blocksIndexed)} indexed blocks</span>
         ${s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : ''}
         <span class="relay-pill ${relay.degraded ? 'degraded' : ''}">${esc(relayText)}</span>
@@ -1682,16 +1692,64 @@ function drawSealStars() {
   g.innerHTML = s;
 }
 
-function pushTicker(text) {
-  const items = $('ticker-items');
+// Populate one rolling ticker chip for a block. Each chip is an <a> pointing at
+// the block-detail route, so every item is individually clickable and navigates
+// to its own height (pause-on-hover, in web/ticker.js, makes moving chips
+// catchable). Reused when a chip recycles into a freshly-mined block.
+function renderBlockChip(el, b) {
+  el.href = `#/block/${encodeURIComponent(b.height)}`;
+  el.title = `Open block #${fmtNum(b.height)} — ${fmtNum(b.txCount)} tx`;
+  el.innerHTML = `<b>#${fmtNum(b.height)}</b> · ${fmtNum(b.txCount)} tx`;
+}
+
+// Build (or rebuild) the marquee against the current DOM + reduced-motion mode.
+function ensureTicker() {
+  const track = $('ticker-track');
+  const viewport = $('ticker-viewport');
+  const ticker = $('ticker');
+  if (!track || !viewport) return null;
+  if (ticker) ticker.classList.toggle('reduced', REDUCED_MOTION);
+  if (!blockTicker) {
+    blockTicker = new BlockTicker({
+      track,
+      viewport,
+      render: renderBlockChip,
+      cap: 48,
+      speed: 44,
+      reducedMotion: REDUCED_MOTION,
+    });
+  }
+  return blockTicker;
+}
+
+// Seed the ticker from recent block history so it always has content rolling,
+// even before the next block is mined. Degrades quietly: if the REST call fails
+// the live WS feed will still seed it on the first incoming block.
+async function seedTicker() {
+  if (NET_LIVE[NET] === false) return;
+  let blocks;
+  try {
+    blocks = await api('/blocks?limit=24');
+  } catch {
+    return; // no history yet — the WS feed will bootstrap the ticker
+  }
+  if (!Array.isArray(blocks) || !blocks.length) return;
+  const ticker = ensureTicker();
+  if (!ticker) return;
   const t = $('ticker');
-  if (!items) return;
-  t.hidden = false;
-  const chip = document.createElement('span');
-  chip.className = 'ticker-chip';
-  chip.innerHTML = text;
-  items.prepend(chip);
-  while (items.children.length > 14) items.lastChild.remove();
+  if (t) t.hidden = false;
+  // The REST list is newest-first; the ticker wants oldest..newest so the newest
+  // block sits at the leading (right) edge that fresh blocks feed in from.
+  ticker.seed(blocks.map((b) => ({ height: b.height, txCount: b.txCount })).reverse());
+}
+
+// A freshly-mined block from the live feed rolls into the ticker.
+function tickerPushBlock(b) {
+  const ticker = ensureTicker();
+  if (!ticker) return;
+  const t = $('ticker');
+  if (t) t.hidden = false;
+  ticker.push({ height: b.height, txCount: b.txCount });
 }
 
 function setConn(state, detail = '') {
@@ -1801,15 +1859,13 @@ function connectWs() {
     if (msg.type === 'reset') {
       // The node was re-genesised / rolled back; the old view is dead. Reload to
       // re-render against the fresh chain.
-      pushTicker('<b>chain reset</b> · reloading…');
       setTimeout(() => location.reload(), 400);
     } else if (msg.type === 'block') {
       const b = msg.block;
-      pushTicker(`<b>Block #${fmtNum(b.height)}</b> · ${fmtNum(b.txCount)} tx`);
+      tickerPushBlock(b);
       live.onBlock?.(b);
       pollStatus();
     } else if (msg.type === 'tx') {
-      pushTicker(`tx <b>${esc(msg.tx.action?.type || 'tx')}</b> · ${esc(shortHash(msg.tx.id))}`);
       live.onTx?.(msg.tx);
     }
   };
@@ -1846,6 +1902,7 @@ async function pollStatus() {
   drawSealStars();
   await loadNetworks(); // resolve live networks + wire the switch before first render
   connectWs();
+  seedTicker(); // seed the rolling ticker from recent block history (non-blocking)
   await pollStatus();
   setInterval(pollStatus, 5000);
   await route().catch((e) => errView(e.message));
