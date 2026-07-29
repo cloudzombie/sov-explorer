@@ -25,13 +25,16 @@ test('strict relay transport requires TLS except for local development', () => {
 
 async function fakeRelay(options = {}) {
   const calls = [];
+  // `down` lets a relay pass initial verification and then go unhealthy later,
+  // modelling a relay that fell behind / started timing out after joining.
+  let down = false;
   const server = createServer((req, res) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       calls.push(body.method);
-      if (options.failMethod === body.method) {
+      if (options.failMethod === body.method || (down && body.method === 'sov_getHeight')) {
         res.writeHead(503).end('down');
         return;
       }
@@ -59,6 +62,7 @@ async function fakeRelay(options = {}) {
   return {
     calls,
     url: `http://127.0.0.1:${port}`,
+    setDown: (value = true) => { down = value; },
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
@@ -102,6 +106,43 @@ test('fails over an ordinary read when the first relay errors', async (t) => {
   });
   await rpc.verifyRelays();
   assert.deepEqual(await rpc.supply(), { total: '42', mined: '42' });
+});
+
+test('a single lagging relay does not degrade a healthy, consistent quorum', async (t) => {
+  const a = await fakeRelay();
+  const b = await fakeRelay();
+  const stuck = await fakeRelay(); // verifies healthy, then falls behind
+  t.after(() => Promise.all([a.close(), b.close(), stuck.close()]));
+  const rpc = new SovereignRpc([a.url, b.url, stuck.url], {
+    expectedChainId: 'sov-mainnet',
+    expectedGenesisHash: hx('a'),
+    probeTtlMs: 0,
+  });
+  const healthy = await rpc.verifyRelays();
+  assert.equal(healthy.healthy, 3);
+  assert.equal(healthy.degraded, false);
+  assert.equal(healthy.reducedRedundancy, false);
+
+  stuck.setDown(); // sgp1-style: verified relay starts timing out
+  const status = await rpc.probe({ force: true });
+  assert.equal(status.healthy, 2, 'two relays remain healthy');
+  assert.equal(status.consistent, true, 'the two healthy relays agree');
+  assert.equal(status.degraded, false, 'a 2-of-3 agreeing quorum is full cross-check, not degraded');
+  assert.equal(status.reducedRedundancy, true, 'but reduced redundancy is still reported');
+});
+
+test('degrades when only one relay is left (no independent cross-check)', async (t) => {
+  const only = await fakeRelay();
+  const down = await fakeRelay({ failMethod: 'sov_getHeight' });
+  t.after(() => Promise.all([only.close(), down.close()]));
+  const rpc = new SovereignRpc([only.url, down.url], {
+    expectedChainId: 'sov-mainnet',
+    expectedGenesisHash: hx('a'),
+    probeTtlMs: 0,
+  });
+  const status = await rpc.verifyRelays();
+  assert.equal(status.healthy, 1);
+  assert.equal(status.degraded, true, 'a single source cannot be cross-checked → degraded');
 });
 
 test('halts when two healthy relays disagree at a common height', async (t) => {
