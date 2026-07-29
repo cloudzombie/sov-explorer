@@ -386,7 +386,7 @@ async function renderOverview(routeId) {
   setView('<div class="loading">Loading overview…</div>', routeId);
   const [status, blocks100, txs, supply] = await Promise.all([
     api('/status'),
-    api('/blocks?limit=100').catch(() => []),
+    api('/blocks?limit=24').catch(() => []),
     api('/txs?limit=12'),
     api('/supply').catch(() => null),
   ]);
