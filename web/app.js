@@ -1,6 +1,6 @@
 // Sovereign Explorer — single-page UI. Hash-routed, fetches the REST API, and follows
 // a WebSocket live feed. All values shown are real chain data served by the node.
-import { downloadRows, explainAction, isWatched, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
+import { downloadRows, explainAction, isWatched, shieldedActivation, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
 
 const $ = (id) => document.getElementById(id);
 const view = $('view');
@@ -404,6 +404,7 @@ async function renderOverview(routeId) {
         ${s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : ''}
         <span class="relay-pill ${relay.degraded ? 'degraded' : ''}">${esc(relayText)}</span>
         <span class="miners-pill ${mw.accounts ? '' : 'idle'}" title="Coinbase accounts that won at least one of the last ${esc(String(mw.windowBlocks ?? '—'))} blocks. Accounts, not machines — several machines can pay one account.">${esc(minersText)}</span>
+        ${pqActivationChips(s)}
       </div>
     </section>
 
@@ -540,6 +541,63 @@ function projectedActivation(d) {
   const period = Number(d?.period);
   if (!Number.isFinite(start) || !Number.isFinite(period) || period <= 0) return null;
   return { lockin: start + period, active: start + 2 * period };
+}
+
+/** Coarse "time remaining" for an activation countdown — seconds → days/hours/
+ * minutes. fmtDuration tops out at minutes, which reads badly for the hundreds
+ * of blocks (many hours) between BIP-9 milestones. */
+function fmtEta(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const d = Math.floor(n / 86400);
+  const h = Math.floor((n % 86400) / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  if (d > 0) return h > 0 ? `~${d}d ${h}h` : `~${d}d`;
+  if (h > 0) return m > 0 ? `~${h}h ${m}m` : `~${h}h`;
+  return `~${Math.max(1, m)}m`;
+}
+
+/** Top-row PQ-TX activation marker chips. The post-quantum shielded pool
+ * ("shielded-v2", signal bit 2) arms via BIP-9; this surfaces its go-live as a
+ * signal → lock-in → active chip strip whose heights are DERIVED from the
+ * node-reported startHeight + period (see shieldedActivation). Past milestones
+ * read as reached, the next carries a block countdown + ~ETA, and once Active it
+ * collapses to a single "PQ TX LIVE" chip. Renders nothing when the node does
+ * not report the deployment, so an older node degrades to no chips at all. */
+function pqActivationChips(s) {
+  const dep = (s.deployments?.deployments ?? []).find((d) => d?.name === 'shielded-v2');
+  const head = s.deployments?.height ?? s.sync?.nodeHeight ?? s.tipHeight;
+  const model = shieldedActivation(dep, head);
+  if (!model) return '';
+
+  if (model.active) {
+    return `<span class="pq-pill live" title="The post-quantum shielded pool (shielded-v2, signal bit 2) is active — Action::ShieldedV2 spends are accepted.">PQ TX LIVE <b>since #${fmtNum(model.activeHeight)}</b></span>`;
+  }
+
+  const chips = model.milestones.map((m) => {
+    const live = m.key === 'active' ? ' — PQ TX live' : '';
+    if (m.reached) {
+      return `<span class="pq-pill done" title="${esc(m.label + ' milestone reached')}">${esc(m.label)}${live} ✓ <b>#${fmtNum(m.height)}</b></span>`;
+    }
+    if (m.next) {
+      let count;
+      if (m.eligibleNow) {
+        count = 'eligible — awaiting signaling';
+      } else if (m.blocksRemaining !== undefined) {
+        const eta = fmtEta(m.etaSeconds);
+        count = `in ${fmtNum(m.blocksRemaining)} block${m.blocksRemaining === 1 ? '' : 's'}${eta ? ` · ${eta}` : ''}`;
+      } else {
+        count = 'next';
+      }
+      return `<span class="pq-pill next" title="Earliest ${esc(m.label)} at #${fmtNum(m.height)} (projected from startHeight + period; slips if signaling misses 90%).">${esc(m.label)}${live} <b>#${fmtNum(m.height)}</b> · ${esc(count)}</span>`;
+    }
+    return `<span class="pq-pill pending" title="Earliest ${esc(m.label)} at #${fmtNum(m.height)} (projected).">${esc(m.label)}${live} <b>#${fmtNum(m.height)}</b></span>`;
+  }).join('');
+
+  const label = model.failed
+    ? `<span class="pq-pill lead failed" title="shielded-v2 signaling failed to reach threshold before timeout.">PQ TX · ${esc(model.state)}</span>`
+    : `<span class="pq-pill lead" title="Post-quantum shielded pool (shielded-v2, signal bit 2) activation via BIP-9 miner signaling.">PQ TX</span>`;
+  return label + chips;
 }
 
 /** Consensus deployments (BIP-9 miner signaling): states from sov_getDeployments
