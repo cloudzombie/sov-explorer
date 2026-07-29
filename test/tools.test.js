@@ -7,7 +7,14 @@ globalThis.localStorage = {
   setItem(key, value) { values.set(key, String(value)); },
 };
 
-const { isWatched, toggleWatch, watchlist, blockUnit, poolBlocks } = await import('../web/tools.js');
+const {
+  isWatched,
+  toggleWatch,
+  watchlist,
+  blockUnit,
+  poolBlocks,
+  relayAvailability,
+} = await import('../web/tools.js');
 
 test('watchlists persist locally without a server dependency', () => {
   assert.deepEqual(watchlist(), []);
@@ -45,4 +52,34 @@ test('poolBlocks splits a value into whole blocks plus a sub-unit remainder', ()
   assert.equal(z.full, 0);
   assert.equal(z.partial, 0);
   assert.equal(poolBlocks(-10, 1000).full, 0); // clamps negatives, never NaN
+});
+
+test('relayAvailability keeps unavailable configured relays visible without degrading quorum', () => {
+  assert.deepEqual(relayAvailability({
+    configured: 3,
+    verified: 2,
+    healthy: 2,
+    consistent: true,
+    degraded: false,
+    reducedRedundancy: true,
+  }), {
+    healthy: 2,
+    configured: 3,
+    state: 'reduced redundancy',
+    tone: 'info',
+  });
+  assert.equal(relayAvailability({
+    configured: 2,
+    verified: 1,
+    healthy: 1,
+    consistent: null,
+    degraded: true,
+  }).tone, 'warn');
+  assert.equal(relayAvailability({
+    configured: 2,
+    verified: 2,
+    healthy: 2,
+    consistent: false,
+    degraded: true,
+  }).tone, 'bad');
 });

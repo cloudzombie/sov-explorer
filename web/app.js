@@ -1,6 +1,6 @@
 // Sovereign Explorer — single-page UI. Hash-routed, fetches the REST API, and follows
 // a WebSocket live feed. All values shown are real chain data served by the node.
-import { blockUnit, downloadRows, explainAction, isWatched, poolBlocks, shieldedActivation, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
+import { blockUnit, downloadRows, explainAction, isWatched, poolBlocks, relayAvailability, shieldedActivation, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
 import { BlockTicker } from './ticker.js';
 
 const $ = (id) => document.getElementById(id);
@@ -404,8 +404,9 @@ async function renderOverview(routeId) {
   const mempool = s.mempool ?? {};
   const sync = s.sync ?? {};
   const relay = s.relays ?? {};
-  const relayText = relay.healthy !== undefined
-    ? `${fmtNum(relay.healthy)}/${fmtNum(relay.verified)} relays${relay.consistent === false ? ' · disagreement' : relay.degraded ? ' · degraded' : ' · consistent'}`
+  const relayState = relayAvailability(relay);
+  const relayText = relayState.healthy !== null
+    ? `${fmtNum(relayState.healthy)}/${fmtNum(relayState.configured)} relays · ${relayState.state}`
     : 'relay status pending';
   // Mining accounts seen in the server-stated recent window (24h at the 150s
   // target). The window is always shown WITH the count: a short sample hides
@@ -426,7 +427,7 @@ async function renderOverview(routeId) {
         <a class="genesis-chip mono" href="#/block/0" title="Open the genesis block (#0) — ${esc(s.genesisHash || '')}">Genesis ${esc(shortHash(s.genesisHash, 10, 6))}</a>
         <span>${fmtNum(s.blocksIndexed)} indexed blocks</span>
         ${s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : ''}
-        <span class="relay-pill ${relay.degraded ? 'degraded' : ''}">${esc(relayText)}</span>
+        <span class="relay-pill ${relayState.tone === 'warn' || relayState.tone === 'bad' ? 'degraded' : relayState.tone === 'info' ? 'reduced' : ''}">${esc(relayText)}</span>
         <span class="miners-pill ${mw.accounts ? '' : 'idle'}" title="Coinbase accounts that won at least one of the last ${esc(String(mw.windowBlocks ?? '—'))} blocks. Accounts, not machines — several machines can pay one account.">${esc(minersText)}</span>
         ${pqActivationChips(s)}
       </div>
@@ -444,7 +445,7 @@ async function renderOverview(routeId) {
         ${statItem('Blockchain size', fmtBytes(all.blockchainSizeBytes), 'indexed window')}
         ${statItem('Mining accounts', mw.accounts === null || mw.accounts === undefined ? '—' : fmtNum(mw.accounts), `won a block in the ${windowLabel} — accounts, not machines`)}
         ${statItem('Mining accounts (all time)', (all.minersSeen ?? all.networkNodes) == null ? '—' : fmtNum(all.minersSeen ?? all.networkNodes), 'every coinbase account in the node registry')}
-        ${statItem('Relays', relay.verified === undefined ? '—' : fmtNum(relay.verified), 'pinned infrastructure nodes')}
+        ${statItem('Relays', relayState.healthy === null ? '—' : `${fmtNum(relayState.healthy)} / ${fmtNum(relayState.configured)}`, 'healthy / configured identity-pinned endpoints')}
         ${statItem('Difficulty', all.difficulty === null || all.difficulty === undefined ? '—' : esc(fmtNum(all.difficulty)), esc(all.difficultyAlgo === 'Sha256d' ? 'SHA-256d' : (all.difficultyAlgo || 'PoW')))}
       </section>
 
@@ -1435,6 +1436,7 @@ async function renderProof(routeId) {
   setView('<div class="loading">Loading Sovereign proof…</div>', routeId);
   const proof = await api('/proof');
   const relays = proof.relays ?? {};
+  const relayState = relayAvailability(relays);
   const crypto = proof.cryptography ?? {};
   const layout = crypto.hybrid65Layout ?? {};
   const supply = proof.privacy?.supply ?? {};
@@ -1448,7 +1450,7 @@ async function renderProof(routeId) {
   const quorumLabel = relays.consistent === false
     ? 'DISAGREEMENT — INDEXING HALTED'
     : relays.consistent === true
-      ? `agreed through block #${fmtNum(relays.commonHeight)}`
+      ? `agreed through block #${fmtNum(relays.commonHeight)}${relays.reducedRedundancy ? ` · ${fmtNum(relayState.healthy)}/${fmtNum(relayState.configured)} relays available` : ''}`
       : 'single-source / comparison pending';
   const pool = safeBigInt(shielded.poolValue ?? supply.shielded);
   const available = safeBigInt(shielded.deshieldableNowGrains);
@@ -1482,7 +1484,7 @@ async function renderProof(routeId) {
 
     <div class="proof-grid">
       <section class="proof-card proof-wide">
-        <div class="proof-heading"><div><span class="eyebrow">CHAIN PROVENANCE</span><h2>Relay quorum</h2></div><span class="proof-state ${relays.consistent === false ? 'bad' : relays.degraded ? 'warn' : 'ok'}">${esc(quorumLabel)}</span></div>
+        <div class="proof-heading"><div><span class="eyebrow">CHAIN PROVENANCE</span><h2>Relay quorum</h2></div><span class="proof-state ${relayState.tone}">${esc(quorumLabel)}</span></div>
         <div class="evidence-kv">
           <span>Chain id</span><b class="mono">${esc(proof.identity?.chainId)}</b>
           <span>Genesis</span><b class="mono break">${copyable(proof.identity?.genesisHash, 'genesis hash')} ${copyButton(proof.identity?.genesisHash, 'genesis hash')}</b>
@@ -2174,11 +2176,12 @@ function renderOperationalStatus(status) {
   }
   const sync = status.sync ?? {};
   const relays = status.relays ?? {};
+  const relayState = relayAvailability(relays);
   const bar = $('syncbar');
-  const relayText = relays.healthy !== undefined
-    ? `${fmtNum(relays.healthy)}/${fmtNum(relays.verified)} verified relays`
+  const relayText = relayState.healthy !== null
+    ? `${fmtNum(relayState.healthy)}/${fmtNum(relayState.configured)} relays healthy`
     : 'relay verification pending';
-  const detail = `${relayText}${relays.consistent === true ? ' · consistent' : relays.consistent === false ? ' · DISAGREE' : ' · degraded'} · node ${fmtNum(sync.nodeHeight ?? 0)} · indexed ${fmtNum(sync.indexedHeight ?? 0)}`;
+  const detail = `${relayText} · ${relayState.state} · node ${fmtNum(sync.nodeHeight ?? 0)} · indexed ${fmtNum(sync.indexedHeight ?? 0)}`;
 
   if (sync.phase === 'halted' || relays.consistent === false) {
     setConn('halted', detail);

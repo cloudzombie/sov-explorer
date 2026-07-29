@@ -287,8 +287,9 @@ export class SovereignRpc {
 
   /**
    * Compare healthy relays at their common height. Two healthy relays that disagree
-   * are a fail-closed condition; one temporarily unavailable relay is degraded but
-   * still usable because the remaining source has already passed the genesis pin.
+   * are a fail-closed condition. Fewer than two healthy relays is degraded because
+   * the remaining source cannot be cross-checked; an unavailable minority is only
+   * reduced redundancy while two or more healthy relays still agree.
    */
   async probe({ force = false } = {}) {
     if (!this._verified) throw new Error('relay identity has not been verified');
@@ -357,8 +358,11 @@ export class SovereignRpc {
       // relays still agree is full cross-check redundancy, not degradation, so it
       // must not raise a "degraded redundancy" alarm. `reducedRedundancy` records
       // that not every configured relay is currently contributing (informational).
+      // Compare against the configured set, not only relays verified during this
+      // process: a relay unavailable at startup has not joined the verified set yet
+      // but still represents lost redundancy that operators and clients should see.
       degraded: !(active.length >= 2 && consistent === true),
-      reducedRedundancy: active.length < enabled.length,
+      reducedRedundancy: active.length < this.relays.length,
     };
     this._probeAt = Date.now();
     return this._probeResult;
