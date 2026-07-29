@@ -351,7 +351,14 @@ export class SovereignRpc {
       commonHeight,
       commonHash,
       consistent,
-      degraded: active.length < enabled.length || consistent !== true,
+      // Degraded means the cross-check quorum is actually compromised — down to a
+      // single healthy source (no independent second opinion) or the healthy
+      // relays disagree. A lagging or offline MINORITY relay while >=2 healthy
+      // relays still agree is full cross-check redundancy, not degradation, so it
+      // must not raise a "degraded redundancy" alarm. `reducedRedundancy` records
+      // that not every configured relay is currently contributing (informational).
+      degraded: !(active.length >= 2 && consistent === true),
+      reducedRedundancy: active.length < enabled.length,
     };
     this._probeAt = Date.now();
     return this._probeResult;
@@ -368,6 +375,7 @@ export class SovereignRpc {
         commonHash: null,
         consistent: null,
         degraded: true,
+        reducedRedundancy: false,
       }),
       relays: this.relays.map((relay) => ({
         name: relay.label,
