@@ -1631,3 +1631,275 @@ details.raw pre {
   color: var(--text);
   margin-bottom: 6px;
 }
+
+/* ==========================================================================
+   Live-strip extras + overview widgets (rolling ticker companion features)
+   ========================================================================== */
+
+/* item 6: LIVE badge heartbeat — pulses once per new block. */
+@keyframes livebeat {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(82, 214, 141, 0.5);
+  }
+  40% {
+    transform: scale(1.14);
+    box-shadow: 0 0 0 6px rgba(82, 214, 141, 0);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(82, 214, 141, 0);
+  }
+}
+.ticker-label.beat {
+  animation: livebeat 0.6s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ticker-label.beat {
+    animation: none;
+  }
+}
+
+/* item 4: block-cadence sparkline pinned at the right of the LIVE strip. */
+.ticker-cadence {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-left: 12px;
+  border-left: 1px solid var(--line-soft);
+}
+.ticker-cadence[hidden] {
+  display: none;
+}
+.ticker-cadence svg rect {
+  fill: var(--blue);
+  opacity: 0.72;
+}
+.ticker-cadence .cadence-avg {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* item 1: bit-2 (post-quantum) signaling progress toward the 90% threshold. */
+.signal-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 18px;
+  margin: 18px 0 0;
+}
+.signal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.signal-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.signal-figure {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+}
+.signal-bar {
+  position: relative;
+  height: 10px;
+  border-radius: 6px;
+  background: var(--panel-3);
+  overflow: hidden;
+}
+.signal-fill {
+  display: block;
+  height: 100%;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--blue), #6f92ff);
+  transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.signal-fill.met {
+  background: linear-gradient(90deg, #3aa76a, var(--ok));
+}
+.signal-threshold {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--warn);
+  opacity: 0.85;
+}
+
+/* item 2: miner readiness board. */
+.miner-board {
+  margin-top: 26px;
+}
+.miner-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.miner-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 12px;
+}
+.miner-cell.ready {
+  border-color: rgba(82, 214, 141, 0.4);
+}
+.miner-cell.not-ready {
+  border-color: rgba(229, 167, 79, 0.32);
+}
+.miner-cell .miner-dot {
+  font-size: 11px;
+  line-height: 1;
+}
+.miner-cell.ready .miner-dot {
+  color: var(--ok);
+}
+.miner-cell.not-ready .miner-dot {
+  color: var(--warn);
+}
+.miner-cell a {
+  color: var(--text);
+  text-decoration: none;
+}
+.miner-cell .miner-count {
+  margin-left: auto;
+  font-family: var(--mono);
+  color: var(--muted);
+}
+
+/* item 8: supply-invariant trust widget. */
+.trust-widget {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 0;
+}
+.trust-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  text-decoration: none;
+}
+.trust-chip.ok {
+  border-color: rgba(82, 214, 141, 0.38);
+  color: var(--ok);
+}
+.trust-chip.warn {
+  border-color: rgba(229, 167, 79, 0.4);
+  color: var(--warn);
+}
+a.trust-chip:hover {
+  border-color: rgba(82, 214, 141, 0.7);
+}
+.trust-chip .dim {
+  color: var(--dim);
+  font-weight: 400;
+}
+
+/* item 3: v1 -> v2 pool migration chart. */
+.pool-migration {
+  margin-top: 26px;
+}
+.pool-v2-area {
+  fill: rgba(82, 214, 141, 0.22);
+  stroke: var(--ok);
+  stroke-width: 1.5;
+}
+.pool-v1-area {
+  fill: rgba(63, 111, 255, 0.28);
+  stroke: var(--blue);
+  stroke-width: 1.5;
+}
+.chart-meta .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+.chart-meta .swatch.v1 {
+  background: var(--blue);
+}
+.chart-meta .swatch.v2 {
+  background: var(--ok);
+}
+
+/* item 9: finality shading in block tables. */
+.blk-row.is-pending td:first-child {
+  box-shadow: inset 3px 0 0 var(--warn);
+}
+.blk-row.is-pending {
+  opacity: 0.82;
+}
+.blk-row.is-final td:first-child {
+  box-shadow: inset 3px 0 0 rgba(82, 214, 141, 0.6);
+}
+.blk-row {
+  transition: opacity 0.4s ease;
+}
+
+/* item 7: inline copyable hash/address text + toast. */
+.copyable {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.15s ease;
+  word-break: break-all;
+}
+.copyable:hover,
+.copyable:focus-visible {
+  background: rgba(63, 111, 255, 0.16);
+  outline: none;
+}
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%) translateY(16px);
+  background: var(--panel-3);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 13px;
+  padding: 9px 16px;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+  z-index: 60;
+}
+.toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+.toast.warn {
+  border-color: rgba(229, 167, 79, 0.5);
+  color: var(--warn);
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    transition: opacity 0.2s ease;
+  }
+}

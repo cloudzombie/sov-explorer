@@ -76,10 +76,11 @@
     <div class="syncbar" id="syncbar" role="status" aria-live="polite" hidden></div>
 
     <div class="ticker" id="ticker" role="log" aria-live="polite" aria-label="Live block-height ticker" hidden>
-      <span class="ticker-label">LIVE</span>
+      <span class="ticker-label" id="ticker-label">LIVE</span>
       <div class="ticker-viewport" id="ticker-viewport">
         <div class="ticker-track" id="ticker-track"></div>
       </div>
+      <div class="ticker-cadence" id="ticker-cadence" title="Recent inter-block times" hidden></div>
     </div>
 
     <main id="view" tabindex="-1" aria-busy="true"><div class="loading">Connecting to the chain…</div></main>
