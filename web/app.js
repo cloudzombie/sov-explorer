@@ -1,6 +1,6 @@
 // Sovereign Explorer — single-page UI. Hash-routed, fetches the REST API, and follows
 // a WebSocket live feed. All values shown are real chain data served by the node.
-import { blockUnit, downloadRows, explainAction, isWatched, poolBlocks, relayAvailability, shieldedActivation, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
+import { blockUnit, downloadRows, explainAction, isWatched, poolBlocks, relayAvailability, shieldedActivation, timingSummary, toggleWatch, verifyMerkleProof, watchlist } from './tools.js';
 import { BlockTicker } from './ticker.js';
 
 const $ = (id) => document.getElementById(id);
@@ -718,6 +718,51 @@ function fmtAge(ms) {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+// ---- transaction timing ---------------------------------------------------
+// First-seen is an OBSERVATION, and the UI says so everywhere it is shown: it is
+// the moment the node (or this explorer, polling the node's mempool) first saw the
+// transaction, never a self-reported creation time. Two honest nodes can differ.
+// A transaction nobody observed pending — which is every transaction mined before
+// this shipped — shows "— / not observed" and is never given an estimated wait.
+const FIRST_SEEN_TOOLTIP = 'When this node (or the explorer polling its mempool) FIRST OBSERVED this transaction. It is not a self-reported creation time, and different nodes can legitimately report different first-seen times.';
+const NOT_OBSERVED = `<span class="dim" title="Neither the node nor this explorer observed this transaction while it was pending, so its wait is unknown. It is never estimated.">— / not observed</span>`;
+
+const timingSourceNote = (source) => (source === 'node'
+  ? 'observed by the node itself (sov_getTxTiming)'
+  : source === 'explorer'
+    ? 'observed by this explorer polling the node\'s mempool'
+    : 'not observed');
+
+/** Wait, in seconds and in blocks, for a table cell. */
+function waitCell(timing) {
+  const t = timingSummary(timing);
+  if (!t.observed || t.waitedMs === null) return NOT_OBSERVED;
+  const blocks = t.waitedBlocks === null ? '' : ` <span class="dim">· ${fmtNum(t.waitedBlocks)} blk</span>`;
+  return `<span title="${esc(timingSourceNote(t.source))}">${fmtDuration(t.waitedMs)}</span>${blocks}`;
+}
+
+/** The first-seen / confirmed / waited rows of the transaction detail table. */
+function timingRows(timing, blockHeight, blockTimestampMs) {
+  const t = timingSummary(timing);
+  const confirmed = `${fmtDateTime(blockTimestampMs)} <span class="dim">— block #${fmtNum(blockHeight)}</span>`;
+  if (!t.observed) {
+    return `
+      <tr><td class="k">First seen</td><td class="v" title="${esc(FIRST_SEEN_TOOLTIP)}">${NOT_OBSERVED}
+        <span class="dim">— neither the node nor this explorer held this transaction in a mempool it was watching (it may have been mined before timing was recorded, or arrived inside a block synced from a peer).</span></td></tr>
+      <tr><td class="k">Confirmed</td><td class="v">${confirmed}</td></tr>
+      <tr><td class="k">Waited</td><td class="v">${NOT_OBSERVED}</td></tr>`;
+  }
+  const blocks = t.waitedBlocks === null
+    ? '<span class="dim">— block count unavailable</span>'
+    : `· <b>${fmtNum(t.waitedBlocks)}</b> block${t.waitedBlocks === 1 ? '' : 's'}`;
+  return `
+    <tr><td class="k">First seen</td><td class="v" title="${esc(FIRST_SEEN_TOOLTIP)}">${fmtDateTime(t.firstSeenMs)}
+      <span class="dim">(${fmtAge(t.firstSeenMs)})${t.firstSeenHeight === null ? '' : ` · chain height #${fmtNum(t.firstSeenHeight)}`} — ${esc(timingSourceNote(t.source))}</span></td></tr>
+    <tr><td class="k">Confirmed</td><td class="v">${confirmed}</td></tr>
+    <tr><td class="k">Waited</td><td class="v"><b>${fmtDecimal((t.waitedMs ?? 0) / 1000, 1)}</b> s ${blocks}
+      <span class="dim">— from first observation to the including block's header timestamp</span></td></tr>`;
+}
+
 const PAGE_SIZE = 50;
 
 async function renderBlocks(before, routeId) {
@@ -793,7 +838,7 @@ function transactionListRow(tx) {
   const status = tx.executionStatus
     ? `<span class="badge ${tx.executionStatus === 'success' ? 'ok' : 'fail'}">${esc(tx.executionStatus)}</span>`
     : '<span class="dim">—</span>';
-  return `<tr><td>${txLink(tx.id)}</td><td>${actionBadge(tx.action)}</td><td>${status}</td><td>${acctLinkShort(tx.signer)}</td><td>${actionSummary(tx.action)}</td><td>${blockLink(tx.blockHeight)}</td><td class="time">${fmtDateTime(tx.timestampMs)}</td></tr>`;
+  return `<tr><td>${txLink(tx.id)}</td><td>${actionBadge(tx.action)}</td><td>${status}</td><td>${acctLinkShort(tx.signer)}</td><td>${actionSummary(tx.action)}</td><td>${blockLink(tx.blockHeight)}</td><td>${waitCell(tx.timing)}</td><td class="time">${fmtDateTime(tx.timestampMs)}</td></tr>`;
 }
 
 async function renderTransactions(params, routeId) {
@@ -819,7 +864,7 @@ async function renderTransactions(params, routeId) {
       <label>To date<input name="toDate" type="date" /></label>
       <button type="submit">Apply filters</button><a class="pager-btn" href="#/transactions">Clear</a>
     </form>
-    <div class="panel"><table><thead><tr><th>Tx</th><th>Action</th><th>Status</th><th>Signer</th><th>Detail</th><th>Block</th><th>Date</th></tr></thead><tbody>${items.map(transactionListRow).join('') || emptyRow(7)}</tbody></table></div>
+    <div class="panel"><table><thead><tr><th>Tx</th><th>Action</th><th>Status</th><th>Signer</th><th>Detail</th><th>Block</th><th title="${esc(FIRST_SEEN_TOOLTIP)}">Waited</th><th>Date</th></tr></thead><tbody>${items.map(transactionListRow).join('') || emptyRow(8)}</tbody></table></div>
     <div class="pager"><span class="pager-info">${page.historyComplete ? 'Complete archived history' : 'Indexed history only'}</span>${next}</div>
   `, routeId);
   if (!committed) return;
@@ -1104,12 +1149,22 @@ async function renderTx(id, routeId) {
       if (body.pending || apiError?.details?.pending) {
         const here = location.hash;
         setTimeout(() => { if (location.hash === here) route(); }, 5000);
+        // The pending wait counts up from a REAL first-seen observation (the node's
+        // mempool, polled by this explorer). Without one, no waiting time is shown —
+        // an unobserved pending transaction is not given an invented start.
+        const details = apiError?.details ?? body;
+        const firstSeenMs = Number(details.firstSeenMs);
+        const waiting = Number.isFinite(firstSeenMs)
+          ? `<b>pending — waiting ${fmtDecimal(Math.max(0, Date.now() - firstSeenMs) / 1000, 0)}s</b>
+             <span class="dim">— since first seen ${fmtDateTime(firstSeenMs)}${details.state ? ` · mempool state: ${esc(details.state)}` : ''}</span>`
+          : `<b>pending</b> ${NOT_OBSERVED} <span class="dim">— this explorer has no first-seen observation for it${details.inMempool ? '' : ', and the node is not holding it in a mempool the explorer can read'}.</span>`;
         return setView(`
           <div class="crumb">Transaction</div>
           <h1>Waiting to be mined… <span class="badge pending">Pending</span></h1>
           <div class="panel"><table class="kv">
             <tr><td class="k">Id</td><td class="v">${esc(id)}</td></tr>
             <tr><td class="k">Status</td><td class="v">Not in a block yet — mainnet targets a block every 2.5 minutes. This page checks again automatically every few seconds.</td></tr>
+            <tr><td class="k" title="${esc(FIRST_SEEN_TOOLTIP)}">Waiting</td><td class="v">${waiting}</td></tr>
           </table></div>
         `, routeId);
       }
@@ -1135,6 +1190,7 @@ async function renderTx(id, routeId) {
       <tr><td class="k">Confirmations</td><td class="v">${fmtNum(t.confirmations)} ${t.final ? '<span class="dim">— final (buried past the 6-confirmation Nakamoto depth)</span>' : '<span class="dim">— pending finality (6 required)</span>'}</td></tr>
       <tr><td class="k">Position</td><td class="v">#${t.index} in block</td></tr>
       <tr><td class="k">Timestamp</td><td class="v">${new Date(t.timestampMs).toLocaleString()} <span class="dim">(${timeAgo(t.timestampMs)})</span></td></tr>
+      ${timingRows(t.timing, t.blockHeight, t.timestampMs)}
       <tr><td class="k">Signer</td><td class="v">${acctLink(t.signer)}</td></tr>
       <tr><td class="k">Nonce</td><td class="v">${fmtNum(t.nonce)}</td></tr>
       <tr><td class="k">Action</td><td class="v">${esc(t.action?.type)} — ${actionSummary(t.action)}</td></tr>
@@ -1357,6 +1413,93 @@ async function renderAnalytics(routeId) {
       <div class="legend"><span><i style="background:#3f6fff"></i>Mined (PoW)</span></div>
     </div>
     <p class="note">Issuance is sampled live as the explorer follows the chain — each point is the chain's committed supply at that height. The 21,000,000 ${COIN_SYMBOL} hard cap is enforced on-chain by exact-integer accounting.</p>
+  `, routeId);
+}
+
+/** One tipped/untipped statistics column. `null` renders as an em dash — a group
+ * with no observed sample is never shown as a zero wait. */
+function waitStatCard(label, group, sub) {
+  const value = group?.medianWaitMs === null || group?.medianWaitMs === undefined
+    ? '<span class="dim">—</span>'
+    : fmtDuration(group.medianWaitMs);
+  const p90 = group?.p90WaitMs === null || group?.p90WaitMs === undefined
+    ? '—'
+    : fmtDuration(group.p90WaitMs);
+  const blocks = group?.medianWaitBlocks === null || group?.medianWaitBlocks === undefined
+    ? '—'
+    : `${fmtDecimal(group.medianWaitBlocks, 1)} blk`;
+  return `<div class="card">
+    <div class="label">${esc(label)}</div>
+    <div class="value num">${value}</div>
+    <div class="sub">p90 ${p90} · median ${blocks} · n=${fmtNum(group?.count ?? 0)}</div>
+    <div class="sub dim">${esc(sub)}</div>
+  </div>`;
+}
+
+/**
+ * Wait times: the fee auction, measured. Median and p90 wait split by tipped vs
+ * untipped, computed ONLY over transactions with an observed first-seen. The
+ * excluded counts are shown next to the sample size, because a median drawn from
+ * a fraction of the window is only meaningful with that fraction stated.
+ */
+async function renderTiming(routeId) {
+  setView('<div class="loading">Loading wait times…</div>', routeId);
+  let stats;
+  let mempool;
+  try {
+    [stats, mempool] = await Promise.all([
+      api('/tx-timing?limit=2000'),
+      api('/mempool?limit=25').catch(() => null),
+    ]);
+  } catch (e) {
+    return errView(e.message, routeId);
+  }
+  const support = stats.support ?? {};
+  const unsupported = support.mempoolRpc === false && support.timingRpc === false;
+  const pending = (mempool?.txs ?? []).map((tx) => `<tr>
+    <td>${txLink(tx.txId)}</td>
+    <td>${acctLinkShort(tx.signer)}</td>
+    <td class="right num">${tx.tipGrains ? `${fmtCoin(tx.tipGrains)} ${COIN_SYMBOL}` : '<span class="dim">no tip</span>'}</td>
+    <td>${esc(tx.state ?? '—')}</td>
+    <td class="right">${Number.isFinite(Number(tx.firstSeenMs))
+      ? `waiting ${fmtDecimal(Math.max(0, Date.now() - Number(tx.firstSeenMs)) / 1000, 0)}s`
+      : NOT_OBSERVED}</td>
+  </tr>`).join('');
+
+  setView(`
+    <h1>Transaction wait times</h1>
+    <p class="note">How long transactions waited between the moment they were first <b>observed</b> in a mempool
+      and the block that included them. Tipped transactions bid for priority under the fee-auction deployment;
+      untipped ones take the ordinary queue. Only transactions with a real observation are counted — nothing here is estimated.</p>
+    ${unsupported ? `<div class="panel"><p class="note"><b>This node does not report transaction timing.</b>
+      It answered <code>sov_getMempoolTxs</code> and <code>sov_getTxTiming</code> with "method not found", so no wait can be measured from it.
+      The explorer stopped asking and everything else on this page keeps working; timing is simply absent, never invented.</p></div>` : ''}
+    <div class="cards">
+      ${waitStatCard('Tipped — median wait', stats.tipped, 'fee-auction priority bids')}
+      ${waitStatCard('Untipped — median wait', stats.untipped, 'no priority bid')}
+      ${waitStatCard('All observed', stats.overall, 'every transaction with a recorded first-seen')}
+      <div class="card">
+        <div class="label">Sample</div>
+        <div class="value num">${fmtNum(stats.sampleSize)}</div>
+        <div class="sub">of ${fmtNum(stats.considered)} transactions in the window${stats.window?.fromHeight === null ? '' : ` (#${fmtNum(stats.window.fromHeight)}–#${fmtNum(stats.window.toHeight)})`}</div>
+        <div class="sub dim">${fmtNum(stats.excludedUnobserved)} excluded as not observed${stats.excludedNegative ? ` · ${fmtNum(stats.excludedNegative)} excluded for a block timestamp earlier than first-seen` : ''}</div>
+      </div>
+    </div>
+    <h2>Where the timing came from</h2>
+    <div class="panel"><table class="kv">
+      <tr><td class="k">Node observations</td><td class="v">${fmtNum(stats.sources?.node ?? 0)} <span class="dim">— the node's own mempool record (<code>sov_getTxTiming</code>)</span></td></tr>
+      <tr><td class="k">Explorer observations</td><td class="v">${fmtNum(stats.sources?.explorer ?? 0)} <span class="dim">— seen by this explorer polling <code>sov_getMempoolTxs</code></span></td></tr>
+      <tr><td class="k">Not observed</td><td class="v">${fmtNum(stats.excludedUnobserved)} <span class="dim">— excluded from every statistic above. Transactions mined before this explorer recorded first-seen have no wait, and one is never estimated for them.</span></td></tr>
+    </table></div>
+    <h2>Pending now</h2>
+    ${mempool?.available
+      ? `<div class="panel"><table><thead><tr><th>Tx</th><th>Signer</th><th class="right">Tip</th><th>State</th><th class="right">Waiting</th></tr></thead>
+        <tbody>${pending || emptyRow(5)}</tbody></table></div>
+        <p class="note">Read from this node's mempool ${mempool.updatedAt ? `at ${fmtDateTime(mempool.updatedAt)}` : ''}${mempool.truncated ? ' (page-capped — the mempool is larger than the polled window)' : ''}. A mempool is node-local: another node may hold a different set.</p>`
+      : `<div class="panel"><p class="note">${esc(mempool?.reason ?? 'The mempool listing is unavailable from this node.')} Pending transactions cannot be listed, so none are shown — rather than an empty table implying an empty mempool.</p></div>`}
+    <p class="note">First seen is an <b>observation</b>, not a creation time: it is when a node (or this explorer, polling that node) first
+      saw the transaction. Different nodes can legitimately differ. Transactions mined before this explorer began recording first-seen show
+      “— / not observed” everywhere and are excluded from these statistics; none of them are backfilled with an estimate.</p>
   `, routeId);
 }
 
@@ -1604,7 +1747,7 @@ function route() {
   const routeTitles = {
     proof: 'Proof', blocks: 'Blocks', transactions: 'Transactions', assets: 'Assets',
     watchlist: 'Watchlist', miners: 'Miners', validators: 'Miners', sns: 'Names',
-    analytics: 'Analytics', validity: 'Finality',
+    analytics: 'Analytics', validity: 'Finality', timing: 'Wait times',
   };
   setPageMeta(routeTitles[head] ?? (head ? '' : 'Overview'));
   setActiveNav(hash);
@@ -1621,6 +1764,7 @@ function route() {
   else if (head === 'account' && arg) task = renderAccount(arg, routeQuery, routeId);
   else if (head === 'miners' || head === 'validators') task = renderMiners(routeId);
   else if (head === 'analytics') task = renderAnalytics(routeId);
+  else if (head === 'timing') task = renderTiming(routeId);
   else if (head === 'sns') task = renderSns(routeQuery, routeId);
   else if (head === 'validity') task = renderValidity(routeId);
   else task = renderNotFound(`Unknown or incomplete explorer route “${head}”.`, routeId);

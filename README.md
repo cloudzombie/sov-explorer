@@ -65,6 +65,39 @@ data and is never claimed. `allTime.networkNodes` reports peers of one relay
 
 Anything the node does not supply renders as an em dash, never as a plausible zero.
 
+## Transaction timing (first seen → confirmed)
+
+A block header says when a transaction was **included**; nothing on-chain says when it
+appeared. The wait is therefore only knowable from an **observation**, and the explorer
+keeps its own durable record of one.
+
+| Piece | Behaviour |
+|---|---|
+| Capture | The existing indexer tick polls `sov_getMempoolTxs` (paged by `offset`/`hasMore`, hard-capped at 8 pages of 256) and records `first_seen_ms` **plus the chain height at that moment** for every transaction id seen for the first time. The first observation wins; a later poll never moves it forward. This also captures transactions the node later prunes without mining. |
+| Pairing | When a block is indexed, `sov_getTxTiming` is asked **once for the whole block** (only within `timingLookbackBlocks` of the head — a node has no mempool memory of deep history). The node's own observation wins; its honest `observed: false` falls back to the explorer's record. |
+| Derivation | `waitedMs` = block header timestamp − first seen. `waitedBlocks` = including height − the height at which the transaction was first observed. Both are differences of recorded values, never estimates from the block interval. |
+| Provenance | Every record carries `source`: `"node"`, `"explorer"`, or `null`. |
+| Storage | Durable in the SQLite archive: `mempool_observations` (pending window, pruned after 7 days) and `first_seen_ms` / `first_seen_height` / `waited_ms` / `waited_blocks` / `timing_source` columns on `transactions`, plus the same object embedded in the transaction record. Columns are added in place, so an existing archive keeps working with NULL timing on its old rows. Re-indexing a block never erases timing already on record. |
+
+**Honest nulls.** When neither the node nor the explorer observed a transaction pending,
+`observed` is `false` and every timing field is `null`, end to end — archive, REST,
+GraphQL, WebSocket, UI. Nothing is estimated, interpolated, or backfilled. Every
+transaction mined before this shipped is in that category and shows **“— / not
+observed”**. First-seen is displayed as what it is: when *this* node/explorer first
+observed the transaction, not a self-reported creation time — two honest nodes can
+legitimately differ.
+
+**Aggregates.** `/api/<net>/tx-timing` reports median and p90 wait split by tipped vs
+untipped (the fee auction, measured). Only observed transactions enter the sample; the
+answer always carries `sampleSize`, `considered`, `excludedUnobserved`, and
+`excludedNegative` (a header timestamp earlier than first-seen is dropped rather than
+clamped to zero). A group with no observed sample reports `null`, never a zero wait.
+
+**Degradation.** Both RPCs are new and node-local. A node that answers `-32601` is
+recorded as not supporting them, is not asked again until the next probe window
+(10 minutes), and everything else in the explorer continues unchanged with timing simply
+absent. This is the expected state against every node deployed today.
+
 **Request budget.** Chain statistics are refreshed as one batch of 12 RPCs at most once
 per `statsIntervalMs` (10 s) against one relay — ≈1.2 req/s, fixed, and independent of
 browser traffic, because every client is served from that one cached snapshot. Receipts
@@ -88,6 +121,8 @@ GET  /api/<net>/blocks?limit=  → recent blocks
 GET  /api/<net>/block/<ref>    → block by height or hash
 GET  /api/<net>/tx/<id>        → a transaction
 GET  /api/<net>/transactions   → archived cursor page with action/account/status/range filters
+GET  /api/<net>/mempool        → pending transactions with their first-seen observations
+GET  /api/<net>/tx-timing      → median/p90 wait, split tipped vs untipped, with exclusions
 GET  /api/<net>/catalog        → paged token/NFT/contract/HTLC catalog
 GET  /api/<net>/object/<kind>/<id> → object state + archived activity/events
 GET  /api/<net>/inclusion-proof/<id> → optional tx + receipt Merkle evidence

@@ -38,6 +38,43 @@ export function relayAvailability(relays = {}) {
   return { healthy, configured, state, tone };
 }
 
+// ---- transaction timing presentation --------------------------------------
+// Pure, DOM-free reduction of the API's `timing` record to what the UI renders.
+// A transaction with no recorded first-seen is NOT given a guessed wait: it comes
+// back `observed: false` so the view can print "— / not observed". First-seen is
+// the moment a node/this explorer first OBSERVED the transaction — not a
+// self-reported creation time — and two nodes can legitimately differ.
+export function timingSummary(timing) {
+  // null / undefined are ABSENT, not zero — `Number(null)` is 0, which would turn a
+  // missing first-seen into an epoch timestamp and an absurd wait.
+  const num = (value) => (value === null || value === undefined ? Number.NaN : Number(value));
+  const firstSeenMs = num(timing?.firstSeenMs);
+  if (!timing || timing.observed !== true || !Number.isFinite(firstSeenMs)) {
+    return {
+      observed: false,
+      source: null,
+      firstSeenMs: null,
+      firstSeenHeight: null,
+      waitedMs: null,
+      waitedSeconds: null,
+      waitedBlocks: null,
+    };
+  }
+  const waitedMs = num(timing.waitedMs);
+  const waitedBlocks = num(timing.waitedBlocks);
+  return {
+    observed: true,
+    source: timing.source ?? null,
+    firstSeenMs,
+    firstSeenHeight: Number.isFinite(num(timing.firstSeenHeight))
+      ? Number(timing.firstSeenHeight)
+      : null,
+    waitedMs: Number.isFinite(waitedMs) ? waitedMs : null,
+    waitedSeconds: Number.isFinite(waitedMs) ? waitedMs / 1000 : null,
+    waitedBlocks: Number.isFinite(waitedBlocks) ? waitedBlocks : null,
+  };
+}
+
 // ---- shielded-v2 (post-quantum TX) activation model -----------------------
 // Pure, framework-free derivation of the BIP-9 activation milestones for the
 // post-quantum shielded pool ("PQ TX"). Heights are DERIVED from the node-

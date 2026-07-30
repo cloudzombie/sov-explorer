@@ -5,6 +5,7 @@
 
 import { confirmationCount, finalAtDepth, normalizeBlock } from './indexer.js';
 import { MINER_WINDOW_BLOCKS } from './store.js';
+import { timingStats, unobservedTiming } from './timing.js';
 
 function json(status, body) {
   return { status, body: JSON.stringify(body) };
@@ -54,6 +55,10 @@ function transactionSummary(tx) {
     blockHash: tx.blockHash,
     timestampMs: tx.timestampMs,
     sizeBytes: tx.sizeBytes,
+    // First-seen / wait timing, or an all-null record with `observed: false` when
+    // neither the node nor this explorer ever saw the transaction pending. Never
+    // estimated: a transaction mined before timing was recorded stays unobserved.
+    timing: tx.timing ?? unobservedTiming(tx.blockHeight, tx.timestampMs),
   };
 }
 
@@ -256,6 +261,63 @@ export async function handleRest(method, pathname, query, ctx) {
         });
       }
 
+      // The node's mempool as this explorer last polled it, each entry carrying the
+      // first-seen observation the pending-transaction view counts up from.
+      // `available: false` on a node that does not serve sov_getMempoolTxs.
+      case 'mempool': {
+        const snapshot = store.mempoolSnapshot;
+        const limitRaw = query.get('limit');
+        const limit = limitRaw === null || limitRaw === ''
+          ? Math.min(50, maxPageLimit)
+          : clamp(limitRaw, 1, maxPageLimit, 50);
+        if (!snapshot) {
+          return json(200, {
+            available: false,
+            reason: 'the explorer has not polled this node\'s mempool yet',
+            size: store.mempoolSize,
+            txs: [],
+            updatedAt: null,
+          });
+        }
+        return json(200, {
+          available: snapshot.available,
+          reason: snapshot.reason,
+          size: store.mempoolSize,
+          txCount: snapshot.txCount,
+          queuedCount: snapshot.queuedCount,
+          truncated: snapshot.truncated,
+          updatedAt: snapshot.updatedAt,
+          txs: snapshot.txs.slice(0, limit),
+        });
+      }
+
+      // Fee-auction wait statistics: median and p90 wait, split tipped vs untipped.
+      // Only transactions with an OBSERVED wait are in the sample; the excluded
+      // counts are part of the answer so the sample can never look complete when it
+      // is not.
+      case 'tx-timing': {
+        const limitRaw = query.get('limit');
+        const sampleLimit = limitRaw === null || limitRaw === ''
+          ? 2_000
+          : clamp(limitRaw, 1, 20_000, 2_000);
+        const rows = store.timingSample({ limit: sampleLimit });
+        const stats = timingStats(rows);
+        const observed = rows.filter((row) => row.observed);
+        return json(200, {
+          ...stats,
+          window: {
+            requested: sampleLimit,
+            fromHeight: rows.length ? rows.at(-1).blockHeight : null,
+            toHeight: rows.length ? rows[0].blockHeight : null,
+          },
+          sources: {
+            node: observed.filter((row) => row.source === 'node').length,
+            explorer: observed.filter((row) => row.source === 'explorer').length,
+          },
+          support: store.stats().txTiming,
+        });
+      }
+
       case 'catalog': {
         const kind = String(query.get('kind') ?? '').toLowerCase();
         if (!OBJECT_KINDS.has(kind)) return json(400, { error: 'kind must be token, nft, contract, or htlc' });
@@ -423,8 +485,19 @@ export async function handleRest(method, pathname, query, ctx) {
           if (!tx) {
             // No receipt anywhere: either it was just submitted and hasn't been
             // mined yet, or the id is unknown. Tell the client it may be pending
-            // so it can wait-and-retry instead of declaring failure.
-            return json(404, { error: 'transaction not yet mined', pending: true });
+            // so it can wait-and-retry instead of declaring failure. When the
+            // transaction IS in the polled mempool, hand back the real first-seen
+            // so the client can show how long it has been waiting.
+            const pendingTx = store.pendingTransaction(id);
+            const observation = store.firstSeen(id);
+            return json(404, {
+              error: 'transaction not yet mined',
+              pending: true,
+              inMempool: !!pendingTx,
+              firstSeenMs: observation?.firstSeenMs ?? pendingTx?.firstSeenMs ?? null,
+              firstSeenHeight: observation?.firstSeenHeight ?? null,
+              state: pendingTx?.state ?? null,
+            });
           }
         }
         // Enrich with the live execution receipt (success / exact failure reason,
@@ -432,7 +505,21 @@ export async function handleRest(method, pathname, query, ctx) {
         // chain data read from the node, not stored copies.
         const receipt = await rpc.receipt(tx.id).catch(() => null) ?? tx.receipt ?? null;
         const confirmations = confirmationCount(store.tipHeight, tx.blockHeight);
-        return json(200, { ...tx, receipt, confirmations, final: finalAtDepth(store.tipHeight, tx.blockHeight) });
+        // Timing follows the record; a transaction lifted straight out of a block
+        // body (never indexed through the mempool) falls back to whatever the
+        // archive retained, and to an explicit unobserved record otherwise.
+        const archivedTiming = tx.timing ? null : store.archive?.transactionTiming?.(id) ?? null;
+        const timing = tx.timing
+          ?? (archivedTiming
+            ? { ...archivedTiming, includedHeight: tx.blockHeight, includedTimestampMs: tx.timestampMs, observed: true }
+            : unobservedTiming(tx.blockHeight, tx.timestampMs));
+        return json(200, {
+          ...tx,
+          receipt,
+          timing,
+          confirmations,
+          final: finalAtDepth(store.tipHeight, tx.blockHeight),
+        });
       }
 
       case 'inclusion-proof': {

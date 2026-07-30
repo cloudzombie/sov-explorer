@@ -5,6 +5,8 @@
 // implement mutations, variables, fragments, or directives — the explorer is
 // read-only, and those features are documented as out of scope rather than faked.
 
+import { timingStats, unobservedTiming } from './timing.js';
+
 const MAX_SOURCE_CHARS = 64 * 1024;
 const MAX_TOKENS = 4096;
 const MAX_DEPTH = 12;
@@ -209,9 +211,25 @@ export const schemaRoots = {
   block: (a, { store }) =>
     store.block(a.hash !== undefined ? String(a.hash).toLowerCase() : Number(a.height))
       ?? store.archive?.block(a.hash !== undefined ? String(a.hash).toLowerCase() : Number(a.height)),
-  transaction: (a, { store }) =>
-    store.tx(String(a.id).toLowerCase())
-      ?? store.archive?.transaction(String(a.id).toLowerCase()),
+  // `timing` is always present on a transaction: an all-null record with
+  // `observed: false` when neither the node nor this explorer saw it pending.
+  transaction: (a, { store }) => {
+    const id = String(a.id).toLowerCase();
+    const tx = store.tx(id) ?? store.archive?.transaction(id) ?? null;
+    if (!tx) return null;
+    return { ...tx, timing: tx.timing ?? unobservedTiming(tx.blockHeight, tx.timestampMs) };
+  },
+  /** The node's mempool as last polled, with each entry's first-seen observation. */
+  mempool: (_a, { store }) => store.mempoolSnapshot ?? {
+    available: false,
+    reason: 'the explorer has not polled this node\'s mempool yet',
+    txs: [],
+    updatedAt: null,
+  },
+  /** Median / p90 wait split tipped vs untipped, with the excluded counts. */
+  txTimingStats: (a, { store }) => timingStats(store.timingSample({
+    limit: Math.max(1, Math.min(20_000, Number.isFinite(Number(a.limit)) ? Math.trunc(Number(a.limit)) : 2_000)),
+  })),
   account: async (a, { rpc, store }) => {
     const acc = await rpc.account(a.id).catch(() => null);
     if (!acc) return null;

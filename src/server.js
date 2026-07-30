@@ -171,6 +171,9 @@ for (const [name, config] of Object.entries(NETWORKS)) {
               action: t.action,
               blockHeight: t.blockHeight,
               timestampMs: t.timestampMs,
+              // Present but all-null with `observed: false` when neither the node
+              // nor this explorer saw the transaction while it was pending.
+              timing: t.timing ?? null,
             },
           }),
         onReset: () => wsHub.broadcast({ type: 'reset' }),
