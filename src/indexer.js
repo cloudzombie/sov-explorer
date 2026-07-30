@@ -4,7 +4,13 @@
 // invents. It is resilient to transient RPC errors — a failed tick is retried on
 // the next interval.
 
-import { indexBlockTiming, isMethodNotFound, normalizeMempoolTx, pairTiming } from './timing.js';
+import {
+  declaredCreationMs,
+  indexBlockTiming,
+  isMethodNotFound,
+  normalizeMempoolTx,
+  pairTiming,
+} from './timing.js';
 
 export function confirmationCount(head, height) {
   return Math.max(0, head - height + 1);
@@ -234,8 +240,9 @@ export class Indexer {
   /**
    * Attach first-seen / wait timing to every transaction in a block.
    *
-   * The node's own observation wins when it has one; otherwise the explorer's own
-   * recorded observation is used; when NEITHER saw the transaction the timing is
+   * A consensus-bounded creation time declared in the transaction itself wins when
+   * present; otherwise the node's own observation; otherwise the explorer's own
+   * recorded observation; when NONE has one the timing is
    * present but every field is null with `observed: false`. Nothing is estimated,
    * and transactions mined before this explorer started observing stay unobserved
    * forever — that is the honest answer, not a defect.
@@ -246,6 +253,11 @@ export class Indexer {
     for (const tx of record.transactions) {
       const id = String(tx.id ?? '').toLowerCase();
       tx.timing = pairTiming({
+        // The transaction's OWN consensus-bounded creation time, when it declared
+        // one. Preferred over any observation: it is in the block, so it survives a
+        // restart, a cold sync, and disagreement between nodes. Null — and therefore
+        // ignored — for every transaction before signal bit 3 activates.
+        declaredCreatedAtMs: declaredCreationMs(tx.action),
         nodeTiming: nodeTiming?.get(id) ?? null,
         observation: this.store.firstSeen(id),
         includedHeight: record.height,

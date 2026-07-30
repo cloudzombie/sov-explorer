@@ -13,7 +13,8 @@ import { executeGraphql, schemaRoots } from '../src/graphql.js';
 import { Indexer } from '../src/indexer.js';
 import { handleRest } from '../src/rest.js';
 import { Store } from '../src/store.js';
-import { isMethodNotFound, pairTiming, timingStats } from '../src/timing.js';
+import { declaredCreationMs, isMethodNotFound, pairTiming, timingStats } from '../src/timing.js';
+import { isTipped, tipGrains, unwrapTipped, unwrapTimestamped } from '../src/store.js';
 
 const hx = (n) => `0x${BigInt(n).toString(16).padStart(64, '0')}`;
 
@@ -183,6 +184,7 @@ test('a transaction nobody observed keeps null timing — never an estimate', ()
     waitedBlocks: null,
     source: null,
     observed: false,
+    declared: false,
   });
 });
 
@@ -480,7 +482,7 @@ test('a transaction indexed before timing existed serves an explicit unobserved 
   const tx = JSON.parse(response.body);
   assert.deepEqual(tx.timing, {
     firstSeenMs: null, firstSeenHeight: null, includedHeight: 3, includedTimestampMs: 300,
-    waitedMs: null, waitedBlocks: null, source: null, observed: false,
+    waitedMs: null, waitedBlocks: null, source: null, observed: false, declared: false,
   });
 });
 
@@ -616,4 +618,134 @@ test('timing statistics come from the durable archive when there is one', async 
   assert.equal(stats.excludedUnobserved, 2);
   assert.equal(stats.tipped.medianWaitMs, 2_000);
   assert.equal(stats.untipped.medianWaitMs, 4_000);
+});
+
+// ── On-chain creation time (`Action::Timestamped`, signal bit 3) ────────────
+//
+// A transaction may declare its OWN creation time, which consensus refuses to
+// include unless it falls inside a bounded window around the including block's
+// timestamp. That is strictly stronger than any mempool observation — every node
+// enforced the same bound, and it lives in the block, so it survives a restart and
+// a cold sync. When present it wins; when absent (every transaction before bit 3
+// activates) nothing changes at all.
+
+const stamped = (createdAtMs, inner) => ({ type: 'timestamped', created_at_ms: createdAtMs, inner });
+
+test('declaredCreationMs reads a declared creation time and never invents one', () => {
+  assert.equal(
+    declaredCreationMs(stamped(1_000, { type: 'transfer', to: 'bob', amount: '1' })),
+    1_000,
+  );
+  // The overwhelmingly common case today: no envelope, so no declared time.
+  assert.equal(declaredCreationMs({ type: 'transfer', to: 'bob', amount: '1' }), null);
+  assert.equal(declaredCreationMs({ type: 'tipped', tip: '5', inner: { type: 'transfer' } }), null);
+  // Malformed or absent input is null, never a throw and never a guess.
+  assert.equal(declaredCreationMs(null), null);
+  assert.equal(declaredCreationMs(undefined), null);
+  assert.equal(declaredCreationMs({ type: 'timestamped' }), null);
+  assert.equal(declaredCreationMs({ type: 'timestamped', created_at_ms: 'soon' }), null);
+});
+
+test('a declared creation time outranks both observations and is labeled `chain`', () => {
+  const timing = pairTiming({
+    declaredCreatedAtMs: 1_000,
+    // Both observations exist AND disagree with the declaration — the chain still
+    // wins, because it is the one value every node agreed on.
+    nodeTiming: { observed: true, firstSeenMs: 4_000, firstSeenHeight: 8, waitedMs: 1, waitedBlocks: 1 },
+    observation: { firstSeenMs: 5_000, firstSeenHeight: 9 },
+    includedHeight: 10,
+    includedTimestampMs: 9_000,
+  });
+  assert.equal(timing.source, 'chain');
+  assert.equal(timing.declared, true);
+  assert.equal(timing.firstSeenMs, 1_000);
+  assert.equal(timing.waitedMs, 8_000, 'block timestamp minus the DECLARED time');
+  // The declaration is a wall-clock instant with no chain position of its own, so
+  // the block count comes from an observation when one exists — and only then.
+  assert.equal(timing.waitedBlocks, 1, '10 - 9, the explorer observation height');
+
+  const noObservation = pairTiming({
+    declaredCreatedAtMs: 1_000,
+    includedHeight: 10,
+    includedTimestampMs: 9_000,
+  });
+  assert.equal(noObservation.waitedBlocks, null, 'no height to measure against, so null');
+  assert.equal(noObservation.waitedMs, 8_000, 'the wait in TIME is still exact');
+});
+
+test('with no declared time every existing precedence and null is unchanged', () => {
+  // Graceful degradation, restated as a property: passing declaredCreatedAtMs: null
+  // (what every pre-activation transaction yields) must reproduce the old answers.
+  const nodeWins = pairTiming({
+    declaredCreatedAtMs: null,
+    nodeTiming: { observed: true, firstSeenMs: 4_000, firstSeenHeight: 8 },
+    observation: { firstSeenMs: 5_000, firstSeenHeight: 9 },
+    includedHeight: 10,
+    includedTimestampMs: 9_000,
+  });
+  assert.equal(nodeWins.source, 'node');
+  assert.equal(nodeWins.declared, false);
+  assert.equal(nodeWins.firstSeenMs, 4_000);
+
+  const explorerFallback = pairTiming({
+    nodeTiming: { observed: false, firstSeenMs: null },
+    observation: { firstSeenMs: 5_000, firstSeenHeight: 9 },
+    includedHeight: 10,
+    includedTimestampMs: 9_000,
+  });
+  assert.equal(explorerFallback.source, 'explorer');
+  assert.equal(explorerFallback.firstSeenMs, 5_000);
+
+  const nobody = pairTiming({ includedHeight: 10, includedTimestampMs: 9_000 });
+  assert.equal(nobody.observed, false);
+  assert.equal(nobody.declared, false);
+  assert.equal(nobody.waitedMs, null);
+});
+
+test('the indexer prefers a declared creation time over its own observation', async () => {
+  const store = new Store();
+  const indexer = new Indexer({}, store);
+  // The explorer watched this transaction arrive at 5_000...
+  store.recordFirstSeen(hx(1), 5_000, 9);
+  const record = {
+    height: 10,
+    timestampMs: 9_000,
+    transactions: [
+      { id: hx(1), index: 0, signer: 'alice', timestampMs: 9_000,
+        action: stamped(1_000, { type: 'transfer', to: 'bob', amount: '1' }) },
+      { id: hx(2), index: 1, signer: 'carol', timestampMs: 9_000,
+        action: { type: 'transfer', to: 'dave', amount: '2' } },
+    ],
+  };
+  await indexer.attachTiming(record, 10);
+  // ...but the transaction said when it was made, and consensus bounded it.
+  assert.equal(record.transactions[0].timing.source, 'chain');
+  assert.equal(record.transactions[0].timing.firstSeenMs, 1_000);
+  assert.equal(record.transactions[0].timing.waitedMs, 8_000);
+  // A transaction that declared nothing is untouched by any of this.
+  assert.equal(record.transactions[1].timing.source, null);
+  assert.equal(record.transactions[1].timing.observed, false);
+});
+
+test('a fee-auction tip stays visible through a creation-time envelope', () => {
+  // `timestamped { tipped { transfer } }` is a legal shape: a transaction may be
+  // both timestamped and tipped. If the envelope hid the tip, the whole
+  // tipped-vs-untipped wait split — the point of the fee-auction view — would
+  // silently misclassify every timestamped bid as untipped.
+  const inner = { type: 'transfer', to: 'bob', amount: '1' };
+  const bare = { type: 'tipped', tip: '5000', inner };
+  const wrapped = stamped(1_000, bare);
+
+  assert.deepEqual(unwrapTimestamped(wrapped), bare);
+  assert.deepEqual(unwrapTipped(wrapped), inner, 'value accounting reaches the real action');
+  assert.equal(tipGrains(wrapped), 5000n, 'the bid is still counted');
+  assert.equal(isTipped(wrapped), true);
+
+  // And nothing about an ordinary transaction changes.
+  assert.equal(tipGrains(bare), 5000n);
+  assert.equal(isTipped(bare), true);
+  assert.equal(isTipped(inner), false);
+  assert.equal(tipGrains(inner), 0n);
+  assert.deepEqual(unwrapTimestamped(inner), inner, 'no envelope, no change');
+  assert.equal(unwrapTimestamped(null), null);
 });

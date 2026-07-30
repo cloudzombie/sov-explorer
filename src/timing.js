@@ -3,6 +3,13 @@
 //
 // Two independent sources feed this, and the explorer never blends them silently:
 //
+//   chain     — an `Action::Timestamped` envelope (v0.2.6, signal bit 3) carrying the
+//               sender's declared creation time, which CONSENSUS bounds against the
+//               including block's own timestamp. Strongest source, because it is a
+//               rule every node enforced rather than one node's memory — but it is a
+//               BOUNDED creation time, provably inside a window, never an exact
+//               attested instant. Only present once bit 3 activates and only on
+//               transactions whose sender chose to declare one.
 //   node      — `sov_getTxTiming`, the node's own mempool observation. Authoritative
 //               when present, because the node saw the transaction arrive on the wire.
 //   explorer  — this process's own `sov_getMempoolTxs` polling. Used when the node
@@ -37,6 +44,26 @@ function normalizeId(value) {
   return typeof value === 'string' && value ? value.toLowerCase() : null;
 }
 
+/**
+ * The CONSENSUS-BOUNDED creation time an `Action::Timestamped` envelope declares
+ * (v0.2.6, signal bit 3), or null when the transaction carries none — which is every
+ * transaction before bit 3 activates, and every one whose sender did not opt in.
+ *
+ * Consensus requires the envelope to be the OUTERMOST action and forbids nesting, so
+ * one level is the whole rule; the loop stays bounded regardless of what a node
+ * serves. Never throws and never guesses: an absent or malformed envelope is null.
+ */
+export function declaredCreationMs(action) {
+  let node = action;
+  for (let i = 0; i < 4 && node && typeof node === 'object'; i++) {
+    if (node.type !== 'timestamped') return null;
+    const declared = finiteInt(node.created_at_ms ?? node.createdAtMs);
+    if (declared !== null) return declared;
+    node = node.inner ?? null;
+  }
+  return null;
+}
+
 /** An empty, honest timing record: observed by nobody, therefore all nulls. */
 export function unobservedTiming(includedHeight = null, includedTimestampMs = null) {
   return {
@@ -48,6 +75,7 @@ export function unobservedTiming(includedHeight = null, includedTimestampMs = nu
     waitedBlocks: null,
     source: null,
     observed: false,
+    declared: false,
   };
 }
 
@@ -80,39 +108,65 @@ export function normalizeMempoolTx(entry, observedAtMs = Date.now(), chainHeight
 }
 
 /**
- * Pick the timing for ONE transaction from the node's answer and the explorer's own
- * observation, and derive the wait.
+ * Pick the timing for ONE transaction and derive the wait, from the strongest source
+ * that actually has an answer.
  *
- * The node wins when it actually observed the transaction (`observed: true` with a
- * real first-seen). `observed: false` — the honest "I never saw this in my mempool"
- * answer — falls through to the explorer's own record. When neither has one, every
- * timing field stays null: nothing is estimated or backfilled.
+ * Precedence, strongest first:
  *
- * `waitedMs` is (block timestamp − first seen) and `waitedBlocks` is (block height −
- * the height at which the transaction was first observed), so both are measured
- * against recorded observations rather than assumed from the block interval.
+ *   1. `chain`    — the transaction's OWN declared creation time, bounded by
+ *                   consensus against the including block's timestamp. Every node
+ *                   agrees on it, and it survives restarts and cold sync, because it
+ *                   is in the block. `source: 'chain'`.
+ *   2. `node`     — the node's own mempool observation (`observed: true` with a real
+ *                   first-seen). One node's memory; another node may differ.
+ *   3. `explorer` — this process's own polling record, when the node has no
+ *                   observation of its own.
+ *
+ * When none has one, every timing field stays null with `observed: false`: nothing is
+ * estimated or backfilled. A block timestamp says when a transaction was INCLUDED,
+ * never when it was made, so an unobserved transaction is reported as unobserved.
+ *
+ * `waitedMs` is (block timestamp − first seen/created) and `waitedBlocks` is (block
+ * height − the height at which the transaction was first observed). A chain-declared
+ * creation time has no associated height — it is a wall-clock instant, not a chain
+ * position — so `waitedBlocks` stays null unless an observation also supplied one.
  */
-export function pairTiming({ nodeTiming = null, observation = null, includedHeight, includedTimestampMs } = {}) {
+export function pairTiming({
+  declaredCreatedAtMs = null,
+  nodeTiming = null,
+  observation = null,
+  includedHeight,
+  includedTimestampMs,
+} = {}) {
   const height = finiteInt(includedHeight);
   const timestampMs = finiteInt(includedTimestampMs);
+  const declared = finiteInt(declaredCreatedAtMs);
   const nodeObserved = nodeTiming?.observed === true
     && finiteInt(nodeTiming?.firstSeenMs) !== null;
 
-  const firstSeenMs = nodeObserved
-    ? finiteInt(nodeTiming.firstSeenMs)
-    : finiteInt(observation?.firstSeenMs);
+  const firstSeenMs = declared !== null
+    ? declared
+    : nodeObserved
+      ? finiteInt(nodeTiming.firstSeenMs)
+      : finiteInt(observation?.firstSeenMs);
   if (firstSeenMs === null) return unobservedTiming(height, timestampMs);
 
-  const firstSeenHeight = nodeObserved
-    ? finiteInt(nodeTiming.firstSeenHeight)
-    : finiteInt(observation?.firstSeenHeight);
+  // A chain-declared creation time carries no height of its own. An observation's
+  // height is still used when one exists, so `waitedBlocks` stays available for a
+  // transaction this explorer also happened to watch arrive.
+  const firstSeenHeight = declared !== null
+    ? finiteInt(observation?.firstSeenHeight)
+    : nodeObserved
+      ? finiteInt(nodeTiming.firstSeenHeight)
+      : finiteInt(observation?.firstSeenHeight);
 
   // Prefer the source's own arithmetic when it supplied it (the node knows its own
   // inclusion timestamp exactly); otherwise derive it from the two observations.
-  const waitedMs = nodeObserved && finiteInt(nodeTiming.waitedMs) !== null
+  const waitedMs = declared === null && nodeObserved && finiteInt(nodeTiming.waitedMs) !== null
     ? finiteInt(nodeTiming.waitedMs)
     : timestampMs !== null ? timestampMs - firstSeenMs : null;
-  const waitedBlocks = nodeObserved && finiteInt(nodeTiming.waitedBlocks) !== null
+  const waitedBlocks = declared === null && nodeObserved
+    && finiteInt(nodeTiming.waitedBlocks) !== null
     ? finiteInt(nodeTiming.waitedBlocks)
     : height !== null && firstSeenHeight !== null ? height - firstSeenHeight : null;
 
@@ -123,8 +177,12 @@ export function pairTiming({ nodeTiming = null, observation = null, includedHeig
     includedTimestampMs: timestampMs,
     waitedMs,
     waitedBlocks,
-    source: nodeObserved ? 'node' : 'explorer',
+    source: declared !== null ? 'chain' : nodeObserved ? 'node' : 'explorer',
     observed: true,
+    // True only for `chain`: the value is a consensus-bounded property of the
+    // transaction, not one node's recollection. The UI uses this to say "made"
+    // rather than "first seen".
+    declared: declared !== null,
   };
 }
 

@@ -725,13 +725,21 @@ function fmtAge(ms) {
 // A transaction nobody observed pending — which is every transaction mined before
 // this shipped — shows "— / not observed" and is never given an estimated wait.
 const FIRST_SEEN_TOOLTIP = 'When this node (or the explorer polling its mempool) FIRST OBSERVED this transaction. It is not a self-reported creation time, and different nodes can legitimately report different first-seen times.';
+// A transaction that carries an `Action::Timestamped` envelope (v0.2.6, signal bit 3)
+// declares its OWN creation time, and consensus refuses to include it unless that
+// time falls inside a window anchored on the including block's timestamp. That is a
+// stronger claim than any observation — every node enforced it — but it is still a
+// BOUNDED time, not an exact attested instant, and the tooltip says exactly that.
+const MADE_TOOLTIP = 'The creation time this transaction DECLARED, which consensus refused to include unless it fell inside a bounded window around the including block\'s timestamp (at most 2 minutes ahead, at most 30 minutes behind). Every node enforced the same bound, so unlike a first-seen observation this does not vary between nodes — but it is a bounded time, not a proof of the exact instant.';
 const NOT_OBSERVED = `<span class="dim" title="Neither the node nor this explorer observed this transaction while it was pending, so its wait is unknown. It is never estimated.">— / not observed</span>`;
 
-const timingSourceNote = (source) => (source === 'node'
-  ? 'observed by the node itself (sov_getTxTiming)'
-  : source === 'explorer'
-    ? 'observed by this explorer polling the node\'s mempool'
-    : 'not observed');
+const timingSourceNote = (source) => (source === 'chain'
+  ? 'declared by the transaction itself, bounded by consensus against the block\'s timestamp'
+  : source === 'node'
+    ? 'observed by the node itself (sov_getTxTiming)'
+    : source === 'explorer'
+      ? 'observed by this explorer polling the node\'s mempool'
+      : 'not observed');
 
 /** Wait, in seconds and in blocks, for a table cell. */
 function waitCell(timing) {
@@ -755,12 +763,20 @@ function timingRows(timing, blockHeight, blockTimestampMs) {
   const blocks = t.waitedBlocks === null
     ? '<span class="dim">— block count unavailable</span>'
     : `· <b>${fmtNum(t.waitedBlocks)}</b> block${t.waitedBlocks === 1 ? '' : 's'}`;
+  // "Made" only when the transaction itself declared the time and consensus bounded
+  // it; otherwise it stays the honest "First seen".
+  const declared = t.source === 'chain';
+  const label = declared ? 'Made' : 'First seen';
+  const tooltip = declared ? MADE_TOOLTIP : FIRST_SEEN_TOOLTIP;
+  const from = declared
+    ? 'from the declared (consensus-bounded) creation time to the including block\'s header timestamp'
+    : 'from first observation to the including block\'s header timestamp';
   return `
-    <tr><td class="k">First seen</td><td class="v" title="${esc(FIRST_SEEN_TOOLTIP)}">${fmtDateTime(t.firstSeenMs)}
+    <tr><td class="k">${label}</td><td class="v" title="${esc(tooltip)}">${fmtDateTime(t.firstSeenMs)}
       <span class="dim">(${fmtAge(t.firstSeenMs)})${t.firstSeenHeight === null ? '' : ` · chain height #${fmtNum(t.firstSeenHeight)}`} — ${esc(timingSourceNote(t.source))}</span></td></tr>
     <tr><td class="k">Confirmed</td><td class="v">${confirmed}</td></tr>
     <tr><td class="k">Waited</td><td class="v"><b>${fmtDecimal((t.waitedMs ?? 0) / 1000, 1)}</b> s ${blocks}
-      <span class="dim">— from first observation to the including block's header timestamp</span></td></tr>`;
+      <span class="dim">— ${esc(from)}</span></td></tr>`;
 }
 
 const PAGE_SIZE = 50;

@@ -9,6 +9,8 @@
 import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
+import { isTipped, unwrapTimestamped } from './store.js';
+
 function relatedAccounts(tx) {
   const action = tx?.action;
   const accounts = new Set();
@@ -194,7 +196,14 @@ export class SqliteArchive {
     `);
     this.db.exec(`
       UPDATE transactions
-      SET action_type = json_extract(record_json, '$.action.type')
+      SET action_type = COALESCE(
+        -- A timestamped envelope is transparent (see the insert path); rows
+        -- written before v0.2.6 can never carry one, so this only matters for a
+        -- re-backfill of rows written after it.
+        CASE WHEN json_extract(record_json, '$.action.type') = 'timestamped'
+             THEN json_extract(record_json, '$.action.inner.type') END,
+        json_extract(record_json, '$.action.type')
+      )
       WHERE action_type IS NULL
     `);
 
@@ -437,6 +446,8 @@ export class SqliteArchive {
     `)?.all(...params, safeLimit) ?? [];
     return rows.map((row) => ({
       blockHeight: Number(row.block_height),
+      // `action_type` is already the EFFECTIVE type (a creation-time envelope is
+      // unwrapped at write time), so a timestamped tip is still counted as a bid.
       tipped: row.action_type === 'tipped',
       waitedMs: row.waited_ms === null || row.waited_ms === undefined ? null : Number(row.waited_ms),
       waitedBlocks: row.waited_blocks === null || row.waited_blocks === undefined
@@ -528,7 +539,13 @@ export class SqliteArchive {
         tx.index ?? 0,
         tx.signer ?? null,
         cp,
-        tx.action?.type ?? null,
+        // The EFFECTIVE action type: a `timestamped` creation-time envelope
+        // (v0.2.6) is metadata about when a transaction was made, not a kind of
+        // action, so it is transparent here. Without this every timestamped
+        // transaction would be filed under a single "timestamped" bucket and
+        // vanish from every action-type filter, and the tipped/untipped wait
+        // split would misclassify a timestamped tip as untipped.
+        unwrapTimestamped(tx.action)?.type ?? tx.action?.type ?? null,
         tx.executionStatus ?? tx.receipt?.status?.status ?? tx.receipt?.status ?? null,
         tx.timestampMs ?? record.timestampMs ?? null,
         JSON.stringify(stored),

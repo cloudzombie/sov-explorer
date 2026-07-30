@@ -22,24 +22,51 @@ const SUPPLY_CAP_GRAINS = 21_000_000n * GRAINS_PER_XUS;
 // count is not derivable from chain data and is never claimed.
 export const MINER_WINDOW_BLOCKS = 576;
 
-/** Unwrap a fee-auction `tipped` envelope (v0.1.98) to the action it executes.
- * Consensus forbids nested tips, but decoding stays bounded regardless. */
-export function unwrapTipped(action) {
+/** Unwrap a `timestamped` creation-time envelope (v0.2.6, signal bit 3) to the
+ * action it carries. Consensus requires it to be the OUTERMOST action and forbids
+ * nesting, so one level is the whole rule; the loop is bounded regardless. Returns
+ * the action unchanged when there is no envelope, so this is safe to call on every
+ * transaction from every node version. */
+export function unwrapTimestamped(action) {
   let inner = action;
-  for (let i = 0; i < 4 && inner && typeof inner === 'object' && inner.type === 'tipped'; i++) {
+  for (let i = 0; i < 4 && inner && typeof inner === 'object' && inner.type === 'timestamped'; i++) {
     inner = inner.inner ?? null;
   }
   return inner;
 }
 
-/** The XUS grains a `tipped` envelope bids to the block's miner (0n when untipped). */
+/** Unwrap a fee-auction `tipped` envelope (v0.1.98) to the action it executes.
+ * Consensus forbids nested tips, but decoding stays bounded regardless.
+ *
+ * A creation-time envelope is unwrapped FIRST: `timestamped { tipped { … } }` is a
+ * legal shape (a transaction may be both timestamped and tipped), and without this
+ * the tip — and the inner action's value — would be invisible to every caller. */
+export function unwrapTipped(action) {
+  let inner = unwrapTimestamped(action);
+  for (let i = 0; i < 4 && inner && typeof inner === 'object' && inner.type === 'tipped'; i++) {
+    inner = unwrapTimestamped(inner.inner ?? null);
+  }
+  return inner;
+}
+
+/** The XUS grains a `tipped` envelope bids to the block's miner (0n when untipped).
+ * Reads through a `timestamped` envelope, so a timestamped tip still counts as a
+ * bid in the fee auction. */
 export function tipGrains(action) {
-  if (!action || typeof action !== 'object' || action.type !== 'tipped') return 0n;
+  const a = unwrapTimestamped(action);
+  if (!a || typeof a !== 'object' || a.type !== 'tipped') return 0n;
   try {
-    return BigInt(action.tip ?? 0);
+    return BigInt(a.tip ?? 0);
   } catch {
     return 0n;
   }
+}
+
+/** Whether a transaction carries a fee-auction tip, seen through a creation-time
+ * envelope. The predicate the tipped/untipped wait split is built on. */
+export function isTipped(action) {
+  return tipGrains(action) > 0n
+    || unwrapTimestamped(action)?.type === 'tipped';
 }
 
 /** The account a transaction touches besides its signer, if any. */
@@ -360,7 +387,7 @@ export class Store {
         const tx = block.transactions[i];
         out.push({
           blockHeight: tx.blockHeight,
-          tipped: tx.action?.type === 'tipped',
+          tipped: isTipped(tx.action),
           waitedMs: tx.timing?.waitedMs ?? null,
           waitedBlocks: tx.timing?.waitedBlocks ?? null,
           source: tx.timing?.source ?? null,
