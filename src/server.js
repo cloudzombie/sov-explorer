@@ -90,6 +90,7 @@ const CONTENT_TYPES = {
   '.svg': 'image/svg+xml',
   '.json': 'application/json; charset=utf-8',
   '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
 };
 
 const SECURITY_HEADERS = {
