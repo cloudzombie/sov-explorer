@@ -1,7 +1,36 @@
-/* Sovereign Explorer - Blockchair-inspired dark chain telemetry UI. */
+/* Sovereign Explorer — a precision instrument for a sovereign reserve asset.
+   Terminal density with engraved-certificate typography: Fraunces (display
+   serif) for the wordmark and section heads, IBM Plex Mono for every figure
+   (monospaced ⇒ tabular by construction — live cells never jitter), and a
+   restrained bullion-gold accent reserved for chrome. Semantic colors
+   (ok/warn/danger, pool v1-blue / PQ-green) are meaning, not decoration,
+   and are never repainted. */
+
+/* Self-hosted, latin-subset, ~55 KB total. No external requests (CSP: self). */
+@font-face {
+  font-family: "Fraunces";
+  src: url("/fonts/fraunces-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/fonts/plex-mono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/fonts/plex-mono-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
 
 :root {
-  --bg: #07080d;
+  --bg: #05060a;
   --bg-2: #090b12;
   --panel: #0d1018;
   --panel-2: #10141f;
@@ -9,15 +38,39 @@
   --line: #1c2130;
   --line-soft: #151a26;
   --text: #f3f5fb;
-  --muted: #858a96;
+  --muted: #8b90a0;
   --dim: #737b8b;
   --blue: #3f6fff;
   --blue-soft: #12245b;
   --ok: #52d68d;
   --warn: #e5a74f;
   --danger: #dd6b78;
-  --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --mono: "SF Mono", "JetBrains Mono", "Fira Mono", Menlo, Consolas, monospace;
+  /* features.css aliases (were referenced but previously undefined) */
+  --green: var(--ok);
+  --yellow: var(--warn);
+  /* Signature accent: bullion gold. Chrome only (seal, wordmark, eyebrows,
+     hairlines, selection) — never on status pills or data, so it can never be
+     confused with the amber `--warn` semantic. */
+  --gold: #d2b273;
+  --gold-bright: #e8cf9a;
+  --gold-soft: rgba(210, 178, 115, 0.55);
+  --gold-faint: rgba(210, 178, 115, 0.16);
+  --radius: 10px;
+  --serif: "Fraunces", "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* Elevation recipe shared by every raised surface: hairline top-light over
+     a soft drop — depth you feel, not see. */
+  --surface: linear-gradient(180deg, rgba(255, 255, 255, 0.016), rgba(255, 255, 255, 0) 46%), var(--panel);
+  --elev:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 1px 2px rgba(0, 0, 0, 0.45),
+    0 12px 32px -18px rgba(0, 0, 0, 0.6);
+}
+
+::selection {
+  background: rgba(210, 178, 115, 0.28);
+  color: var(--text);
 }
 
 * {
@@ -61,11 +114,51 @@ body {
 
 body {
   min-height: 100vh;
-  background: linear-gradient(180deg, var(--bg-2) 0%, var(--bg) 100%);
+  /* Atmosphere: a faint instrument-lamp glow at the top of the field, a whisper
+     of gold at the horizon, then the deep ground. */
+  background:
+    radial-gradient(1200px 540px at 50% -160px, rgba(63, 111, 255, 0.075), transparent 70%),
+    radial-gradient(900px 420px at 88% -80px, rgba(210, 178, 115, 0.04), transparent 62%),
+    linear-gradient(180deg, var(--bg-2) 0%, var(--bg) 560px);
   color: var(--text);
   font-family: var(--sans);
   font-size: 15px;
+  /* Every numeral on the page is tabular — live-updating figures never jitter,
+     whether set in the mono face (fixed-pitch by construction) or the sans. */
+  font-variant-numeric: tabular-nums;
   line-height: 1.5;
+}
+
+/* Texture layer: fine engineering grid + photographic grain, fixed to the
+   viewport. Sits behind all content (first-painted child of body), so it can
+   never cost legibility. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' fill='%23ffffff' opacity='0.045'/%3E%3C/svg%3E"),
+    linear-gradient(rgba(135, 164, 255, 0.023) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(135, 164, 255, 0.023) 1px, transparent 1px);
+  background-size: 160px 160px, 56px 56px, 56px 56px;
+}
+
+/* Quiet, instrument-grade scrollbars (WebKit/Blink; Firefox keeps its own). */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #232a3c;
+  border: 2px solid var(--bg);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2f3850;
 }
 
 a {
@@ -86,8 +179,9 @@ a:hover {
   align-items: center;
   gap: 22px;
   padding: 14px 28px;
-  background: rgba(8, 10, 16, 0.96);
+  background: linear-gradient(180deg, rgba(10, 12, 19, 0.97), rgba(7, 9, 14, 0.94));
   border-bottom: 1px solid var(--line);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.025) inset;
   backdrop-filter: blur(16px);
 }
 
@@ -115,17 +209,18 @@ a:hover {
 
 .brand-text b {
   color: var(--text);
-  font-family: var(--mono);
-  font-size: 20px;
-  letter-spacing: 0;
+  font-family: var(--serif);
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .brand-text small {
   margin-top: 3px;
-  color: var(--muted);
-  font-size: 10px;
+  color: var(--gold-soft);
+  font-size: 9.5px;
   font-weight: 700;
-  letter-spacing: 1.6px;
+  letter-spacing: 2.4px;
   text-transform: uppercase;
 }
 
@@ -139,20 +234,25 @@ a:hover {
   min-width: 0;
   flex: 1;
   height: 40px;
-  background: #0a0d14;
+  background: rgba(5, 7, 11, 0.85);
   border: 1px solid var(--line);
   border-right: none;
   border-radius: 8px 0 0 8px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.4);
   color: var(--text);
   font-family: var(--mono);
   font-size: 13px;
   padding: 0 14px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .search input:focus {
   outline: none;
   border-color: #2f5de4;
-  box-shadow: inset 0 0 0 1px rgba(63, 111, 255, 0.18);
+  box-shadow:
+    inset 0 1px 3px rgba(0, 0, 0, 0.4),
+    inset 0 0 0 1px rgba(63, 111, 255, 0.18),
+    0 0 0 3px rgba(63, 111, 255, 0.12);
 }
 
 .search input::placeholder {
@@ -163,16 +263,19 @@ a:hover {
   height: 40px;
   border: 1px solid #2f5de4;
   border-radius: 0 8px 8px 0;
-  background: var(--blue);
+  background: linear-gradient(180deg, #4d79ff, #3260ea);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
   color: #fff;
   cursor: pointer;
   font-size: 13px;
   font-weight: 700;
+  letter-spacing: 0.01em;
   padding: 0 18px;
+  transition: filter 0.15s ease;
 }
 
 .search button:hover {
-  background: #5b82ff;
+  filter: brightness(1.12);
 }
 
 .nav {
@@ -184,11 +287,13 @@ a:hover {
 
 .nav a {
   border-radius: 8px;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 700;
-  padding: 8px 11px;
+  color: var(--dim);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 8px 10px;
   white-space: nowrap;
+  transition: color 0.12s ease, background 0.12s ease;
 }
 
 .nav a:hover {
@@ -198,6 +303,7 @@ a:hover {
 
 .nav a.active {
   background: var(--blue-soft);
+  box-shadow: inset 0 1px 0 rgba(135, 164, 255, 0.14);
   color: #aebfff;
 }
 
@@ -273,7 +379,12 @@ a:hover {
   background: var(--panel);
   white-space: nowrap;
 }
+.pager-btn {
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
 .pager-btn:hover {
+  background: var(--panel-2);
   border-color: var(--blue);
   color: #aebfff;
 }
@@ -527,25 +638,46 @@ h1,
 h2,
 h3 {
   color: var(--text);
-  font-family: var(--sans);
-  font-weight: 750;
-  letter-spacing: 0;
+  font-family: var(--serif);
+  font-weight: 600;
+  letter-spacing: 0.002em;
 }
 
 h1 {
-  font-size: 30px;
-  line-height: 1.15;
+  font-size: 34px;
+  line-height: 1.12;
   margin: 0 0 20px;
 }
 
 h2 {
-  font-size: 20px;
+  font-size: 21px;
   line-height: 1.2;
-  margin: 28px 0 14px;
+  margin: 30px 0 14px;
+}
+
+/* Section heads carry a short gold tick — the one ornamental mark in the
+   system, so the eye can find section boundaries at a glance. */
+main h2::before {
+  content: "";
+  display: inline-block;
+  width: 17px;
+  height: 2px;
+  margin-right: 10px;
+  vertical-align: 6px;
+  background: linear-gradient(90deg, var(--gold), rgba(210, 178, 115, 0.15));
+}
+
+/* …but never inside data panels or item cards, where a tick would read as data. */
+.panel h2::before,
+.watch-card h2::before,
+.proof-heading h2::before,
+.commitment-compare h2::before,
+.sns-card h2::before {
+  content: none;
 }
 
 h3 {
-  font-size: 16px;
+  font-size: 16.5px;
   margin: 22px 0 10px;
 }
 
@@ -560,17 +692,33 @@ h3 {
 }
 
 .hero-strip {
+  position: relative;
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
   gap: 24px;
-  margin: 0 0 28px;
-  padding: 0 2px;
+  margin: 6px 0 30px;
+  padding: 0 2px 22px;
+  /* An engraved rule closes the masthead of the page: gold at the left edge
+     dissolving into the structural hairline. */
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.hero-strip::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: -1px;
+  width: 220px;
+  height: 1px;
+  background: linear-gradient(90deg, var(--gold), transparent);
 }
 
 .hero-strip h1 {
-  font-family: var(--mono);
-  font-size: clamp(32px, 4vw, 64px);
+  font-family: var(--serif);
+  font-size: clamp(40px, 4.6vw, 78px);
+  font-weight: 600;
+  letter-spacing: -0.005em;
   line-height: 0.95;
   margin: 0;
 }
@@ -578,8 +726,13 @@ h3 {
 .hero-strip p {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 14px;
-  margin: 10px 0 0;
+  font-size: 13.5px;
+  margin: 12px 0 0;
+}
+
+.hero-strip p span {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
 
 .hero-meta {
@@ -687,16 +840,19 @@ h3 {
 }
 
 .stat-card {
-  background: var(--panel);
+  background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
+  box-shadow: var(--elev);
   min-height: 560px;
   padding: 38px 36px 32px;
 }
 
 .stat-card h2 {
-  font-size: 24px;
-  margin: 0 0 30px;
+  font-size: 23px;
+  margin: 0 0 26px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .stat-item {
@@ -722,9 +878,9 @@ h3 {
 
 .stat-label {
   color: var(--dim);
-  font-size: 13px;
-  font-weight: 750;
-  letter-spacing: 1px;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 
@@ -732,7 +888,9 @@ h3 {
   color: var(--text);
   font-family: var(--mono);
   font-size: clamp(19px, 1.45vw, 25px);
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
   line-height: 1.25;
   margin-top: 12px;
   overflow-wrap: anywhere;
@@ -765,17 +923,23 @@ h3 {
 }
 
 .card {
-  background: var(--panel);
+  background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
+  box-shadow: var(--elev);
   padding: 18px;
+  transition: border-color 0.15s ease;
+}
+
+.card:hover {
+  border-color: #262d40;
 }
 
 .card .label {
   color: var(--dim);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 1px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 
@@ -783,7 +947,9 @@ h3 {
   color: var(--text);
   font-family: var(--mono);
   font-size: 25px;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
   line-height: 1.2;
   margin-top: 8px;
   overflow-wrap: anywhere;
@@ -803,9 +969,10 @@ h3 {
 }
 
 .panel {
-  background: var(--panel);
+  background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
+  box-shadow: var(--elev);
   min-width: 0;
   /* `hidden` keeps content inside the rounded corners, but on a narrow viewport it
      also CLIPPED wide tables (the consensus-deployment table is ~680px of real
@@ -834,12 +1001,12 @@ table {
 }
 
 th {
-  background: #0a0d14;
+  background: linear-gradient(180deg, #0c0f17, #090c13);
   border-bottom: 1px solid var(--line);
   color: var(--dim);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 1px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.11em;
   padding: 12px 14px;
   text-align: left;
   text-transform: uppercase;
@@ -848,6 +1015,7 @@ th {
 td {
   border-bottom: 1px solid var(--line-soft);
   color: #dce1ef;
+  font-variant-numeric: tabular-nums;
   padding: 11px 14px;
   vertical-align: top;
 }
@@ -1118,7 +1286,8 @@ details.raw pre {
   border-radius: 12px;
   background:
     radial-gradient(circle at 100% 0, rgba(63, 111, 255, 0.08), transparent 36%),
-    var(--panel);
+    var(--surface);
+  box-shadow: var(--elev);
   padding: 22px;
 }
 
@@ -1140,10 +1309,11 @@ details.raw pre {
 }
 
 .eyebrow {
-  color: var(--dim);
+  color: var(--gold-soft);
   font-size: 10px;
-  font-weight: 850;
-  letter-spacing: 0.13em;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
 }
 
 .proof-state {
@@ -1373,9 +1543,21 @@ details.raw pre {
   font-family: var(--mono);
 }
 
-@media (max-width: 1180px) {
+/* The 12-link nav cannot fit beside the search field below ~1440px — earlier
+   it was let go until 1180px and painted over the search box in between. */
+@media (max-width: 1440px) {
   .masthead {
     grid-template-columns: auto 1fr auto;
+  }
+
+  /* Keep the segmented network switch hugging its content instead of
+     stretching across its grid cell, and pin the status light to the right. */
+  .netsw {
+    justify-self: start;
+  }
+
+  .conn {
+    justify-self: end;
   }
 
   .nav {
@@ -1586,9 +1768,10 @@ details.raw pre {
   gap: 14px;
 }
 .sns-card {
-  background: var(--panel);
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 12px;
+  box-shadow: var(--elev);
   padding: 18px 20px;
   transition: border-color 0.15s ease, transform 0.15s ease;
 }
@@ -1694,9 +1877,10 @@ details.raw pre {
 
 /* item 1: bit-2 (post-quantum) signaling progress toward the 90% threshold. */
 .signal-panel {
-  background: var(--panel);
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 12px;
+  box-shadow: var(--elev);
   padding: 14px 18px;
   margin: 18px 0 0;
 }
@@ -2082,5 +2266,48 @@ a.trust-chip:hover {
 @media (prefers-reduced-motion: reduce) {
   .toast {
     transition: opacity 0.2s ease;
+  }
+}
+
+/* ==========================================================================
+   Page-load choreography — one staggered reveal per navigation
+   ==========================================================================
+   Each route's top-level sections rise in over ~⅓s. The blocks route marks the
+   view with data-tip-height and re-renders on every live block, so it opts out
+   below — content there must never pulse on arrival. The global
+   prefers-reduced-motion kill switch at the top of the media section already
+   disables this entirely. */
+@keyframes view-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  main > * {
+    animation: view-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  }
+  main > :nth-child(2) {
+    animation-delay: 0.05s;
+  }
+  main > :nth-child(3) {
+    animation-delay: 0.1s;
+  }
+  main > :nth-child(4) {
+    animation-delay: 0.15s;
+  }
+  main > :nth-child(5) {
+    animation-delay: 0.2s;
+  }
+  main > :nth-child(6) {
+    animation-delay: 0.25s;
+  }
+  main > :nth-child(n + 7) {
+    animation-delay: 0.3s;
+  }
+  /* Live-refreshing routes (blocks list) re-render per block: no replay. */
+  main[data-tip-height] > * {
+    animation: none;
   }
 }
