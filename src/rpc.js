@@ -455,6 +455,15 @@ export class SovereignRpc {
   mintReward() { return this.call('sov_getMintReward'); }
   /** The chain/genesis-bound signing tags the ACTIVE tx-domain deployment enforces. */
   signingDomain() { return this.call('sov_getSigningDomain'); }
+  /** One page of the node's own mempool, each entry carrying the node's first-seen
+   * observation. Node-local and non-consensus. A node without this method errors
+   * with JSON-RPC -32601; the indexer detects that once and stops asking. */
+  mempoolTxs(offset = 0, limit = 256) { return this.call('sov_getMempoolTxs', { offset, limit }); }
+  /** First-seen / inclusion timing for every transaction in ONE block — one request
+   * per block, not one per transaction. Same -32601 contract as `mempoolTxs`. */
+  blockTxTiming(height) { return this.call('sov_getTxTiming', { height }); }
+  /** First-seen / inclusion timing for a single transaction id. */
+  txTiming(txId) { return this.call('sov_getTxTiming', { txId }); }
 
   listTokens(offset = 0, limit = 100) { return this.call('sov_listTokens', { offset, limit }); }
   tokenInfo(asset) { return this.call('sov_getTokenInfo', { hash: asset }); }

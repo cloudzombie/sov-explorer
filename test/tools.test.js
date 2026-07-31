@@ -14,6 +14,7 @@ const {
   blockUnit,
   poolBlocks,
   relayAvailability,
+  timingSummary,
 } = await import('../web/tools.js');
 
 test('watchlists persist locally without a server dependency', () => {
@@ -52,6 +53,46 @@ test('poolBlocks splits a value into whole blocks plus a sub-unit remainder', ()
   assert.equal(z.full, 0);
   assert.equal(z.partial, 0);
   assert.equal(poolBlocks(-10, 1000).full, 0); // clamps negatives, never NaN
+});
+
+test('timingSummary renders a real observation and refuses to invent a missing one', () => {
+  assert.deepEqual(timingSummary({
+    firstSeenMs: 1_753_900_000_000,
+    firstSeenHeight: 14_400,
+    waitedMs: 300_000,
+    waitedBlocks: 2,
+    source: 'node',
+    observed: true,
+  }), {
+    observed: true,
+    source: 'node',
+    firstSeenMs: 1_753_900_000_000,
+    firstSeenHeight: 14_400,
+    waitedMs: 300_000,
+    waitedSeconds: 300,
+    waitedBlocks: 2,
+  });
+
+  // Unobserved, absent, and malformed all collapse to the same honest "unknown" —
+  // the UI shows "— / not observed" rather than a guessed wait.
+  for (const timing of [
+    null,
+    undefined,
+    { observed: false, firstSeenMs: null, waitedMs: null },
+    { observed: true, firstSeenMs: null, waitedMs: 5_000 },
+  ]) {
+    const summary = timingSummary(timing);
+    assert.equal(summary.observed, false);
+    assert.equal(summary.firstSeenMs, null);
+    assert.equal(summary.waitedMs, null);
+    assert.equal(summary.waitedSeconds, null);
+    assert.equal(summary.waitedBlocks, null);
+  }
+
+  // Observed first-seen but no wait yet (still pending) keeps the wait null.
+  const pending = timingSummary({ observed: true, firstSeenMs: 10, waitedMs: null, waitedBlocks: null });
+  assert.equal(pending.observed, true);
+  assert.equal(pending.waitedMs, null);
 });
 
 test('relayAvailability keeps unavailable configured relays visible without degrading quorum', () => {

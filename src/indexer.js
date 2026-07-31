@@ -4,6 +4,14 @@
 // invents. It is resilient to transient RPC errors — a failed tick is retried on
 // the next interval.
 
+import {
+  declaredCreationMs,
+  indexBlockTiming,
+  isMethodNotFound,
+  normalizeMempoolTx,
+  pairTiming,
+} from './timing.js';
+
 export function confirmationCount(head, height) {
   return Math.max(0, head - height + 1);
 }
@@ -98,10 +106,164 @@ export class Indexer {
     this.onBlock = opts.onBlock ?? null;
     this.onTx = opts.onTx ?? null;
     this.onReset = opts.onReset ?? null;
+    // Mempool polling: pages of at most 256 (the node's hard cap), bounded so a
+    // large mempool can never turn one tick into an unbounded request loop.
+    this.mempoolPageLimit = Math.max(1, Math.min(256, opts.mempoolPageLimit ?? 256));
+    this.mempoolMaxPages = Math.max(1, Math.min(64, opts.mempoolMaxPages ?? 8));
+    // Node timing is only requested for blocks near the head: a node's mempool
+    // observations do not reach back into deep history, so asking during a cold
+    // backfill would spend one request per block to be told "not observed".
+    this.timingLookbackBlocks = Math.max(0, opts.timingLookbackBlocks ?? 128);
+    // How long an RPC the node answered with method-not-found stays written off
+    // before it is probed again (a relay can be upgraded under a running explorer).
+    this.timingProbeIntervalMs = opts.timingProbeIntervalMs ?? 10 * 60_000;
+    this.observationRetentionMs = opts.observationRetentionMs ?? 7 * 24 * 60 * 60_000;
+    this._unsupportedUntil = new Map(); // rpc key -> timestamp to re-probe at
+    this._lastObservationPruneAt = 0;
     this._running = false;
     this._timer = null;
     this._lastStatsAt = 0;
     this._archiveRestored = false;
+  }
+
+  /** False while an RPC the node rejected as unknown is still written off. */
+  _supports(key) {
+    const retryAt = this._unsupportedUntil.get(key);
+    return retryAt === undefined || Date.now() >= retryAt;
+  }
+
+  _markUnsupported(key) {
+    this._unsupportedUntil.set(key, Date.now() + this.timingProbeIntervalMs);
+    this.store.timingSupport[key] = false;
+  }
+
+  _markSupported(key) {
+    this._unsupportedUntil.delete(key);
+    this.store.timingSupport[key] = true;
+  }
+
+  /**
+   * Poll the node's mempool and record a first-seen observation for every
+   * transaction id seen for the FIRST time. This also captures transactions the node
+   * later prunes without mining, and it is what makes a wait measurable at all —
+   * a block says when a transaction was included, never when it appeared.
+   *
+   * Paged with `offset`/`hasMore` up to `mempoolMaxPages`. A node without
+   * `sov_getMempoolTxs` answers method-not-found exactly once: the method is then
+   * written off until the next probe window and the snapshot says so plainly.
+   */
+  async pollMempool(head) {
+    if (typeof this.rpc.mempoolTxs !== 'function') return null;
+    if (!this._supports('mempool')) return null;
+    const txs = [];
+    let offset = 0;
+    let truncated = false;
+    let txCount = null;
+    let queuedCount = null;
+    for (let page = 0; page < this.mempoolMaxPages; page++) {
+      let response;
+      try {
+        response = await this.rpc.mempoolTxs(offset, this.mempoolPageLimit);
+      } catch (error) {
+        if (isMethodNotFound(error)) {
+          this._markUnsupported('mempool');
+          this.store.setMempoolSnapshot({
+            available: false,
+            reason: 'this node does not serve sov_getMempoolTxs',
+            txs: [],
+            txCount: null,
+            queuedCount: null,
+            truncated: false,
+            updatedAt: Date.now(),
+          });
+          return null;
+        }
+        return null; // transient relay error: the next tick retries
+      }
+      this._markSupported('mempool');
+      const entries = Array.isArray(response?.txs) ? response.txs : [];
+      const observedAt = Date.now();
+      for (const entry of entries) {
+        const tx = normalizeMempoolTx(entry, observedAt, head);
+        if (!tx) continue;
+        // The chain height recorded alongside first-seen is the head at the moment
+        // THIS explorer first saw the transaction, so `waitedBlocks` is a difference
+        // of two real heights rather than an estimate from the block interval.
+        const observation = this.store.recordFirstSeen(tx.txId, tx.firstSeenMs, head);
+        txs.push({
+          ...tx,
+          firstSeenMs: observation?.firstSeenMs ?? tx.firstSeenMs,
+          firstSeenHeight: observation?.firstSeenHeight ?? null,
+        });
+      }
+      txCount = Number.isFinite(Number(response?.txCount)) ? Number(response.txCount) : txCount;
+      queuedCount = Number.isFinite(Number(response?.queuedCount))
+        ? Number(response.queuedCount)
+        : queuedCount;
+      if (!response?.hasMore || entries.length === 0) break;
+      offset += entries.length;
+      if (page === this.mempoolMaxPages - 1) truncated = true;
+    }
+    const snapshot = {
+      available: true,
+      reason: null,
+      txs,
+      txCount,
+      queuedCount,
+      truncated,
+      updatedAt: Date.now(),
+    };
+    this.store.setMempoolSnapshot(snapshot);
+    if (Date.now() - this._lastObservationPruneAt >= this.timingProbeIntervalMs) {
+      this._lastObservationPruneAt = Date.now();
+      this.store.archive?.pruneObservations?.(Date.now() - this.observationRetentionMs);
+    }
+    return snapshot;
+  }
+
+  /** The node's own timing for one block, indexed by transaction id, or null when
+   * the node cannot answer (older node, out of lookback, or a transient error). */
+  async blockTiming(height, head) {
+    if (typeof this.rpc.blockTxTiming !== 'function') return null;
+    if (!this._supports('timing')) return null;
+    if (Number.isFinite(head) && head - height > this.timingLookbackBlocks) return null;
+    try {
+      const response = await this.rpc.blockTxTiming(height);
+      this._markSupported('timing');
+      return indexBlockTiming(response);
+    } catch (error) {
+      if (isMethodNotFound(error)) this._markUnsupported('timing');
+      return null;
+    }
+  }
+
+  /**
+   * Attach first-seen / wait timing to every transaction in a block.
+   *
+   * A consensus-bounded creation time declared in the transaction itself wins when
+   * present; otherwise the node's own observation; otherwise the explorer's own
+   * recorded observation; when NONE has one the timing is
+   * present but every field is null with `observed: false`. Nothing is estimated,
+   * and transactions mined before this explorer started observing stay unobserved
+   * forever — that is the honest answer, not a defect.
+   */
+  async attachTiming(record, head = record.height) {
+    if (!record.transactions?.length) return;
+    const nodeTiming = await this.blockTiming(record.height, head);
+    for (const tx of record.transactions) {
+      const id = String(tx.id ?? '').toLowerCase();
+      tx.timing = pairTiming({
+        // The transaction's OWN consensus-bounded creation time, when it declared
+        // one. Preferred over any observation: it is in the block, so it survives a
+        // restart, a cold sync, and disagreement between nodes. Null — and therefore
+        // ignored — for every transaction before signal bit 3 activates.
+        declaredCreatedAtMs: declaredCreationMs(tx.action),
+        nodeTiming: nodeTiming?.get(id) ?? null,
+        observation: this.store.firstSeen(id),
+        includedHeight: record.height,
+        includedTimestampMs: tx.timestampMs ?? record.timestampMs,
+      });
+    }
   }
 
   /** Learn the chain id and genesis hash before the first sync. */
@@ -154,6 +316,7 @@ export class Indexer {
     const final = finalAtDepth(head, height, this.finalityDepth);
     const record = normalizeBlock(block, digest, final);
     await this.attachReceipts(record);
+    await this.attachTiming(record, head);
     return record;
   }
 
@@ -279,6 +442,10 @@ export class Indexer {
       await this.init();
       if (this.onReset) this.onReset();
     }
+    // Observe the mempool BEFORE indexing this tick's blocks, so a transaction that
+    // is about to be mined still gets a first-seen record. Reuses this same polling
+    // loop — there is no second scheduler — and is a no-op on a node without the RPC.
+    await this.pollMempool(head);
     const initial = this.store.tipHeight < 0;
     const from = initial ? Math.max(0, head - this.backfill + 1) : this.store.tipHeight + 1;
     const lag = Math.max(0, head - Math.max(-1, this.store.tipHeight));

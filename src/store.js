@@ -22,24 +22,51 @@ const SUPPLY_CAP_GRAINS = 21_000_000n * GRAINS_PER_XUS;
 // count is not derivable from chain data and is never claimed.
 export const MINER_WINDOW_BLOCKS = 576;
 
-/** Unwrap a fee-auction `tipped` envelope (v0.1.98) to the action it executes.
- * Consensus forbids nested tips, but decoding stays bounded regardless. */
-export function unwrapTipped(action) {
+/** Unwrap a `timestamped` creation-time envelope (v0.2.6, signal bit 3) to the
+ * action it carries. Consensus requires it to be the OUTERMOST action and forbids
+ * nesting, so one level is the whole rule; the loop is bounded regardless. Returns
+ * the action unchanged when there is no envelope, so this is safe to call on every
+ * transaction from every node version. */
+export function unwrapTimestamped(action) {
   let inner = action;
-  for (let i = 0; i < 4 && inner && typeof inner === 'object' && inner.type === 'tipped'; i++) {
+  for (let i = 0; i < 4 && inner && typeof inner === 'object' && inner.type === 'timestamped'; i++) {
     inner = inner.inner ?? null;
   }
   return inner;
 }
 
-/** The XUS grains a `tipped` envelope bids to the block's miner (0n when untipped). */
+/** Unwrap a fee-auction `tipped` envelope (v0.1.98) to the action it executes.
+ * Consensus forbids nested tips, but decoding stays bounded regardless.
+ *
+ * A creation-time envelope is unwrapped FIRST: `timestamped { tipped { … } }` is a
+ * legal shape (a transaction may be both timestamped and tipped), and without this
+ * the tip — and the inner action's value — would be invisible to every caller. */
+export function unwrapTipped(action) {
+  let inner = unwrapTimestamped(action);
+  for (let i = 0; i < 4 && inner && typeof inner === 'object' && inner.type === 'tipped'; i++) {
+    inner = unwrapTimestamped(inner.inner ?? null);
+  }
+  return inner;
+}
+
+/** The XUS grains a `tipped` envelope bids to the block's miner (0n when untipped).
+ * Reads through a `timestamped` envelope, so a timestamped tip still counts as a
+ * bid in the fee auction. */
 export function tipGrains(action) {
-  if (!action || typeof action !== 'object' || action.type !== 'tipped') return 0n;
+  const a = unwrapTimestamped(action);
+  if (!a || typeof a !== 'object' || a.type !== 'tipped') return 0n;
   try {
-    return BigInt(action.tip ?? 0);
+    return BigInt(a.tip ?? 0);
   } catch {
     return 0n;
   }
+}
+
+/** Whether a transaction carries a fee-auction tip, seen through a creation-time
+ * envelope. The predicate the tipped/untipped wait split is built on. */
+export function isTipped(action) {
+  return tipGrains(action) > 0n
+    || unwrapTimestamped(action)?.type === 'tipped';
 }
 
 /** The account a transaction touches besides its signer, if any. */
@@ -80,10 +107,27 @@ export function transactionCrypto(tx) {
 }
 
 export class Store {
-  constructor({ maxBlocks = 10_000, maxBytes = 256 * 1024 * 1024, archive = null } = {}) {
+  constructor({
+    maxBlocks = 10_000,
+    maxBytes = 256 * 1024 * 1024,
+    archive = null,
+    maxFirstSeen = 50_000,
+  } = {}) {
     this.maxBlocks = Math.max(1, maxBlocks);
     this.maxBytes = Math.max(1, maxBytes);
     this.archive = archive;
+    // The explorer's OWN mempool observations, kept in insertion order so the map
+    // stays bounded on a long-lived process. The durable copy lives in the archive;
+    // this is the hot lookup used while pairing a freshly indexed block.
+    this.maxFirstSeen = Math.max(1, maxFirstSeen);
+    this.mempoolFirstSeen = new Map(); // tx id -> { firstSeenMs, firstSeenHeight }
+    // Latest mempool page(s) as reported by the node, for the pending-transaction
+    // view. Null until the first successful poll; `available: false` once the node
+    // has told us it does not serve sov_getMempoolTxs.
+    this.mempoolSnapshot = null;
+    // Node support for the two timing RPCs: true, false (method not found), or null
+    // (not yet probed). Published so the UI can say WHY timing is absent.
+    this.timingSupport = { mempool: null, timing: null };
     this.archiveError = null;
     this._statsVersion = 0;
     this._statsCache = null;
@@ -145,6 +189,8 @@ export class Store {
     this.heightByHash.clear();
     this.txById.clear();
     this.txIdsByAccount.clear();
+    this.mempoolFirstSeen.clear();
+    this.mempoolSnapshot = null;
     this.proposers.clear();
     this.miners = [];
     this.supply = null;
@@ -280,6 +326,76 @@ export class Store {
       }
       this.minHeight += 1;
     }
+  }
+
+  /**
+   * Record that this explorer saw a transaction in the node's mempool. The FIRST
+   * observation wins, in memory and in the archive alike: a transaction that sits
+   * pending across many polls keeps the moment it was first seen. Returns the
+   * observation on record.
+   */
+  recordFirstSeen(txId, firstSeenMs, firstSeenHeight = null) {
+    const id = String(txId ?? '').toLowerCase();
+    if (!id || !Number.isFinite(Number(firstSeenMs))) return null;
+    const existing = this.firstSeen(id);
+    if (existing) return existing;
+    const observation = {
+      firstSeenMs: Math.trunc(Number(firstSeenMs)),
+      firstSeenHeight: Number.isFinite(Number(firstSeenHeight))
+        ? Math.trunc(Number(firstSeenHeight))
+        : null,
+    };
+    this.mempoolFirstSeen.set(id, observation);
+    while (this.mempoolFirstSeen.size > this.maxFirstSeen) {
+      this.mempoolFirstSeen.delete(this.mempoolFirstSeen.keys().next().value);
+    }
+    this.archive?.recordFirstSeen?.(id, observation.firstSeenMs, observation.firstSeenHeight);
+    return observation;
+  }
+
+  /** This explorer's own first-seen observation for a transaction, or null. */
+  firstSeen(txId) {
+    const id = String(txId ?? '').toLowerCase();
+    return this.mempoolFirstSeen.get(id) ?? this.archive?.firstSeen?.(id) ?? null;
+  }
+
+  /** Publish the latest mempool page(s) polled from the node (or its absence). */
+  setMempoolSnapshot(snapshot) {
+    this.mempoolSnapshot = snapshot;
+    this._touchStats();
+  }
+
+  /** The pending transaction the node is holding under this id, or null. */
+  pendingTransaction(txId) {
+    const id = String(txId ?? '').toLowerCase();
+    return this.mempoolSnapshot?.txs?.find((tx) => tx.txId === id) ?? null;
+  }
+
+  /**
+   * Wait samples for the fee-auction statistics. Served from the durable archive
+   * when there is one (full history); otherwise from the bounded in-memory window,
+   * which is smaller but equally real. Unobserved transactions are INCLUDED with
+   * `observed: false` so the caller can report the exclusion count honestly.
+   */
+  timingSample({ limit = 2_000 } = {}) {
+    if (typeof this.archive?.timingSample === 'function') return this.archive.timingSample({ limit });
+    const out = [];
+    for (let h = this.tipHeight; h >= this.minHeight && out.length < limit; h--) {
+      const block = this.blocksByHeight.get(h);
+      if (!block) continue;
+      for (let i = block.transactions.length - 1; i >= 0 && out.length < limit; i--) {
+        const tx = block.transactions[i];
+        out.push({
+          blockHeight: tx.blockHeight,
+          tipped: isTipped(tx.action),
+          waitedMs: tx.timing?.waitedMs ?? null,
+          waitedBlocks: tx.timing?.waitedBlocks ?? null,
+          source: tx.timing?.source ?? null,
+          observed: !!tx.timing?.observed,
+        });
+      }
+    }
+    return out;
   }
 
   block(idOrHeight) {
@@ -745,6 +861,18 @@ export class Store {
         difficultyAlgo: this.difficulty?.algo ?? null,
       },
       last24h,
+      // Transaction-timing availability, stated rather than implied. `mempoolRpc` /
+      // `timingRpc` are the node's answers to sov_getMempoolTxs / sov_getTxTiming:
+      // false means the node returned method-not-found (every node deployed before
+      // those RPCs shipped), null means not probed yet. Timing is simply absent in
+      // that case — never estimated.
+      txTiming: {
+        mempoolRpc: this.timingSupport.mempool,
+        timingRpc: this.timingSupport.timing,
+        observationsRetained: this.mempoolFirstSeen.size,
+        pendingObserved: this.mempoolSnapshot?.available ? this.mempoolSnapshot.txs.length : null,
+        updatedAt: this.mempoolSnapshot?.updatedAt ?? null,
+      },
       mempool: {
         transactions: this.mempoolSize,
         transactionsPerSecond: null,

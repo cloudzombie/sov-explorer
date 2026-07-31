@@ -9,6 +9,8 @@
 import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
+import { isTipped, unwrapTimestamped } from './store.js';
+
 function relatedAccounts(tx) {
   const action = tx?.action;
   const accounts = new Set();
@@ -51,6 +53,11 @@ export class SqliteArchive {
     this.blockHeightStmt = this.db.prepare('SELECT record_json FROM blocks WHERE height = ?');
     this.blockHashStmt = this.db.prepare('SELECT record_json FROM blocks WHERE hash = ?');
     this.txStmt = this.db.prepare('SELECT record_json FROM transactions WHERE id = ?');
+    // A read-only replica cannot migrate. Against an archive written before timing
+    // shipped these statements simply do not prepare, and every timing read degrades
+    // to null rather than failing the whole replica.
+    this.txTimingStmt = this._tryPrepare('SELECT first_seen_ms, first_seen_height, waited_ms, waited_blocks, timing_source FROM transactions WHERE id = ?');
+    this.observationStmt = this._tryPrepare('SELECT first_seen_ms, first_seen_height FROM mempool_observations WHERE tx_id = ?');
     this.accountTxsStmt = this.db.prepare(`SELECT t.record_json FROM account_transactions a JOIN transactions t ON t.id = a.tx_id WHERE a.account = ? ORDER BY a.block_height DESC, a.tx_index DESC LIMIT ?`);
     this.recentStmt = this.db.prepare('SELECT record_json FROM blocks ORDER BY height DESC LIMIT ?');
     this.beforeStmt = this.db.prepare('SELECT record_json FROM blocks WHERE height <= ? ORDER BY height DESC LIMIT ?');
@@ -99,6 +106,19 @@ export class SqliteArchive {
         ON transactions(block_height DESC, tx_index DESC);
       CREATE INDEX IF NOT EXISTS transactions_signer_idx
         ON transactions(signer, block_height DESC, tx_index DESC);
+
+      -- First-seen observations captured by polling the node's mempool. Written
+      -- BEFORE a transaction is mined (and kept for transactions the node later
+      -- prunes without mining), so the wait can still be paired once the block
+      -- lands. Node-local, non-consensus: this is when THIS explorer first saw
+      -- the transaction, never a self-reported creation time.
+      CREATE TABLE IF NOT EXISTS mempool_observations (
+        tx_id TEXT PRIMARY KEY,
+        first_seen_ms INTEGER NOT NULL,
+        first_seen_height INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS mempool_observations_time_idx
+        ON mempool_observations(first_seen_ms);
 
       CREATE TABLE IF NOT EXISTS account_transactions (
         account TEXT NOT NULL,
@@ -159,6 +179,13 @@ export class SqliteArchive {
     );
     if (!txColumns.has('action_type')) this.db.exec('ALTER TABLE transactions ADD COLUMN action_type TEXT');
     if (!txColumns.has('execution_status')) this.db.exec('ALTER TABLE transactions ADD COLUMN execution_status TEXT');
+    // Timing columns are added in place on an existing archive. Rows written before
+    // this shipped simply have NULL timing — they are reported as "not observed",
+    // never backfilled with an estimate.
+    for (const column of ['first_seen_ms', 'first_seen_height', 'waited_ms', 'waited_blocks']) {
+      if (!txColumns.has(column)) this.db.exec(`ALTER TABLE transactions ADD COLUMN ${column} INTEGER`);
+    }
+    if (!txColumns.has('timing_source')) this.db.exec('ALTER TABLE transactions ADD COLUMN timing_source TEXT');
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS transactions_action_idx
         ON transactions(action_type, block_height DESC, tx_index DESC);
@@ -169,7 +196,14 @@ export class SqliteArchive {
     `);
     this.db.exec(`
       UPDATE transactions
-      SET action_type = json_extract(record_json, '$.action.type')
+      SET action_type = COALESCE(
+        -- A timestamped envelope is transparent (see the insert path); rows
+        -- written before v0.2.6 can never carry one, so this only matters for a
+        -- re-backfill of rows written after it.
+        CASE WHEN json_extract(record_json, '$.action.type') = 'timestamped'
+             THEN json_extract(record_json, '$.action.inner.type') END,
+        json_extract(record_json, '$.action.type')
+      )
       WHERE action_type IS NULL
     `);
 
@@ -188,9 +222,21 @@ export class SqliteArchive {
     this.insertTxStmt = this.db.prepare(`
       INSERT OR REPLACE INTO transactions(
         id, block_height, tx_index, signer, counterparty, action_type,
-        execution_status, timestamp_ms, record_json
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        execution_status, timestamp_ms, record_json,
+        first_seen_ms, first_seen_height, waited_ms, waited_blocks, timing_source
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
+    // The FIRST observation wins: a later poll must never move first-seen forward.
+    this.insertObservationStmt = this.db.prepare(`
+      INSERT OR IGNORE INTO mempool_observations(tx_id, first_seen_ms, first_seen_height)
+      VALUES(?, ?, ?)
+    `);
+    this.observationStmt = this.db.prepare(
+      'SELECT first_seen_ms, first_seen_height FROM mempool_observations WHERE tx_id = ?',
+    );
+    this.pruneObservationsStmt = this.db.prepare(
+      'DELETE FROM mempool_observations WHERE first_seen_ms < ?',
+    );
     this.insertAccountTxStmt = this.db.prepare(`
       INSERT OR REPLACE INTO account_transactions(account, block_height, tx_index, tx_id)
       VALUES(?, ?, ?, ?)
@@ -198,6 +244,10 @@ export class SqliteArchive {
     this.blockHeightStmt = this.db.prepare('SELECT record_json FROM blocks WHERE height = ?');
     this.blockHashStmt = this.db.prepare('SELECT record_json FROM blocks WHERE hash = ?');
     this.txStmt = this.db.prepare('SELECT record_json FROM transactions WHERE id = ?');
+    this.txTimingStmt = this.db.prepare(`
+      SELECT first_seen_ms, first_seen_height, waited_ms, waited_blocks, timing_source
+      FROM transactions WHERE id = ?
+    `);
     this.accountTxsStmt = this.db.prepare(`
       SELECT t.record_json
       FROM account_transactions a
@@ -307,8 +357,105 @@ export class SqliteArchive {
     }
   }
 
+  _tryPrepare(sql) {
+    try {
+      return this.db.prepare(sql);
+    } catch {
+      return null;
+    }
+  }
+
   meta(key) {
     return this.getMetaStmt.get(key)?.value ?? null;
+  }
+
+  /**
+   * Record that a transaction was seen in the node's mempool. The FIRST observation
+   * wins — a later poll of the same still-pending transaction must never move
+   * first-seen forward. Returns the observation now on record.
+   */
+  recordFirstSeen(txId, firstSeenMs, firstSeenHeight = null) {
+    const id = String(txId ?? '').toLowerCase();
+    if (!id || !Number.isFinite(Number(firstSeenMs))) return null;
+    if (!this.readOnly && this.insertObservationStmt) {
+      this.insertObservationStmt.run(
+        id,
+        Math.trunc(Number(firstSeenMs)),
+        Number.isFinite(Number(firstSeenHeight)) ? Math.trunc(Number(firstSeenHeight)) : null,
+      );
+    }
+    return this.firstSeen(id);
+  }
+
+  /** The explorer's own first-seen observation for a transaction, or null. */
+  firstSeen(txId) {
+    const row = this.observationStmt?.get(String(txId ?? '').toLowerCase());
+    if (!row || row.first_seen_ms === null || row.first_seen_ms === undefined) return null;
+    return {
+      firstSeenMs: Number(row.first_seen_ms),
+      firstSeenHeight: row.first_seen_height === null || row.first_seen_height === undefined
+        ? null
+        : Number(row.first_seen_height),
+    };
+  }
+
+  /** The timing already stored for a mined transaction, or null when it has none. */
+  transactionTiming(txId) {
+    const row = this.txTimingStmt?.get(String(txId ?? '').toLowerCase());
+    if (!row || row.timing_source === null || row.timing_source === undefined) return null;
+    const number = (value) => (value === null || value === undefined ? null : Number(value));
+    return {
+      firstSeenMs: number(row.first_seen_ms),
+      firstSeenHeight: number(row.first_seen_height),
+      waitedMs: number(row.waited_ms),
+      waitedBlocks: number(row.waited_blocks),
+      source: row.timing_source,
+    };
+  }
+
+  /** Drop mempool observations older than `beforeMs`. Once a transaction is mined
+   * its timing lives on the transaction row, so the observation table only has to
+   * cover the pending window (plus a margin for transactions the node pruned). */
+  pruneObservations(beforeMs) {
+    if (this.readOnly || !this.pruneObservationsStmt) return 0;
+    if (!Number.isFinite(Number(beforeMs))) return 0;
+    return Number(this.pruneObservationsStmt.run(Math.trunc(Number(beforeMs)))?.changes ?? 0);
+  }
+
+  /**
+   * The most recent transactions with their wait and tipped-ness, for the fee-auction
+   * statistics. Transactions WITHOUT timing are returned too (with `observed: false`)
+   * so the caller can report how many of the window were excluded instead of
+   * silently shrinking its sample.
+   */
+  timingSample({ limit = 2_000, minHeight = null } = {}) {
+    const safeLimit = Math.max(1, Math.min(50_000, Math.trunc(Number(limit) || 2_000)));
+    const clauses = [];
+    const params = [];
+    if (Number.isSafeInteger(minHeight)) {
+      clauses.push('block_height >= ?');
+      params.push(minHeight);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this._tryPrepare(`
+      SELECT block_height, action_type, waited_ms, waited_blocks, timing_source
+      FROM transactions
+      ${where}
+      ORDER BY block_height DESC, tx_index DESC
+      LIMIT ?
+    `)?.all(...params, safeLimit) ?? [];
+    return rows.map((row) => ({
+      blockHeight: Number(row.block_height),
+      // `action_type` is already the EFFECTIVE type (a creation-time envelope is
+      // unwrapped at write time), so a timestamped tip is still counted as a bid.
+      tipped: row.action_type === 'tipped',
+      waitedMs: row.waited_ms === null || row.waited_ms === undefined ? null : Number(row.waited_ms),
+      waitedBlocks: row.waited_blocks === null || row.waited_blocks === undefined
+        ? null
+        : Number(row.waited_blocks),
+      source: row.timing_source ?? null,
+      observed: !!row.timing_source,
+    }));
   }
 
   ensureIdentity(chainId, genesisHash) {
@@ -331,7 +478,7 @@ export class SqliteArchive {
   clearChainData() {
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.exec('DELETE FROM blocks; DELETE FROM meta;');
+      this.db.exec('DELETE FROM blocks; DELETE FROM mempool_observations; DELETE FROM meta;');
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -344,6 +491,16 @@ export class SqliteArchive {
       throw new Error('archive block requires a non-negative safe height and hash');
     }
     const blockHash = String(record.hash).toLowerCase();
+    // Read any timing already on record BEFORE the delete below cascades the old
+    // transaction rows away: an observation cannot be recovered once the mempool
+    // has moved on, so re-indexing a block must never erase it.
+    const retainedTiming = new Map();
+    for (const tx of record.transactions ?? []) {
+      if (!tx?.id) continue;
+      const txId = String(tx.id).toLowerCase();
+      const timing = this.transactionTiming(txId);
+      if (timing) retainedTiming.set(txId, timing);
+    }
     this.deleteHeightStmt.run(record.height);
     this.deleteHashStmt.run(blockHash);
     this.insertBlockStmt.run(
@@ -361,16 +518,42 @@ export class SqliteArchive {
       const txId = String(tx.id).toLowerCase();
       const accounts = relatedAccounts(tx);
       const cp = accounts.find((account) => account !== tx.signer) ?? null;
+      // Re-indexing a block (finality refresh, on-demand historical fetch) must not
+      // erase timing that was paired when the block was first indexed: an observation
+      // cannot be recovered once the mempool has moved on.
+      const retained = retainedTiming.get(txId) ?? null;
+      const timing = tx.timing?.observed
+        ? tx.timing
+        : retained
+          ? {
+              ...retained,
+              includedHeight: record.height,
+              includedTimestampMs: tx.timestampMs ?? record.timestampMs ?? null,
+              observed: true,
+            }
+          : null;
+      const stored = timing?.source ? { ...tx, timing } : tx;
       this.insertTxStmt.run(
         txId,
         record.height,
         tx.index ?? 0,
         tx.signer ?? null,
         cp,
-        tx.action?.type ?? null,
+        // The EFFECTIVE action type: a `timestamped` creation-time envelope
+        // (v0.2.6) is metadata about when a transaction was made, not a kind of
+        // action, so it is transparent here. Without this every timestamped
+        // transaction would be filed under a single "timestamped" bucket and
+        // vanish from every action-type filter, and the tipped/untipped wait
+        // split would misclassify a timestamped tip as untipped.
+        unwrapTimestamped(tx.action)?.type ?? tx.action?.type ?? null,
         tx.executionStatus ?? tx.receipt?.status?.status ?? tx.receipt?.status ?? null,
         tx.timestampMs ?? record.timestampMs ?? null,
-        JSON.stringify(tx),
+        JSON.stringify(stored),
+        timing?.firstSeenMs ?? null,
+        timing?.firstSeenHeight ?? null,
+        timing?.waitedMs ?? null,
+        timing?.waitedBlocks ?? null,
+        timing?.source ?? null,
       );
       for (const account of accounts) {
         this.insertAccountTxStmt.run(account, record.height, tx.index ?? 0, txId);
