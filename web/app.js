@@ -162,6 +162,10 @@ const NET_LIVE = { testnet: true, mainnet: true };
 let LAST_STATUS = null;
 let WS_OPEN = false;
 let ROUTE_ID = 0;
+// Per-view live state, owned by the currently rendered route and cleared on
+// navigation: the overview's last supporting data, and the blocks list page.
+let ovState = null;
+let blocksPage = null;
 
 function setNetToggleUI() {
   for (const b of document.querySelectorAll('#netsw button')) {
@@ -230,10 +234,24 @@ async function api(path) {
   return res.json();
 }
 
+// The staggered entrance choreography (@keyframes view-rise) is gated on the
+// `view-enter` class, which is set HERE and here only — i.e. when a navigation
+// replaces the view. It is dropped once the animation has run so that any later
+// in-place data patch can never replay it.
+let entranceTimer = null;
+function markEntrance() {
+  view.classList.remove('view-enter');
+  void view.offsetWidth; // restart the animation on a repeated navigation
+  view.classList.add('view-enter');
+  clearTimeout(entranceTimer);
+  entranceTimer = setTimeout(() => view.classList.remove('view-enter'), 1000);
+}
 function setView(html, routeId = null) {
   if (routeId !== null && routeId !== ROUTE_ID) return false;
+  patchedHtml.clear();
   view.innerHTML = html;
   delete view.dataset.tipHeight;
+  markEntrance();
   view.setAttribute('aria-busy', String(html.includes('class="loading"')));
   return true;
 }
@@ -248,10 +266,18 @@ function renderNotFound(message = 'That explorer page does not exist.', routeId 
 // ---- live view hooks ------------------------------------------------------
 // The current view registers what to do when a block/tx arrives over the WS
 // feed, so the page updates in place — no refresh. Cleared on every navigation.
-const live = { onBlock: null, onTx: null };
+// - onBlock/onTx: a block/tx arrived over the WS stream (the primary path).
+// - onStatus: a fresh /status snapshot (every poll, and after every WS block).
+// - refresh: reload this view's data and patch it in — reconciliation only, used
+//   when the stream was down or fell behind. Never re-renders the page.
+const live = { onBlock: null, onTx: null, onStatus: null, refresh: null };
 function liveReset() {
   live.onBlock = null;
   live.onTx = null;
+  live.onStatus = null;
+  live.refresh = null;
+  ovState = null;
+  blocksPage = null;
 }
 // Prepend a freshly-arrived row to a table body, flash it, and cap the length.
 function livePrepend(tbodyId, rowHtml, cap) {
@@ -263,6 +289,34 @@ function livePrepend(tbodyId, rowHtml, cap) {
   const row = tb.firstElementChild;
   if (row) row.classList.add('live-new');
   while (tb.children.length > cap) tb.lastChild.remove();
+}
+
+// ---- in-place patching ----------------------------------------------------
+// Data updates mutate the DOM instead of re-rendering the view. Every patch is
+// change-guarded: identical markup is not written back, so nothing flickers,
+// nothing re-lays-out, and a hovered/focused element survives an unchanged tick.
+const patchedHtml = new Map();
+/** Replace an element's markup only when it actually changed. Never call this on
+ * a direct child of <main> that already exists — the entrance choreography is
+ * keyed to navigation, and replacing a section wholesale is a render, not a patch. */
+function patchHtml(el, html, key) {
+  if (!el) return false;
+  const id = key ?? el.id;
+  if (id && patchedHtml.get(id) === html) return false;
+  if (id) patchedHtml.set(id, html);
+  el.innerHTML = html;
+  return true;
+}
+function patchText(el, text) {
+  if (el && el.textContent !== text) el.textContent = text;
+}
+/** Re-time the relative "age" cells so they keep counting without a re-render. */
+function refreshAges() {
+  for (const el of view.querySelectorAll('[data-age-ts]')) {
+    const ts = Number(el.dataset.ageTs);
+    if (!Number.isFinite(ts)) continue;
+    patchText(el, el.hasAttribute('data-age-abs') ? timeAgo(ts) : fmtAge(ts));
+  }
 }
 
 // ---- links + render helpers -----------------------------------------------
@@ -392,87 +446,51 @@ async function renderOverview(routeId) {
   ]);
   const blocks = (Array.isArray(blocks100) ? blocks100 : []).slice(0, 12);
   const s = status;
+  const height = Number(s.sync?.nodeHeight ?? s.tipHeight);
   // Feed the live-strip cadence sparkline and record a pool-split sample.
   seedCadence(blocks100);
   recordPoolSample(
-    Number(s.sync?.nodeHeight ?? s.tipHeight),
+    height,
     supply?.shielded ?? s.shieldedInfo?.poolValue ?? null,
     s.shieldedV2Info?.poolValue ?? null,
   );
-  const all = s.allTime ?? {};
-  const day = s.last24h ?? {};
-  const mempool = s.mempool ?? {};
   const sync = s.sync ?? {};
-  const relay = s.relays ?? {};
-  const relayState = relayAvailability(relay);
-  const relayText = relayState.healthy !== null
-    ? `${fmtNum(relayState.healthy)}/${fmtNum(relayState.configured)} relays · ${relayState.state}`
-    : 'relay status pending';
-  // Mining accounts seen in the server-stated recent window (24h at the 150s
-  // target). The window is always shown WITH the count: a short sample hides
-  // low-hashrate miners, and coinbase accounts are not machines — several
-  // machines can pay the same account.
-  const mw = s.minerWindow ?? {};
-  const windowLabel = minerWindowLabel(mw.windowBlocks);
-  const minersText = mw.accounts === null || mw.accounts === undefined
-    ? 'miners pending'
-    : `${fmtNum(mw.accounts)} mining account${mw.accounts === 1 ? '' : 's'} · ${windowLabel}`;
-  setView(`
+  // Every live-updatable region is generated once here and seeded into the patch
+  // cache below, so the first status tick rewrites only what genuinely changed
+  // (without the seed, an identical panel would be rewritten and re-animate).
+  const slots = {
+    'ov-hero-chips': heroChips(s),
+    'ov-signal': signalProgress(s),
+    'ov-trust': trustWidget(s, supply, s.genesisHash),
+    'ov-stat-alltime': statsAllTime(s, supply),
+    'ov-stat-activity': statsActivity(s),
+    'ov-stat-mempool': statsMempool(s),
+    'ov-deployments': deploymentsPanel(s),
+    'ov-miner-board': minerReadinessBoard(blocks100),
+    'ov-pool': poolMigrationChart(),
+  };
+  const committed = setView(`
     <section class="hero-strip">
       <div>
         <h1>Sovereign</h1>
-        <p><span id="hero-chain">${esc(s.chainId || 'Chain')}</span> · node height <span id="hero-height">${fmtNum(sync.nodeHeight ?? s.tipHeight ?? 0)}</span>${sync.ready ? '' : ` · indexing <span id="hero-indexed">${fmtNum(sync.indexedHeight ?? 0)}</span>`}</p>
+        <p><span id="hero-chain">${esc(s.chainId || 'Chain')}</span> · node height <span id="hero-height">${fmtNum(sync.nodeHeight ?? s.tipHeight ?? 0)}</span><span id="hero-indexing"${sync.ready ? ' hidden' : ''}> · indexing <span id="hero-indexed">${fmtNum(sync.indexedHeight ?? 0)}</span></span></p>
       </div>
       <div class="hero-meta">
         <a class="genesis-chip mono" href="#/block/0" title="Open the genesis block (#0) — ${esc(s.genesisHash || '')}">Genesis ${esc(shortHash(s.genesisHash, 10, 6))}</a>
-        <span>${fmtNum(s.blocksIndexed)} indexed blocks</span>
-        ${s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : ''}
-        <span class="relay-pill ${relayState.tone === 'warn' || relayState.tone === 'bad' ? 'degraded' : relayState.tone === 'info' ? 'reduced' : ''}">${esc(relayText)}</span>
-        <span class="miners-pill ${mw.accounts ? '' : 'idle'}" title="Coinbase accounts that won at least one of the last ${esc(String(mw.windowBlocks ?? '—'))} blocks. Accounts, not machines — several machines can pay one account.">${esc(minersText)}</span>
-        ${pqActivationChips(s)}
+        <span class="live-slot" id="ov-hero-chips">${slots['ov-hero-chips']}</span>
       </div>
     </section>
-    ${signalProgress(s)}
-    ${trustWidget(s, supply, s.genesisHash)}
+    <div id="ov-signal">${slots['ov-signal']}</div>
+    <div id="ov-trust">${slots['ov-trust']}</div>
 
     <div class="stat-columns">
-      <section class="stat-card">
-        <h2>All time</h2>
-        ${statItem('Circulation', `<span id="ov-circulation">${fmtCoin(all.circulationGrains)} ${COIN_SYMBOL}</span>`, `${pct(s.mintedOfCap)} of 21,000,000 cap minted`)}
-        ${statItem('Shielded supply', supply?.shieldedPercent === undefined ? '—' : `${fmtDecimal(supply.shieldedPercent, 2)}%`, supply ? `${fmtCoin(supply.shielded)} ${COIN_SYMBOL} private of ${fmtCoin(supply.total)} (Orchard pool — not post-quantum)` : 'node unreachable')}
-        ${statItem('Market cap', fmtUsd(all.marketCapUsd), 'price feed not configured')}
-        ${statItem('Market dominance', all.marketDominance === null || all.marketDominance === undefined ? '—' : pct(all.marketDominance), 'market feed not configured')}
-        ${statItem('Blockchain size', fmtBytes(all.blockchainSizeBytes), 'indexed window')}
-        ${statItem('Mining accounts', mw.accounts === null || mw.accounts === undefined ? '—' : fmtNum(mw.accounts), `won a block in the ${windowLabel} — accounts, not machines`)}
-        ${statItem('Mining accounts (all time)', (all.minersSeen ?? all.networkNodes) == null ? '—' : fmtNum(all.minersSeen ?? all.networkNodes), 'every coinbase account in the node registry')}
-        ${statItem('Relays', relayState.healthy === null ? '—' : `${fmtNum(relayState.healthy)} / ${fmtNum(relayState.configured)}`, 'healthy / configured identity-pinned endpoints')}
-        ${statItem('Difficulty', all.difficulty === null || all.difficulty === undefined ? '—' : esc(fmtNum(all.difficulty)), esc(all.difficultyAlgo === 'Sha256d' ? 'SHA-256d' : (all.difficultyAlgo || 'PoW')))}
-      </section>
-
-      <section class="stat-card">
-        <h2>${day.windowComplete ? '24h statistics' : 'Indexed activity'}</h2>
-        ${statItem('Transactions', fmtNum(day.transactions))}
-        ${statItem('Transactions per second', fmtDecimal(day.transactionsPerSecond ?? 0, 4))}
-        ${statItem('Blocks', fmtNum(day.blocks))}
-        ${statItem('Volume', `${fmtCoin(day.volumeGrains)} ${COIN_SYMBOL}`, `transparent ${COIN_SYMBOL} volume`)}
-        ${statItem('Miner tips', day.minerTipGrains === undefined ? '—' : `${fmtCoin(day.minerTipGrains)} ${COIN_SYMBOL}`, day.tippedTransactions ? `${fmtNum(day.tippedTransactions)} fee-auction tipped tx` : 'fee-auction tips in indexed window')}
-        ${statItem('Hashrate', fmtHashrate(day.hashrate), day.hashrate == null ? 'measuring — needs a few blocks' : 'node estimate from recent block work (sov_getDifficulty)')}
-        ${blockTimeStat(s.blockTime)}
-        ${!day.windowComplete ? `<p class="stat-footnote">Building the recent window; values become a full 24h view after synchronization.</p>` : ''}
-      </section>
-
-      <section class="stat-card">
-        <h2>Mempool &amp; fees</h2>
-        ${statItem('Pending transactions', fmtNum(mempool.transactions), 'sov_getMempoolSize')}
-        ${feeRouteStats(s)}
-        ${statItem('Auction floor', '—', auctionFloorNote(s))}
-        ${statItem('Block subsidy', s.mintRewardGrains == null ? '—' : `${fmtCoin(s.mintRewardGrains)} ${COIN_SYMBOL}`, s.mintRewardGrains == null ? 'not exposed by node' : 'next coinbase at this height (sov_getMintReward)')}
-        ${statItem('Size', fmtBytes(mempool.sizeBytes), 'mempool bytes not exposed')}
-      </section>
+      <section class="stat-card" id="ov-stat-alltime">${slots['ov-stat-alltime']}</section>
+      <section class="stat-card" id="ov-stat-activity">${slots['ov-stat-activity']}</section>
+      <section class="stat-card" id="ov-stat-mempool">${slots['ov-stat-mempool']}</section>
     </div>
-    ${deploymentsPanel(s)}
-    ${minerReadinessBoard(blocks100)}
-    ${poolMigrationChart()}
+    <div id="ov-deployments">${slots['ov-deployments']}</div>
+    <div id="ov-miner-board">${slots['ov-miner-board']}</div>
+    <div id="ov-pool">${slots['ov-pool']}</div>
 
     <div class="grid2">
       <div>
@@ -487,11 +505,152 @@ async function renderOverview(routeId) {
       </div>
     </div>
   `, routeId);
-  // Count the circulation figure up to its value (rolls on later re-renders).
-  odometer($('ov-circulation'), all.circulationGrains, (g) => `${fmtCoin(String(Math.round(g)))} ${COIN_SYMBOL}`, 'ov-circulation');
-  // Live: new blocks and txs stream into their tables in place.
-  live.onBlock = (b) => livePrepend('ov-blocks', blockRow(b), 12);
+  if (!committed) return;
+  for (const [id, html] of Object.entries(slots)) patchedHtml.set(id, html);
+  // Count the circulation figure up to its value (rolls on later live updates).
+  odometer($('ov-circulation'), s.allTime?.circulationGrains, ovCirculationFmt, 'ov-circulation');
+  // Live: everything below updates the DOM in place. The page is never
+  // re-rendered for data — only navigation calls setView again.
+  ovState = { supply, blocks: Array.isArray(blocks100) ? blocks100 : [], height, tip: blocks.length ? blocks[0].height : -1, busy: false };
+  live.onBlock = (b) => {
+    if (!ovState) return;
+    if (Number.isFinite(Number(b?.height)) && Number(b.height) <= ovState.tip) return; // already shown
+    ovState.tip = Number(b.height);
+    livePrepend('ov-blocks', blockRow(b), 12);
+  };
   live.onTx = (t) => livePrepend('ov-txs', txRow({ ...t, timestampMs: t.timestampMs ?? Date.now() }), 12);
+  live.onStatus = updateOverview;
+  live.refresh = () => refreshOverviewData(true);
+}
+
+const ovCirculationFmt = (g) => `${fmtCoin(String(Math.round(g)))} ${COIN_SYMBOL}`;
+
+/** The hero-strip status chips — everything in them is derived from /status, so
+ * a status tick can re-derive the strip and patch it in place. */
+function heroChips(s) {
+  const relayState = relayAvailability(s.relays ?? {});
+  const relayText = relayState.healthy !== null
+    ? `${fmtNum(relayState.healthy)}/${fmtNum(relayState.configured)} relays · ${relayState.state}`
+    : 'relay status pending';
+  // Mining accounts seen in the server-stated recent window (24h at the 150s
+  // target). The window is always shown WITH the count: a short sample hides
+  // low-hashrate miners, and coinbase accounts are not machines — several
+  // machines can pay the same account.
+  const mw = s.minerWindow ?? {};
+  const minersText = mw.accounts === null || mw.accounts === undefined
+    ? 'miners pending'
+    : `${fmtNum(mw.accounts)} mining account${mw.accounts === 1 ? '' : 's'} · ${minerWindowLabel(mw.windowBlocks)}`;
+  return `<span>${fmtNum(s.blocksIndexed)} indexed blocks</span>` +
+    (s.archive?.enabled ? `<span>${s.archive.complete ? `${fmtNum(s.archive.blocks)}-block complete archive` : `archive from #${fmtNum(s.archive.contiguousFromHeight)}`}</span>` : '') +
+    `<span class="relay-pill ${relayState.tone === 'warn' || relayState.tone === 'bad' ? 'degraded' : relayState.tone === 'info' ? 'reduced' : ''}">${esc(relayText)}</span>` +
+    `<span class="miners-pill ${mw.accounts ? '' : 'idle'}" title="Coinbase accounts that won at least one of the last ${esc(String(mw.windowBlocks ?? '—'))} blocks. Accounts, not machines — several machines can pay one account.">${esc(minersText)}</span>` +
+    pqActivationChips(s);
+}
+
+function statsAllTime(s, supply) {
+  const all = s.allTime ?? {};
+  const mw = s.minerWindow ?? {};
+  const windowLabel = minerWindowLabel(mw.windowBlocks);
+  const relayState = relayAvailability(s.relays ?? {});
+  return `<h2>All time</h2>
+    ${statItem('Circulation', `<span id="ov-circulation">${fmtCoin(all.circulationGrains)} ${COIN_SYMBOL}</span>`, `${pct(s.mintedOfCap)} of 21,000,000 cap minted`)}
+    ${statItem('Shielded supply', supply?.shieldedPercent === undefined ? '—' : `${fmtDecimal(supply.shieldedPercent, 2)}%`, supply ? `${fmtCoin(supply.shielded)} ${COIN_SYMBOL} private of ${fmtCoin(supply.total)} (Orchard pool — not post-quantum)` : 'node unreachable')}
+    ${statItem('Market cap', fmtUsd(all.marketCapUsd), 'price feed not configured')}
+    ${statItem('Market dominance', all.marketDominance === null || all.marketDominance === undefined ? '—' : pct(all.marketDominance), 'market feed not configured')}
+    ${statItem('Blockchain size', fmtBytes(all.blockchainSizeBytes), 'indexed window')}
+    ${statItem('Mining accounts', mw.accounts === null || mw.accounts === undefined ? '—' : fmtNum(mw.accounts), `won a block in the ${windowLabel} — accounts, not machines`)}
+    ${statItem('Mining accounts (all time)', (all.minersSeen ?? all.networkNodes) == null ? '—' : fmtNum(all.minersSeen ?? all.networkNodes), 'every coinbase account in the node registry')}
+    ${statItem('Relays', relayState.healthy === null ? '—' : `${fmtNum(relayState.healthy)} / ${fmtNum(relayState.configured)}`, 'healthy / configured identity-pinned endpoints')}
+    ${statItem('Difficulty', all.difficulty === null || all.difficulty === undefined ? '—' : esc(fmtNum(all.difficulty)), esc(all.difficultyAlgo === 'Sha256d' ? 'SHA-256d' : (all.difficultyAlgo || 'PoW')))}`;
+}
+
+function statsActivity(s) {
+  const day = s.last24h ?? {};
+  return `<h2>${day.windowComplete ? '24h statistics' : 'Indexed activity'}</h2>
+    ${statItem('Transactions', fmtNum(day.transactions))}
+    ${statItem('Transactions per second', fmtDecimal(day.transactionsPerSecond ?? 0, 4))}
+    ${statItem('Blocks', fmtNum(day.blocks))}
+    ${statItem('Volume', `${fmtCoin(day.volumeGrains)} ${COIN_SYMBOL}`, `transparent ${COIN_SYMBOL} volume`)}
+    ${statItem('Miner tips', day.minerTipGrains === undefined ? '—' : `${fmtCoin(day.minerTipGrains)} ${COIN_SYMBOL}`, day.tippedTransactions ? `${fmtNum(day.tippedTransactions)} fee-auction tipped tx` : 'fee-auction tips in indexed window')}
+    ${statItem('Hashrate', fmtHashrate(day.hashrate), day.hashrate == null ? 'measuring — needs a few blocks' : 'node estimate from recent block work (sov_getDifficulty)')}
+    ${blockTimeStat(s.blockTime)}
+    ${!day.windowComplete ? `<p class="stat-footnote">Building the recent window; values become a full 24h view after synchronization.</p>` : ''}`;
+}
+
+function statsMempool(s) {
+  const mempool = s.mempool ?? {};
+  return `<h2>Mempool &amp; fees</h2>
+    ${statItem('Pending transactions', fmtNum(mempool.transactions), 'sov_getMempoolSize')}
+    ${feeRouteStats(s)}
+    ${statItem('Auction floor', '—', auctionFloorNote(s))}
+    ${statItem('Block subsidy', s.mintRewardGrains == null ? '—' : `${fmtCoin(s.mintRewardGrains)} ${COIN_SYMBOL}`, s.mintRewardGrains == null ? 'not exposed by node' : 'next coinbase at this height (sov_getMintReward)')}
+    ${statItem('Size', fmtBytes(mempool.sizeBytes), 'mempool bytes not exposed')}`;
+}
+
+/** A fresh /status snapshot arrived: re-derive every status-driven panel of the
+ * overview and patch the changed ones in place. No setView, no entrance replay. */
+function updateOverview(s) {
+  if (!ovState || !$('ov-blocks')) return;
+  patchHtml($('ov-hero-chips'), heroChips(s), 'ov-hero-chips');
+  patchHtml($('ov-signal'), signalProgress(s), 'ov-signal');
+  patchHtml($('ov-trust'), trustWidget(s, ovState.supply, s.genesisHash), 'ov-trust');
+  patchHtml($('ov-stat-alltime'), statsAllTime(s, ovState.supply), 'ov-stat-alltime');
+  odometer($('ov-circulation'), s.allTime?.circulationGrains, ovCirculationFmt, 'ov-circulation');
+  patchHtml($('ov-stat-activity'), statsActivity(s), 'ov-stat-activity');
+  patchHtml($('ov-stat-mempool'), statsMempool(s), 'ov-stat-mempool');
+  patchHtml($('ov-deployments'), deploymentsPanel(s), 'ov-deployments');
+  // Panels fed by block/supply data (miner readiness, pool vaults) need a fetch;
+  // only ask for one when the chain actually moved.
+  const height = Number(s.sync?.nodeHeight ?? s.tipHeight);
+  if (Number.isFinite(height) && height !== ovState.height) {
+    ovState.height = height;
+    // If the stream did not deliver the block the indexer already has, reconcile
+    // the latest-* tables too rather than leaving a hole in them.
+    const indexed = Number(s.sync?.indexedHeight ?? s.tipHeight);
+    refreshOverviewData(ovState.tip >= 0 && Number.isFinite(indexed) && ovState.tip < indexed);
+  }
+}
+
+/** Reload the overview's supporting data and patch it in. `withTables` also
+ * reconciles the two latest-* tables — used when the live stream was down or
+ * fell behind, so missed rows appear without a page re-render. */
+async function refreshOverviewData(withTables) {
+  const state = ovState;
+  if (!state || state.busy) return;
+  state.busy = true;
+  try {
+    const [blocks100, supply, txs] = await Promise.all([
+      api('/blocks?limit=24').catch(() => state.blocks),
+      api('/supply').catch(() => state.supply),
+      withTables ? api('/txs?limit=12').catch(() => null) : Promise.resolve(null),
+    ]);
+    if (ovState !== state || !$('ov-blocks')) return; // navigated away mid-flight
+    state.blocks = Array.isArray(blocks100) ? blocks100 : state.blocks;
+    state.supply = supply;
+    seedCadence(state.blocks);
+    recordPoolSample(
+      state.height,
+      supply?.shielded ?? LAST_STATUS?.shieldedInfo?.poolValue ?? null,
+      LAST_STATUS?.shieldedV2Info?.poolValue ?? null,
+    );
+    patchHtml($('ov-miner-board'), minerReadinessBoard(state.blocks), 'ov-miner-board');
+    patchHtml($('ov-pool'), poolMigrationChart(), 'ov-pool');
+    if (LAST_STATUS) {
+      patchHtml($('ov-trust'), trustWidget(LAST_STATUS, supply, LAST_STATUS.genesisHash), 'ov-trust');
+      patchHtml($('ov-stat-alltime'), statsAllTime(LAST_STATUS, supply), 'ov-stat-alltime');
+      odometer($('ov-circulation'), LAST_STATUS.allTime?.circulationGrains, ovCirculationFmt, 'ov-circulation');
+    }
+    if (withTables) {
+      const rows = state.blocks.slice(0, 12);
+      if (rows.length) {
+        state.tip = rows[0].height;
+        patchHtml($('ov-blocks'), rows.map(blockRow).join(''), 'ov-blocks');
+      }
+      if (Array.isArray(txs) && txs.length) patchHtml($('ov-txs'), txs.map(txRow).join(''), 'ov-txs');
+    }
+  } finally {
+    state.busy = false;
+  }
 }
 
 /** Why the mempool auction floor is a dash. The floor genuinely has no RPC, but the
@@ -687,10 +846,10 @@ function blockRow(b) {
   const coinbase = b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>';
   // Finality shading: pending blocks (<6 confirmations) read dimmer with an amber
   // edge; they brighten with a green edge once the node reports them final.
-  return `<tr class="blk-row ${b.final ? 'is-final' : 'is-pending'}"><td>${blockLink(b.height)}</td><td>${acctLinkShort(b.proposer)}</td><td class="right num">${fmtNum(b.txCount)}</td><td class="right num">${coinbase}</td><td class="dim" title="${esc(new Date(b.timestampMs).toLocaleString())}">${timeAgo(b.timestampMs)}</td><td>${finalBadge(b.final)}</td></tr>`;
+  return `<tr class="blk-row ${b.final ? 'is-final' : 'is-pending'}"><td>${blockLink(b.height)}</td><td>${acctLinkShort(b.proposer)}</td><td class="right num">${fmtNum(b.txCount)}</td><td class="right num">${coinbase}</td><td class="dim" data-age-ts="${esc(b.timestampMs)}" data-age-abs title="${esc(new Date(b.timestampMs).toLocaleString())}">${timeAgo(b.timestampMs)}</td><td>${finalBadge(b.final)}</td></tr>`;
 }
 function txRow(t) {
-  return `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td class="dim" title="${esc(new Date(t.timestampMs).toLocaleString())}">${timeAgo(t.timestampMs)}</td><td>${acctLinkShort(t.signer)}</td><td class="right">${blockLink(t.blockHeight)}</td></tr>`;
+  return `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td class="dim" data-age-ts="${esc(t.timestampMs)}" data-age-abs title="${esc(new Date(t.timestampMs).toLocaleString())}">${timeAgo(t.timestampMs)}</td><td>${acctLinkShort(t.signer)}</td><td class="right">${blockLink(t.blockHeight)}</td></tr>`;
 }
 function emptyRow(cols) {
   return `<tr><td colspan="${cols}" class="empty">No data yet — waiting for blocks.</td></tr>`;
@@ -742,11 +901,13 @@ async function renderBlocks(before, routeId) {
       ? `<a class="pager-btn" href="${href}">${label}</a>`
       : `<span class="pager-btn is-disabled">${label}</span>`;
   const newerHref = highest + PAGE_SIZE >= tip ? '#/blocks' : `#/blocks/${highest + PAGE_SIZE}`;
+  // The range/tip figures and the "Older" target move as live blocks arrive, so
+  // they are addressable (by class — the pager is rendered twice) and patched.
   const pager = `<div class="pager">
     ${btn('#/blocks', '⏮ Latest', hasNewer)}
     ${btn(newerHref, '◀ Newer', hasNewer)}
-    <span class="pager-info">${blocks.length ? `#${fmtNum(lowest)} – #${fmtNum(highest)}` : '—'} of ${fmtNum(tip)}</span>
-    ${btn(`#/blocks/${lowest - 1}`, 'Older ▶', hasOlder)}
+    <span class="pager-info"><span class="pager-range">${blocks.length ? `#${fmtNum(lowest)} – #${fmtNum(highest)}` : '—'}</span> of <span class="pager-tip">${fmtNum(tip)}</span></span>
+    ${blocks.length && hasOlder ? `<a class="pager-btn pager-older" href="#/blocks/${lowest - 1}">Older ▶</a>` : '<span class="pager-btn pager-older is-disabled">Older ▶</span>'}
     ${btn(`#/blocks/${PAGE_SIZE - 1}`, 'Genesis ⏭', hasOlder)}
   </div>`;
 
@@ -761,9 +922,56 @@ async function renderBlocks(before, routeId) {
   window.__sovExport = { name: `${NET}-blocks-${cursor ?? 'latest'}`, rows: blocks };
   $('export-tools').hidden = false;
   view.dataset.tipHeight = String(highest);
-  // Live: on the latest page (no cursor), new blocks stream in at the top.
+  // Live: on the latest page (no cursor), new blocks stream in at the top — the
+  // arriving ROW animates itself in; the page is never re-rendered.
   if (cursor === null) {
-    live.onBlock = () => route().catch((e) => errView(e.message));
+    blocksPage = { rows: blocks, tip };
+    live.onBlock = prependLiveBlock;
+    live.refresh = refreshBlocksLatest;
+  }
+}
+
+/** A block arrived over the stream while the latest blocks page is open. */
+function prependLiveBlock(b) {
+  const height = Number(b?.height);
+  if (!blocksPage || !$('blocks-tbody') || !Number.isFinite(height)) return;
+  if (blocksPage.rows.length && height <= blocksPage.rows[0].height) return; // already shown
+  livePrepend('blocks-tbody', blocksListRow(b), PAGE_SIZE);
+  blocksPage.rows.unshift(b);
+  if (blocksPage.rows.length > PAGE_SIZE) blocksPage.rows.length = PAGE_SIZE;
+  blocksPage.tip = Math.max(blocksPage.tip, height);
+  view.dataset.tipHeight = String(height);
+  window.__sovExport = { name: `${NET}-blocks-latest`, rows: blocksPage.rows };
+  updateBlocksPager();
+}
+
+/** Reconcile the latest blocks page against the server (stream down or behind). */
+async function refreshBlocksLatest() {
+  const page = blocksPage;
+  if (!page) return;
+  const [status, list] = await Promise.all([api('/status'), api(`/blocks?limit=${PAGE_SIZE}`)]);
+  if (blocksPage !== page || !$('blocks-tbody')) return; // navigated away mid-flight
+  page.rows = Array.isArray(list) ? list : [];
+  page.tip = Math.max(0, status.tipHeight);
+  patchHtml($('blocks-tbody'), page.rows.map(blocksListRow).join('') || emptyRow(8), 'blocks-tbody');
+  window.__sovExport = { name: `${NET}-blocks-latest`, rows: page.rows };
+  view.dataset.tipHeight = String(page.rows.length ? page.rows[0].height : 0);
+  updateBlocksPager();
+}
+
+/** Keep the (duplicated) pager's range, tip and "Older" target truthful. */
+function updateBlocksPager() {
+  if (!blocksPage) return;
+  const rows = blocksPage.rows;
+  const highest = rows.length ? rows[0].height : 0;
+  const lowest = rows.length ? rows[rows.length - 1].height : 0;
+  for (const el of view.querySelectorAll('.pager-range')) {
+    patchText(el, rows.length ? `#${fmtNum(lowest)} – #${fmtNum(highest)}` : '—');
+  }
+  for (const el of view.querySelectorAll('.pager-tip')) patchText(el, fmtNum(blocksPage.tip));
+  for (const el of view.querySelectorAll('a.pager-older')) {
+    const href = `#/blocks/${lowest - 1}`;
+    if (el.getAttribute('href') !== href) el.setAttribute('href', href);
   }
 }
 
@@ -775,7 +983,7 @@ function blocksListRow(b) {
     <td class="right num">${fmtNum(b.txCount)}</td>
     <td class="right num">${b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>'}</td>
     <td class="time" title="${new Date(Number(b.timestampMs)).toISOString?.() || ''} · ${esc(b.timestampMs)} ms">${fmtDateTime(b.timestampMs)}</td>
-    <td class="right dim">${fmtAge(b.timestampMs)}</td>
+    <td class="right dim" data-age-ts="${esc(b.timestampMs)}">${fmtAge(b.timestampMs)}</td>
     <td>${finalBadge(b.final)}</td></tr>`;
 }
 
@@ -2217,6 +2425,8 @@ function renderOperationalStatus(status) {
 }
 
 let ws = null;
+// True once a live feed has dropped, so the next successful open reconciles.
+let wsDropped = false;
 function connectWs() {
   // Close any prior socket (e.g. after a network switch) without letting it trigger
   // a reconnect to the old network.
@@ -2244,9 +2454,17 @@ function connectWs() {
   ws.onopen = () => {
     WS_OPEN = true;
     renderOperationalStatus(LAST_STATUS);
+    // Recovering from a dropped feed: catch up on what the stream missed by
+    // patching the view's data in place — no reload, no entrance replay.
+    if (wsDropped) {
+      wsDropped = false;
+      pollStatus();
+      Promise.resolve(live.refresh?.()).catch(() => {});
+    }
   };
   ws.onclose = () => {
     WS_OPEN = false;
+    wsDropped = true;
     renderOperationalStatus(LAST_STATUS);
     if (ws === mine) setTimeout(() => ws === mine && connectWs(), 2500);
   };
@@ -2273,6 +2491,11 @@ function connectWs() {
   };
 }
 
+// How many consecutive polls have seen the rendered tip trail the indexed tip.
+// The WebSocket is the primary update path; polling only reconciles, so a single
+// lagging sample (a block mid-flight) is not enough to trigger a data reload.
+let staleTicks = 0;
+
 async function pollStatus() {
   try {
     const s = await api('/status');
@@ -2280,20 +2503,27 @@ async function pollStatus() {
     LAST_STATUS = s;
     renderOperationalStatus(s);
     const sync = s.sync ?? {};
-    $('foot-chain').textContent = s.chainId
+    patchText($('foot-chain'), s.chainId
       ? `${s.chainId} · node ${fmtNum(sync.nodeHeight ?? 0)} · indexed ${fmtNum(sync.indexedHeight ?? 0)}`
-      : '';
+      : '');
     const heroHeight = $('hero-height');
     if (heroHeight) odometer(heroHeight, sync.nodeHeight ?? s.tipHeight ?? 0, fmtNum, 'hero-height');
+    const heroIndexing = $('hero-indexing');
+    if (heroIndexing) heroIndexing.hidden = !!sync.ready;
     const heroIndexed = $('hero-indexed');
-    if (heroIndexed) heroIndexed.textContent = fmtNum(sync.indexedHeight ?? s.tipHeight ?? 0);
-    const onLatestBlocks = (location.hash || '#/') === '#/blocks';
+    if (heroIndexed) patchText(heroIndexed, fmtNum(sync.indexedHeight ?? s.tipHeight ?? 0));
+    // The active view patches its own panels from the fresh status.
+    live.onStatus?.(s);
+    refreshAges();
+    // Reconciliation, never a re-render: reload this view's data when indexing
+    // has just finished, or when the stream is down / has fallen behind.
     const renderedTip = Number(view.dataset.tipHeight ?? -1);
-    if (
-      (wasReady === false && sync.ready === true)
-      || (sync.ready && onLatestBlocks && renderedTip < Number(sync.indexedHeight ?? 0))
-    ) {
-      await route().catch((e) => errView(e.message));
+    const behind = sync.ready === true && renderedTip >= 0 && renderedTip < Number(sync.indexedHeight ?? 0);
+    staleTicks = behind ? staleTicks + 1 : 0;
+    const becameReady = wasReady === false && sync.ready === true;
+    if (live.refresh && (becameReady || (behind && (!WS_OPEN || staleTicks >= 2)))) {
+      staleTicks = 0;
+      await Promise.resolve(live.refresh()).catch(() => {});
     }
   } catch {
     setConn('down', 'Explorer API is unreachable');

@@ -753,6 +753,13 @@ h3 {
   padding: 6px 9px;
 }
 
+/* A live-update slot: an addressable wrapper whose chips are patched in place on
+   every status tick. display:contents keeps it out of the flex layout entirely,
+   so the chips lay out exactly as if the wrapper were not there. */
+.hero-meta span.live-slot {
+  display: contents;
+}
+
 /* The genesis pill navigates to block #0 like any other block link. */
 .hero-meta a.genesis-chip {
   cursor: pointer;
@@ -2272,11 +2279,12 @@ a.trust-chip:hover {
 /* ==========================================================================
    Page-load choreography — one staggered reveal per navigation
    ==========================================================================
-   Each route's top-level sections rise in over ~⅓s. The blocks route marks the
-   view with data-tip-height and re-renders on every live block, so it opts out
-   below — content there must never pulse on arrival. The global
-   prefers-reduced-motion kill switch at the top of the media section already
-   disables this entirely. */
+   Each route's top-level sections rise in over ~⅓s. The reveal is gated on the
+   `view-enter` class, which app.js sets in setView() — i.e. only when a
+   NAVIGATION replaces the view — and drops again once the animation has run.
+   Live data updates patch the DOM in place and never carry the class, so they
+   can never replay the entrance. The global prefers-reduced-motion kill switch
+   at the top of the media section already disables this entirely. */
 @keyframes view-rise {
   from {
     opacity: 0;
@@ -2285,29 +2293,25 @@ a.trust-chip:hover {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  main > * {
+  main.view-enter > * {
     animation: view-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) backwards;
   }
-  main > :nth-child(2) {
+  main.view-enter > :nth-child(2) {
     animation-delay: 0.05s;
   }
-  main > :nth-child(3) {
+  main.view-enter > :nth-child(3) {
     animation-delay: 0.1s;
   }
-  main > :nth-child(4) {
+  main.view-enter > :nth-child(4) {
     animation-delay: 0.15s;
   }
-  main > :nth-child(5) {
+  main.view-enter > :nth-child(5) {
     animation-delay: 0.2s;
   }
-  main > :nth-child(6) {
+  main.view-enter > :nth-child(6) {
     animation-delay: 0.25s;
   }
-  main > :nth-child(n + 7) {
+  main.view-enter > :nth-child(n + 7) {
     animation-delay: 0.3s;
-  }
-  /* Live-refreshing routes (blocks list) re-render per block: no replay. */
-  main[data-tip-height] > * {
-    animation: none;
   }
 }
