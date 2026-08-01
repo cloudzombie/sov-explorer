@@ -130,3 +130,37 @@ test('account history is cursor-paginated and includes live holdings', async () 
   assert.equal(account.nfts[0].tokenId, '01');
   assert.equal(account.historyComplete, true);
 });
+
+test('block lists carry real per-block shielded flows, and never fabricate them', async () => {
+  const ctx = context();
+  // A block whose only shielded action is a successful v1 shield of 100 grains
+  // (bundle prefix: flags byte + value_balance -100 as i64le, per the chain codec).
+  const vb = new Array(9).fill(0);
+  vb[0] = 0x03;
+  const neg100 = BigInt.asUintN(64, -100n);
+  for (let i = 0; i < 8; i++) vb[1 + i] = Number((neg100 >> BigInt(8 * i)) & 0xffn);
+  const hash2 = `0x${'ef'.repeat(32)}`;
+  ctx.store.addBlock({
+    height: 2,
+    hash: hash2,
+    prevHash: blockHash,
+    timestampMs: 3_000,
+    proposer: 'miner',
+    txCount: 1,
+    sizeBytes: 1_000,
+    transactions: [{
+      id: `0x${'12'.repeat(32)}`, index: 0, signer: 'alice', publicKey: 'k', signature: 's',
+      action: { type: 'shielded', bundle: vb },
+      executionStatus: 'success', blockHeight: 2, blockHash: hash2, timestampMs: 3_000,
+    }],
+  });
+  const response = await handleRest('GET', '/api/blocks', new URLSearchParams('limit=2'), ctx);
+  const [top, prev] = JSON.parse(response.body);
+  // Derived from the retained transactions (no precomputed field on this record).
+  assert.deepEqual(top.shieldedFlows, {
+    shieldV1: '100', unshieldV1: '0', shieldV2: '0', unshieldV2: '0', shieldedTxs: 1, unattributed: 0,
+  });
+  // The transfer-only block genuinely moved nothing across the pool boundary.
+  assert.equal(prev.shieldedFlows.shieldV1, '0');
+  assert.equal(prev.shieldedFlows.shieldedTxs, 0);
+});

@@ -12,7 +12,7 @@ import { dirname, join, normalize } from 'node:path';
 
 import { openArchive } from './archive.js';
 import { SovereignRpc } from './rpc.js';
-import { Store } from './store.js';
+import { blockShieldedFlows, Store } from './store.js';
 import { Indexer } from './indexer.js';
 import { handleRest } from './rest.js';
 import { executeGraphql, schemaRoots } from './graphql.js';
@@ -122,6 +122,10 @@ function blockSummary(b) {
     coinbase: b.coinbase,
     timestampMs: b.timestampMs,
     final: b.final,
+    // Real per-block shielded-pool boundary flows (grain-sum strings by
+    // direction), decoded from the block's own bundle bytes — the live feed
+    // that drives the UI's pool turnstile. Null means unknown, never zero.
+    shieldedFlows: b.shieldedFlows ?? blockShieldedFlows(b),
   };
 }
 

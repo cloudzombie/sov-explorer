@@ -4,6 +4,8 @@
 // invents. It is resilient to transient RPC errors — a failed tick is retried on
 // the next interval.
 
+import { blockShieldedFlows } from './store.js';
+
 export function confirmationCount(head, height) {
   return Math.max(0, head - height + 1);
 }
@@ -154,6 +156,10 @@ export class Indexer {
     const final = finalAtDepth(head, height, this.finalityDepth);
     const record = normalizeBlock(block, digest, final);
     await this.attachReceipts(record);
+    // Per-block transparent↔shielded flow sums, decoded from the REAL bundle
+    // bytes of this block's transactions and gated on their committed receipt
+    // status. Computed after receipts attach so failed actions are excluded.
+    record.shieldedFlows = blockShieldedFlows(record);
     return record;
   }
 

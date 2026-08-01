@@ -16,6 +16,20 @@ let cadenceTs = [];
 // strings), persisted so the v1→v2 migration chart survives reloads. The node
 // does not retain a pool-split time-series, so this is a best-effort local view.
 const POOL_HISTORY_KEY = 'sov-pool-history-v1';
+// Live pool-turnstile state (session-local). Every entry in `events` is a real
+// on-chain flow: a per-block `shieldedFlows` sum the server decoded from the
+// block's own shielded-bundle bytes, gated on committed receipts. The rotor
+// angle advances ONLY when such an event arrives — with no flow the turnstile
+// stands still. `seenHeight` guards against double-counting a block that
+// arrives over both the WS stream and a reconciling fetch.
+const TURNSTILE = {
+  angle: 0,
+  events: [], // newest first: { height, pool, dir, grains, ts, migrationHint }
+  seenHeight: -1,
+  lastBlock: null, // { height, known } — known=false ⇒ flows unavailable, not zero
+  rev: 0, // bumped on every recorded flow; lets the DOM detect it is stale
+};
+const TURNSTILE_MAX_EVENTS = 6;
 const view = $('view');
 const DEFAULT_DESCRIPTION = 'Independent live explorer for Sovereign blocks, transactions, accounts, assets, contracts, HTLCs, and Nakamoto finality.';
 
@@ -454,6 +468,12 @@ async function renderOverview(routeId) {
     supply?.shielded ?? s.shieldedInfo?.poolValue ?? null,
     s.shieldedV2Info?.poolValue ?? null,
   );
+  // Overview renders read LAST_STATUS for pool/turnstile panels; make sure it
+  // reflects this render's own snapshot before those panels are generated.
+  LAST_STATUS = s;
+  // Seed the turnstile from the already-indexed recent blocks (real per-block
+  // flow sums served with the block list). Historical — sets state, no motion.
+  seedTurnstile(blocks100);
   const sync = s.sync ?? {};
   // Every live-updatable region is generated once here and seeded into the patch
   // cache below, so the first status tick rewrites only what genuinely changed
@@ -469,6 +489,10 @@ async function renderOverview(routeId) {
     'ov-miner-board': minerReadinessBoard(blocks100),
     'ov-pool': poolMigrationChart(),
   };
+  // The turnstile is deliberately NOT a patched slot: it is rendered once per
+  // navigation and then only mutated in place, so a live rotor turn is never
+  // cut short by a wholesale innerHTML rewrite.
+  const turnstileHtml = turnstileSection();
   const committed = setView(`
     <section class="hero-strip">
       <div>
@@ -491,6 +515,7 @@ async function renderOverview(routeId) {
     <div id="ov-deployments">${slots['ov-deployments']}</div>
     <div id="ov-miner-board">${slots['ov-miner-board']}</div>
     <div id="ov-pool">${slots['ov-pool']}</div>
+    <div id="ov-turnstile">${turnstileHtml}</div>
 
     <div class="grid2">
       <div>
@@ -599,6 +624,7 @@ function updateOverview(s) {
   patchHtml($('ov-stat-activity'), statsActivity(s), 'ov-stat-activity');
   patchHtml($('ov-stat-mempool'), statsMempool(s), 'ov-stat-mempool');
   patchHtml($('ov-deployments'), deploymentsPanel(s), 'ov-deployments');
+  updateTurnstileStatics(s);
   // Panels fed by block/supply data (miner readiness, pool vaults) need a fetch;
   // only ask for one when the chain actually moved.
   const height = Number(s.sync?.nodeHeight ?? s.tipHeight);
@@ -633,6 +659,11 @@ async function refreshOverviewData(withTables) {
       supply?.shielded ?? LAST_STATUS?.shieldedInfo?.poolValue ?? null,
       LAST_STATUS?.shieldedV2Info?.poolValue ?? null,
     );
+    // Reconciliation path (stream was down/behind): fold any missed blocks'
+    // real flows into the turnstile state; the patch below re-renders it at
+    // rest — reconciliation is not a live event and does not animate.
+    seedTurnstile(state.blocks);
+    reconcileTurnstileDom();
     patchHtml($('ov-miner-board'), minerReadinessBoard(state.blocks), 'ov-miner-board');
     patchHtml($('ov-pool'), poolMigrationChart(), 'ov-pool');
     if (LAST_STATUS) {
@@ -2235,6 +2266,267 @@ function recordPoolSample(height, v1, v2) {
     /* storage full / disabled — the chart just shows what it has */
   }
 }
+// ---- live pool turnstile ---------------------------------------------------
+// A turnstile between the transparent supply and the two shielded pools. Every
+// quarter-turn is one REAL boundary crossing: the server decodes each block's
+// shielded-bundle bytes (v1 Orchard `value_balance`, v2 STARK public
+// `transparent_in`/`transparent_out`), sums them per direction gated on the
+// committed receipts, and serves them as `shieldedFlows` on the block stream.
+// Shields rotate the rotor clockwise (into the pools), unshields rotate it
+// counter-clockwise. A block with no pool flow does not move the rotor; a block
+// whose flows are unknown (no receipt / older node) is labeled unknown, and is
+// never rendered as motion OR as a zero.
+
+/** Turn a block's server-computed `shieldedFlows` into direction events. */
+function turnstileFlowEvents(b) {
+  const f = b?.shieldedFlows;
+  if (!f) return null; // unknown ≠ zero
+  const out = [];
+  // Same-block v1 exit + v2 entry is consistent with a v1→v2 migration, but the
+  // pools are cryptographically unlinkable, so it is annotated as a hint only.
+  const migrationHint = safeBigInt(f.unshieldV1) > 0n && safeBigInt(f.shieldV2) > 0n;
+  const push = (pool, dir, grains) => {
+    if (grains > 0n) out.push({ height: b.height, pool, dir, grains: grains.toString(), ts: b.timestampMs, migrationHint });
+  };
+  push(1, 'shield', safeBigInt(f.shieldV1));
+  push(1, 'unshield', safeBigInt(f.unshieldV1));
+  push(2, 'shield', safeBigInt(f.shieldV2));
+  push(2, 'unshield', safeBigInt(f.unshieldV2));
+  return out;
+}
+
+/** Record one block into the turnstile state. Returns true when it carried a
+ * real flow (i.e. the rotor position advanced). Height-guarded: a block seen
+ * on both the live stream and a reconciling fetch is counted once. */
+function recordTurnstileBlock(b) {
+  const height = Number(b?.height);
+  if (!Number.isFinite(height) || height <= TURNSTILE.seenHeight) return false;
+  TURNSTILE.seenHeight = height;
+  const events = turnstileFlowEvents(b);
+  // `known` is honest about coverage: false when flows were not served at all
+  // OR when a shielded transaction in this block could not be attributed (no
+  // receipt / unparseable bundle) — that block must not read as "no flow".
+  const fullyAttributed = events !== null && Number(b.shieldedFlows?.unattributed ?? 0) === 0;
+  TURNSTILE.lastBlock = { height, known: fullyAttributed || (events?.length ?? 0) > 0 };
+  if (!events || !events.length) return false;
+  for (const ev of events) {
+    // One quarter-turn per real flow event; direction is the flow's direction.
+    TURNSTILE.angle += ev.dir === 'shield' ? 90 : -90;
+    TURNSTILE.events.unshift(ev);
+  }
+  TURNSTILE.events.length = Math.min(TURNSTILE.events.length, TURNSTILE_MAX_EVENTS);
+  TURNSTILE.rev += 1;
+  return true;
+}
+
+/** Presentation state of the v2 (post-quantum) gate, from live node data only. */
+function v2GateState(s = LAST_STATUS) {
+  const v2 = s?.shieldedV2Info;
+  if (!v2) return { phase: 'unreported', label: 'not reported by this node' };
+  if (v2.active === true) {
+    return safeBigInt(v2.poolValue) > 0n
+      ? { phase: 'live', label: 'active' }
+      : { phase: 'awaiting-flow', label: 'active · awaiting first flow' };
+  }
+  const dep = (s?.deployments?.deployments ?? []).find((d) => d?.name === 'shielded-v2');
+  const model = shieldedActivation(dep, Number(s?.sync?.nodeHeight ?? s?.tipHeight));
+  return model && !model.failed
+    ? { phase: 'preactivation', label: `activates at #${fmtNum(model.activeHeight)}`, activeHeight: model.activeHeight }
+    : { phase: 'preactivation', label: 'awaiting activation' };
+}
+
+const TS_DIR_GLYPH = { shield: '⟶', unshield: '⟵' };
+function turnstileEventText(ev) {
+  const verb = ev.dir === 'shield'
+    ? (ev.pool === 2 ? 'shield → pool v2' : 'shield → pool v1')
+    : (ev.pool === 2 ? 'pool v2 → transparent' : 'pool v1 → transparent');
+  return `${verb} · ${fmtCoin(ev.grains)} ${COIN_SYMBOL}`;
+}
+
+/** The "last flow" line under the rotor — a real event, or an honest idle. */
+function turnstileLastHtml() {
+  const last = TURNSTILE.events[0] ?? null;
+  if (last) {
+    return `<a href="#/block/${encodeURIComponent(last.height)}">block #${fmtNum(last.height)}</a> · ${turnstileEventText(last)}`;
+  }
+  if (TURNSTILE.lastBlock === null) return 'waiting for live blocks…';
+  return TURNSTILE.lastBlock.known
+    ? `idle — no pool flow through block #${fmtNum(TURNSTILE.lastBlock.height)}`
+    : `flow data unavailable for block #${fmtNum(TURNSTILE.lastBlock.height)}`;
+}
+
+/** The recent-flow log — every entry links to the block that caused it. */
+function turnstileLogHtml() {
+  return TURNSTILE.events.map((ev) => `
+    <li class="ts-ev p${ev.pool} ${ev.dir}">
+      <a class="mono" href="#/block/${encodeURIComponent(ev.height)}">#${fmtNum(ev.height)}</a>
+      <span class="ts-ev-dir" aria-hidden="true">${TS_DIR_GLYPH[ev.dir]}</span>
+      <span>${turnstileEventText(ev)}</span>
+      ${ev.migrationHint ? '<span class="ts-ev-hint" title="This block carried both a v1 exit and a v2 entry — consistent with a v1→v2 migration. The pools are cryptographically unlinkable, so this is a co-occurrence, not proof.">v1 exit + v2 entry</span>' : ''}
+      <span class="dim" data-age-ts="${esc(ev.ts)}" data-age-abs>${timeAgo(ev.ts)}</span>
+    </li>`).join('');
+}
+
+/** The turnstile markup at the CURRENT state. Rendered inside the pool section;
+ * live flow events mutate the existing DOM instead (see turnstileOnBlock) so
+ * the rotor genuinely rotates. A fresh render draws the rotor already at its
+ * resting angle — no entrance motion, nothing moves without a new real event. */
+function poolTurnstile() {
+  const s = LAST_STATUS;
+  const total = safeBigInt(ovState?.supply?.total ?? s?.supply?.total);
+  const v1 = safeBigInt(s?.shieldedInfo?.poolValue);
+  const v2 = safeBigInt(s?.shieldedV2Info?.poolValue);
+  const transparent = total > 0n && v1 + v2 <= total ? total - v1 - v2 : null;
+  const gate2 = v2GateState(s);
+  const last = TURNSTILE.events[0] ?? null;
+  const lane = (pool) => (last && last.pool === pool ? ` lit ${last.dir}` : '');
+
+  // Rotor: housing ring + 4 arms. The arms group is rotated via an inline CSS
+  // transform (transitioned in CSS; instant under prefers-reduced-motion).
+  const rotor = `
+    <svg class="ts-rotor" viewBox="0 0 120 120" role="img" aria-label="Pool turnstile — rotates only on a real shield or unshield">
+      <circle class="ts-housing" cx="60" cy="60" r="46" />
+      ${[0, 90, 180, 270].map((a) => `<line class="ts-notch" x1="60" y1="9" x2="60" y2="17" transform="rotate(${a} 60 60)" />`).join('')}
+      <g transform="translate(60 60)">
+        <g class="ts-arms" style="transform:rotate(${TURNSTILE.angle}deg)">
+          ${[0, 90, 180, 270].map((a) => `<g transform="rotate(${a})"><line class="ts-arm" x1="0" y1="0" x2="0" y2="-40" /><circle class="ts-arm-tip" cx="0" cy="-40" r="4.5" /></g>`).join('')}
+          <circle class="ts-hub" cx="0" cy="0" r="8" />
+        </g>
+      </g>
+    </svg>`;
+
+  return `
+    <div class="ts-head">
+      <h3>Live turnstile</h3>
+      <span class="dim">each quarter-turn = one real boundary crossing, decoded from that block's bundle bytes</span>
+    </div>
+    <div class="ts-wrap">
+      <div class="ts-side">
+        <span class="ts-side-label">Transparent</span>
+        <b class="ts-balance mono" id="ts-bal-transparent">${transparent === null ? '—' : `${fmtCoin(transparent.toString())} ${COIN_SYMBOL}`}</b>
+        <span class="ts-side-sub">public balances</span>
+      </div>
+      <div class="ts-rotor-cell">
+        ${rotor}
+        <div class="ts-last" id="ts-last">${turnstileLastHtml()}</div>
+      </div>
+      <div class="ts-gates">
+        <div class="ts-gate v1${lane(1)}" id="ts-gate-v1">
+          <span class="ts-gate-arrow" aria-hidden="true">${last && last.pool === 1 ? TS_DIR_GLYPH[last.dir] : '·'}</span>
+          <div>
+            <span class="ts-gate-name">Pool v1 · Orchard</span>
+            <b class="ts-balance mono" id="ts-bal-v1">${s?.shieldedInfo ? `${fmtCoin(v1.toString())} ${COIN_SYMBOL}` : '—'}</b>
+            <span class="ts-side-sub">Halo2 · curve-based (not PQ)</span>
+          </div>
+        </div>
+        <div class="ts-gate v2${lane(2)} ${gate2.phase}" id="ts-gate-v2">
+          <span class="ts-gate-arrow" aria-hidden="true">${last && last.pool === 2 ? TS_DIR_GLYPH[last.dir] : '·'}</span>
+          <div>
+            <span class="ts-gate-name">Pool v2 · post-quantum</span>
+            <b class="ts-balance mono" id="ts-bal-v2">${gate2.phase === 'unreported' ? '—' : `${fmtCoin(v2.toString())} ${COIN_SYMBOL}`}</b>
+            <span class="ts-side-sub" id="ts-v2-sub">ML-KEM-768 · STARK · ${esc(gate2.label)}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <ul class="ts-log" id="ts-log">${turnstileLogHtml()}</ul>`;
+}
+
+/** The turnstile's own overview slot. It is NOT patched wholesale on data
+ * ticks — a rebuild would cut a rotor transition short — so it renders once per
+ * navigation and is then mutated in place (turnstileOnBlock for flow events,
+ * updateTurnstileStatics for balances, reconcileTurnstileDom after catch-up). */
+function turnstileSection() {
+  return `<section class="pool-migration pm-ts">
+    <div class="panel pm-panel">
+      <div id="pm-turnstile" data-rev="${TURNSTILE.rev}">${poolTurnstile()}</div>
+    </div>
+  </section>`;
+}
+
+/** Patch the turnstile's balance/state figures in place from a fresh /status —
+ * numbers only, never the rotor. Every figure is the node's own answer. */
+function updateTurnstileStatics(s) {
+  if (!s || !$('pm-turnstile')) return;
+  const total = safeBigInt(ovState?.supply?.total ?? s.supply?.total);
+  const v1 = safeBigInt(s.shieldedInfo?.poolValue);
+  const v2 = safeBigInt(s.shieldedV2Info?.poolValue);
+  const transparent = total > 0n && v1 + v2 <= total ? total - v1 - v2 : null;
+  patchText($('ts-bal-transparent'), transparent === null ? '—' : `${fmtCoin(transparent.toString())} ${COIN_SYMBOL}`);
+  patchText($('ts-bal-v1'), s.shieldedInfo ? `${fmtCoin(v1.toString())} ${COIN_SYMBOL}` : '—');
+  const gate2 = v2GateState(s);
+  patchText($('ts-bal-v2'), gate2.phase === 'unreported' ? '—' : `${fmtCoin(v2.toString())} ${COIN_SYMBOL}`);
+  patchText($('ts-v2-sub'), `ML-KEM-768 · STARK · ${gate2.label}`);
+  const gateEl = $('ts-gate-v2');
+  if (gateEl) {
+    for (const phase of ['unreported', 'preactivation', 'awaiting-flow', 'live']) {
+      gateEl.classList.toggle(phase, gate2.phase === phase);
+    }
+  }
+}
+
+/** After a catch-up seeding (stream was down): if the mounted turnstile DOM no
+ * longer matches the recorded state, re-render it AT REST. Reconciliation is
+ * not a live event, so it must not animate. */
+function reconcileTurnstileDom() {
+  const host = $('pm-turnstile');
+  if (!host || host.dataset.rev === String(TURNSTILE.rev)) return;
+  patchHtml(host, poolTurnstile(), 'pm-turnstile');
+  host.dataset.rev = String(TURNSTILE.rev);
+}
+
+/** A block arrived on the live stream: advance the turnstile state and, when
+ * the pool section is on screen, move the REAL rotor in place (CSS transition)
+ * rather than rebuilding it — a rebuild cannot animate, and an unchanged state
+ * must not move at all. */
+function turnstileOnBlock(b) {
+  const moved = recordTurnstileBlock(b);
+  const host = $('pm-turnstile');
+  if (!host) return;
+  if (!moved) {
+    // Only the idle/"through block #N" line can have changed.
+    const lastEl = $('ts-last');
+    if (lastEl && !TURNSTILE.events.length) lastEl.innerHTML = turnstileLastHtml();
+    return;
+  }
+  const arms = host.querySelector('.ts-arms');
+  if (!arms) {
+    // No live rotor mounted inside the section (first paint edge case).
+    patchHtml(host, poolTurnstile(), 'pm-turnstile');
+    host.dataset.rev = String(TURNSTILE.rev);
+    return;
+  }
+  host.dataset.rev = String(TURNSTILE.rev);
+  // Rotate the existing rotor to the new resting angle (CSS-transitioned);
+  // everything else (last line, event log, lane highlight) updates as data.
+  arms.style.transform = `rotate(${TURNSTILE.angle}deg)`;
+  const lastEl = $('ts-last');
+  if (lastEl) lastEl.innerHTML = turnstileLastHtml();
+  const logEl = $('ts-log');
+  if (logEl) {
+    logEl.innerHTML = turnstileLogHtml();
+    logEl.firstElementChild?.classList.add('live-new');
+  }
+  const last = TURNSTILE.events[0];
+  for (const pool of [1, 2]) {
+    const gate = $(`ts-gate-v${pool}`);
+    if (!gate) continue;
+    gate.classList.toggle('lit', last.pool === pool);
+    gate.classList.toggle('shield', last.pool === pool && last.dir === 'shield');
+    gate.classList.toggle('unshield', last.pool === pool && last.dir === 'unshield');
+    const arrow = gate.querySelector('.ts-gate-arrow');
+    if (arrow) patchText(arrow, last.pool === pool ? TS_DIR_GLYPH[last.dir] : '·');
+  }
+}
+
+/** Seed the turnstile's history from already-indexed blocks (newest-first API
+ * order). Historical, so it sets state without motion: the next render simply
+ * shows the rotor at rest with the real recent events listed. */
+function seedTurnstile(blocks) {
+  const rows = (Array.isArray(blocks) ? [...blocks] : []).sort((a, b) => a.height - b.height);
+  for (const b of rows) recordTurnstileBlock(b);
+}
+
 // A voxel-vault view of the shielded-pool migration: Orchard v1 (NON-PQ) and
 // the post-quantum v2 pool rendered as isometric block stacks — each cube a
 // fixed XUS quantum — so the amounts read as two physical vaults. The v2 vault
@@ -2319,7 +2611,12 @@ function poolMigrationChart() {
     ticks.push(`<text class="vx-tick-lbl" x="${sideL - 22}" y="${y + 3.5}" text-anchor="end">${label}</text>`);
   }
 
-  const dormantV2 = v2c <= 0;
+  const v2Empty = v2c <= 0;
+  // Honest v2 caption while the vault is empty: before activation the pool
+  // CANNOT hold value ("activates at #N", derived from the node-reported
+  // deployment); after activation it simply has not seen its first flow yet.
+  const gate2 = v2GateState();
+  const v2EmptyCaption = gate2.phase === 'preactivation' ? gate2.label : 'awaiting first flow';
   const fmtXus = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const towers = `
     <svg class="pm-vaults" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Shielded pool vaults: v1 Orchard ${fmtDecimal(v1c, 2)} ${COIN_SYMBOL}, post-quantum v2 ${fmtDecimal(v2c, 2)} ${COIN_SYMBOL}">
@@ -2328,10 +2625,10 @@ function poolMigrationChart() {
       ${ticks.join('')}
       <text class="vx-total vx-t1" x="${fc1}" y="${topPad - 28}" text-anchor="middle">${fmtXus(v1c)}</text>
       <text class="vx-unit-lbl" x="${fc1}" y="${topPad - 14}" text-anchor="middle">${COIN_SYMBOL} · ${fmtDecimal(pctV1, 1)}% of private</text>
-      <text class="vx-total vx-t2 ${dormantV2 ? 'vx-muted' : ''}" x="${fc2}" y="${topPad - 28}" text-anchor="middle">${dormantV2 ? '0' : fmtXus(v2c)}</text>
-      <text class="vx-unit-lbl" x="${fc2}" y="${topPad - 14}" text-anchor="middle">${COIN_SYMBOL} · ${dormantV2 ? 'dormant' : `${fmtDecimal(pctPq, 1)}% of private`}</text>
+      <text class="vx-total vx-t2 ${v2Empty ? 'vx-muted' : ''}" x="${fc2}" y="${topPad - 28}" text-anchor="middle">${v2Empty ? '0' : fmtXus(v2c)}</text>
+      <text class="vx-unit-lbl" x="${fc2}" y="${topPad - 14}" text-anchor="middle">${COIN_SYMBOL} · ${v2Empty ? esc(v2EmptyCaption) : `${fmtDecimal(pctPq, 1)}% of private`}</text>
       ${vault(x1, b1, 'v1', false)}
-      ${vault(x2, b2, 'v2', dormantV2)}
+      ${vault(x2, b2, 'v2', v2Empty)}
       <text class="vx-name" x="${fc1}" y="${groundY + DP + 26}" text-anchor="middle">v1 · Orchard</text>
       <text class="vx-sub" x="${fc1}" y="${groundY + DP + 40}" text-anchor="middle">Halo2 · classical</text>
       <text class="vx-name" x="${fc2}" y="${groundY + DP + 26}" text-anchor="middle">v2 · post-quantum</text>
@@ -2354,10 +2651,10 @@ function poolMigrationChart() {
       ${towers}
       <div class="pm-meter" role="img" aria-label="${fmtDecimal(pctPq, 1)} percent of the private supply is post-quantum">
         <div class="pm-meter-cells">${meter}</div>
-        <div class="pm-meter-cap"><b>${fmtDecimal(pctPq, 1)}%</b> post-quantum${dormantV2 ? ' · v2 vault dormant, awaiting migration' : ''}</div>
+        <div class="pm-meter-cap"><b>${fmtDecimal(pctPq, 1)}%</b> post-quantum${v2Empty ? ` · v2 ${esc(v2EmptyCaption)}` : ''}</div>
       </div>
     </div>
-    <p class="note">Live pool state, quantised at ${fmtNum(unit)} ${COIN_SYMBOL} per cube (the top cube is the sub-unit remainder). The node exposes only the current pool value — this is a snapshot, not a node-authoritative time-series.</p>
+    <p class="note">Live pool state, quantised at ${fmtNum(unit)} ${COIN_SYMBOL} per cube (the top cube is the sub-unit remainder). The node exposes only the current pool value — this is a snapshot, not a node-authoritative time-series. The turnstile moves only when a block genuinely crosses the transparent↔shielded boundary, decoded from that block's own bundle bytes — never simulated.</p>
   </section>`;
 }
 
@@ -2483,6 +2780,9 @@ function connectWs() {
     } else if (msg.type === 'block') {
       const b = msg.block;
       tickerPushBlock(b);
+      // The pool turnstile listens to the stream itself (not the route) so its
+      // state stays exact across navigation; it only moves on a real flow.
+      turnstileOnBlock(b);
       live.onBlock?.(b);
       pollStatus();
     } else if (msg.type === 'tx') {

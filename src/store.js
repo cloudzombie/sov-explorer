@@ -42,6 +42,146 @@ export function tipGrains(action) {
   }
 }
 
+// ---- shielded-pool boundary flows ------------------------------------------
+// The transparent↔shielded value movement of a shielded action is public
+// consensus data carried INSIDE the serialized bundle:
+//
+// - Pool v1 (`Action::Shielded`, Orchard/Halo2): the canonical codec is
+//   `flags:1 | value_balance:i64le:8 | anchor:32 | …` (chain crate
+//   `sov-shielded/src/codec.rs`). Consensus applies `value_balance` to the
+//   transparent side: vb < 0 shields |vb| grains INTO the pool, vb > 0
+//   de-shields vb grains OUT, vb == 0 is a fully private transfer (no
+//   boundary flow).
+// - Pool v2 (`Action::ShieldedV2`, ML-KEM-768/STARK): the v1 wire format is
+//   `version:1 | 4×anchor:32 | 4×nullifier:32 | 4×input_dummy:1 |
+//   4×output_commitment:32 | 4×output_dummy:1 | transparent_in:u64le |
+//   transparent_out:u64le | fee:u64le | …` (chain crate
+//   `sov-shielded-pq/src/wire.rs`). `transparent_in` is the shield leg,
+//   `transparent_out` the de-shield leg; both are public STARK inputs.
+//
+// Nothing here is inferred or estimated: these are the exact bytes consensus
+// itself decodes to move transparent balance. An unparseable bundle yields
+// null (unknown), never a guessed amount.
+
+const V2_PROOF_VERSION = 1;
+const V2_SLOTS = 4;
+// version + slots·(anchor + nullifier + commitment) + 2·slots dummy flags.
+const V2_LEGS_OFFSET = 1 + V2_SLOTS * (32 + 32 + 32) + V2_SLOTS * 2;
+const V2_MIN_LEN = V2_LEGS_OFFSET + 24; // through transparent_in/out + fee
+
+/** The leading bytes of a bundle field as a byte array, or null. The node's
+ * JSON-RPC serializes `Vec<u8>` as an array of numbers; a hex string is also
+ * accepted defensively. Only `need` bytes are materialized. */
+function bundlePrefix(bundle, need) {
+  if (Array.isArray(bundle)) {
+    if (bundle.length < need) return null;
+    const out = new Uint8Array(need);
+    for (let i = 0; i < need; i++) {
+      const b = Number(bundle[i]);
+      if (!Number.isInteger(b) || b < 0 || b > 255) return null;
+      out[i] = b;
+    }
+    return out;
+  }
+  if (typeof bundle === 'string') {
+    const hex = bundle.startsWith('0x') ? bundle.slice(2) : bundle;
+    if (hex.length < need * 2 || !/^[0-9a-fA-F]*$/.test(hex.slice(0, need * 2))) return null;
+    const out = new Uint8Array(need);
+    for (let i = 0; i < need; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return out;
+  }
+  return null;
+}
+
+function u64le(bytes, at) {
+  let v = 0n;
+  for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[at + i]);
+  return v;
+}
+
+/**
+ * The transparent-boundary flow a shielded action's bundle declares, or null
+ * when the action is not a shielded action / its bundle cannot be parsed.
+ * Returns `{ pool: 1|2, shieldGrains, unshieldGrains }` with BigInt grain
+ * amounts (either may be 0n; a v1 private transfer is `{1, 0n, 0n}`).
+ */
+export function shieldedFlowGrains(action) {
+  const a = unwrapTipped(action);
+  if (!a || typeof a !== 'object') return null;
+  if (a.type === 'shielded') {
+    const bytes = bundlePrefix(a.bundle, 9);
+    if (!bytes) return null;
+    const vb = BigInt.asIntN(64, u64le(bytes, 1)); // signed value balance
+    return {
+      pool: 1,
+      shieldGrains: vb < 0n ? -vb : 0n,
+      unshieldGrains: vb > 0n ? vb : 0n,
+    };
+  }
+  if (a.type === 'shielded_v2') {
+    const bytes = bundlePrefix(a.bundle, V2_MIN_LEN);
+    if (!bytes || bytes[0] !== V2_PROOF_VERSION) return null;
+    return {
+      pool: 2,
+      shieldGrains: u64le(bytes, V2_LEGS_OFFSET),
+      unshieldGrains: u64le(bytes, V2_LEGS_OFFSET + 8),
+    };
+  }
+  return null;
+}
+
+/** A transaction's committed execution status, from wherever the record has it. */
+function txExecutionStatus(tx) {
+  return tx?.executionStatus ?? tx?.receipt?.status?.status ?? tx?.receipt?.status ?? null;
+}
+
+/**
+ * Sum a block's REAL transparent↔shielded flows by direction, from its
+ * transactions' bundle bytes. Only transactions whose committed receipt says
+ * `success` are counted — a failed shielded action moves nothing. A shielded
+ * transaction whose status is unknown (no receipt) or whose bundle bytes are
+ * not parseable is EXCLUDED from the sums and counted in `unattributed`
+ * instead: an unknown flow is reported as unknown, never as a number.
+ * Grain sums are decimal strings (they exceed 2^53).
+ */
+export function blockShieldedFlows(block) {
+  if (!Array.isArray(block?.transactions)) return null;
+  const sums = { shieldV1: 0n, unshieldV1: 0n, shieldV2: 0n, unshieldV2: 0n };
+  let shieldedTxs = 0;
+  let unattributed = 0;
+  for (const tx of block.transactions) {
+    const inner = unwrapTipped(tx?.action);
+    const type = inner?.type;
+    if (type !== 'shielded' && type !== 'shielded_v2') continue;
+    shieldedTxs += 1;
+    const status = txExecutionStatus(tx);
+    if (status !== 'success') {
+      if (status === null || status === undefined) unattributed += 1;
+      continue; // failed: consensus moved nothing
+    }
+    const flow = shieldedFlowGrains(tx.action);
+    if (!flow) {
+      unattributed += 1;
+      continue;
+    }
+    if (flow.pool === 1) {
+      sums.shieldV1 += flow.shieldGrains;
+      sums.unshieldV1 += flow.unshieldGrains;
+    } else {
+      sums.shieldV2 += flow.shieldGrains;
+      sums.unshieldV2 += flow.unshieldGrains;
+    }
+  }
+  return {
+    shieldV1: sums.shieldV1.toString(),
+    unshieldV1: sums.unshieldV1.toString(),
+    shieldV2: sums.shieldV2.toString(),
+    unshieldV2: sums.unshieldV2.toString(),
+    shieldedTxs,
+    unattributed,
+  };
+}
+
 /** The account a transaction touches besides its signer, if any. */
 export function txCounterparty(action) {
   const a = unwrapTipped(action);
