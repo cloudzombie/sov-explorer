@@ -2217,6 +2217,229 @@ a.trust-chip:hover {
   }
 }
 
+/* Live pool turnstile — transparent supply on the left, the two shielded-pool
+   gates on the right, a four-arm rotor between them. The rotor's ONLY motion
+   is a CSS transition to a new resting angle, and that angle changes only when
+   a block's decoded bundle bytes carried a real boundary flow: no flow, no
+   movement. Everything else is static data. */
+.pm-ts {
+  margin-top: 12px;
+}
+.ts-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 12px;
+  margin-bottom: 12px;
+}
+.ts-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+.ts-head .dim {
+  font-size: 11.5px;
+}
+.ts-wrap {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 10px 22px;
+  max-width: 720px;
+  margin: 0 auto;
+}
+.ts-side {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  justify-self: end;
+  text-align: right;
+}
+.ts-side-label,
+.ts-gate-name {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.ts-balance {
+  font-size: 14px;
+  color: var(--text);
+  font-weight: 600;
+}
+.ts-side-sub {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--dim);
+  letter-spacing: 0.02em;
+}
+.ts-rotor-cell {
+  text-align: center;
+}
+.ts-rotor {
+  display: block;
+  width: 104px;
+  height: 104px;
+  margin: 0 auto;
+}
+.ts-housing {
+  fill: var(--panel-2);
+  stroke: var(--line);
+  stroke-width: 2;
+}
+.ts-notch {
+  stroke: var(--line);
+  stroke-width: 2;
+}
+.ts-arms {
+  /* The one moving part. It transitions to each new REAL resting angle; a
+     freshly rendered rotor simply appears at rest. */
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: transform 0.9s cubic-bezier(0.22, 0.9, 0.24, 1);
+}
+.ts-arm {
+  stroke: var(--muted);
+  stroke-width: 4;
+  stroke-linecap: round;
+}
+.ts-arm-tip {
+  fill: var(--dim);
+}
+.ts-hub {
+  fill: var(--panel-3);
+  stroke: var(--line);
+  stroke-width: 2;
+}
+.ts-last {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 1.4em;
+}
+.ts-last a {
+  color: var(--text);
+}
+.ts-gates {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  justify-self: start;
+  min-width: 0;
+}
+.ts-gate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  transition: border-color 0.4s ease, box-shadow 0.4s ease;
+}
+.ts-gate.v1 {
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+.ts-gate.v2 {
+  box-shadow: inset 3px 0 0 var(--ok);
+}
+/* v2 before it can flow: reported-but-inactive reads reserved, not broken. */
+.ts-gate.v2.preactivation,
+.ts-gate.v2.unreported {
+  border-style: dashed;
+  background: transparent;
+}
+.ts-gate.lit.v1 {
+  border-color: rgba(63, 111, 255, 0.55);
+}
+.ts-gate.lit.v2 {
+  border-color: rgba(82, 214, 141, 0.55);
+}
+.ts-gate-arrow {
+  width: 20px;
+  text-align: center;
+  font-size: 15px;
+  color: var(--dim);
+  flex: none;
+}
+.ts-gate.lit .ts-gate-arrow {
+  color: var(--text);
+}
+.ts-gate > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ts-log {
+  list-style: none;
+  margin: 12px auto 0;
+  padding: 0;
+  max-width: 720px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.ts-ev {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 2px;
+  border-top: 1px solid var(--line-soft);
+}
+.ts-ev.live-new {
+  animation: live-in 1.6s ease-out;
+}
+.ts-ev-dir {
+  color: var(--dim);
+}
+.ts-ev.p1 .ts-ev-dir {
+  color: var(--blue);
+}
+.ts-ev.p2 .ts-ev-dir {
+  color: var(--ok);
+}
+.ts-ev-hint {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 8px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.ts-ev .dim {
+  margin-left: auto;
+}
+@media (max-width: 700px) {
+  .ts-wrap {
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+  .ts-side {
+    justify-self: center;
+    text-align: center;
+  }
+  .ts-gates {
+    justify-self: stretch;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Reduced motion: the rotor snaps to its (real) resting angle and the log
+     row does not flash — the same data, shown statically. */
+  .ts-arms {
+    transition: none;
+  }
+  .ts-ev.live-new {
+    animation: none;
+  }
+  .ts-gate {
+    transition: none;
+  }
+}
+
 /* item 9: finality shading in block tables. */
 .blk-row.is-pending td:first-child {
   box-shadow: inset 3px 0 0 var(--warn);

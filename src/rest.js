@@ -4,7 +4,7 @@
 // reads (blocks, transactions) come from the index.
 
 import { confirmationCount, finalAtDepth, normalizeBlock } from './indexer.js';
-import { MINER_WINDOW_BLOCKS } from './store.js';
+import { blockShieldedFlows, MINER_WINDOW_BLOCKS } from './store.js';
 
 function json(status, body) {
   return { status, body: JSON.stringify(body) };
@@ -140,6 +140,9 @@ function digestSummary(height, d, tip) {
     coinbase: d.coinbase ?? null,
     timestampMs: d.timestampMs,
     final: finalAtDepth(tip, height),
+    // A digest carries no transaction bodies, so the block's shielded flows are
+    // genuinely unknown here — reported as null, never as a fabricated zero.
+    shieldedFlows: null,
   };
 }
 
@@ -155,6 +158,11 @@ function blockListSummary(block, tip) {
     txRoot: block.txRoot ?? null,
     receiptsRoot: block.receiptsRoot ?? null,
     final: finalAtDepth(tip, block.height),
+    // Real per-direction shielded-pool flow sums for this block (see
+    // blockShieldedFlows): precomputed at index time, or derived here from the
+    // retained transactions of an older (pre-upgrade) archive record.
+    shieldedFlows: block.shieldedFlows
+      ?? (Array.isArray(block.transactions) ? blockShieldedFlows(block) : null),
   };
 }
 
