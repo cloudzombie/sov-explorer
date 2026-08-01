@@ -2296,19 +2296,21 @@ a.trust-chip:hover {
   stroke-width: 2;
 }
 .ts-arms {
-  /* The one moving part. It transitions to each new REAL resting angle; a
-     freshly rendered rotor simply appears at rest. */
+  /* The one moving part. Its ratchet turn is a Web Animations API step fired
+     only on a REAL flow event (see turnstileOnBlock); at rest the inline
+     rotate() is the whole truth, so a freshly rendered rotor never moves. */
   transform-box: fill-box;
   transform-origin: center;
-  transition: transform 0.9s cubic-bezier(0.22, 0.9, 0.24, 1);
 }
 .ts-arm {
   stroke: var(--muted);
-  stroke-width: 4;
+  stroke-width: 5;
   stroke-linecap: round;
 }
 .ts-arm-tip {
   fill: var(--dim);
+  stroke: rgba(6, 9, 16, 0.4);
+  stroke-width: 1;
 }
 .ts-hub {
   fill: var(--panel-3);
@@ -2427,11 +2429,9 @@ a.trust-chip:hover {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  /* Reduced motion: the rotor snaps to its (real) resting angle and the log
-     row does not flash — the same data, shown statically. */
-  .ts-arms {
-    transition: none;
-  }
+  /* Reduced motion: the rotor snaps to its (real) resting angle (the WAAPI
+     step is also gated off in JS) and the log row does not flash — the same
+     data, shown statically. */
   .ts-ev.live-new {
     animation: none;
   }

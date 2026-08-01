@@ -572,6 +572,21 @@ function heroChips(s) {
     pqActivationChips(s);
 }
 
+/** The shielded-supply caption, naming BOTH pools with their real values.
+ * `sov_getSupply` reports `shielded` (v1 Orchard, kept v1-only for client
+ * compatibility) plus additive `shieldedV2`/`shieldedTotal`; `shieldedPercent`
+ * spans both pools, so captioning it "Orchard" alone would be wrong. A node too
+ * old to report v2 gets "v2 not reported" — never a fabricated zero. */
+function shieldedSupplySub(supply) {
+  if (!supply) return 'node unreachable';
+  const v2 = supply.shieldedV2 ?? LAST_STATUS?.shieldedV2Info?.poolValue ?? null;
+  const v1Part = `v1 Orchard ${fmtCoin(supply.shielded)}`;
+  if (v2 === null) {
+    return `${v1Part} ${COIN_SYMBOL} private of ${fmtCoin(supply.total)} · v2 not reported by this node`;
+  }
+  return `${v1Part} + v2 PQ ${fmtCoin(v2)} ${COIN_SYMBOL} private of ${fmtCoin(supply.total)}`;
+}
+
 function statsAllTime(s, supply) {
   const all = s.allTime ?? {};
   const mw = s.minerWindow ?? {};
@@ -579,7 +594,7 @@ function statsAllTime(s, supply) {
   const relayState = relayAvailability(s.relays ?? {});
   return `<h2>All time</h2>
     ${statItem('Circulation', `<span id="ov-circulation">${fmtCoin(all.circulationGrains)} ${COIN_SYMBOL}</span>`, `${pct(s.mintedOfCap)} of 21,000,000 cap minted`)}
-    ${statItem('Shielded supply', supply?.shieldedPercent === undefined ? '—' : `${fmtDecimal(supply.shieldedPercent, 2)}%`, supply ? `${fmtCoin(supply.shielded)} ${COIN_SYMBOL} private of ${fmtCoin(supply.total)} (Orchard pool — not post-quantum)` : 'node unreachable')}
+    ${statItem('Shielded supply', supply?.shieldedPercent === undefined ? '—' : `${fmtDecimal(supply.shieldedPercent, 2)}%`, shieldedSupplySub(supply))}
     ${statItem('Market cap', fmtUsd(all.marketCapUsd), 'price feed not configured')}
     ${statItem('Market dominance', all.marketDominance === null || all.marketDominance === undefined ? '—' : pct(all.marketDominance), 'market feed not configured')}
     ${statItem('Blockchain size', fmtBytes(all.blockchainSizeBytes), 'indexed window')}
@@ -1584,7 +1599,7 @@ async function renderAnalytics(routeId) {
     <div class="cards">
       <div class="card"><div class="label">Total supply</div><div class="value num">${fmtCoin(stats.supply?.total)}<span class="unit">${COIN_SYMBOL}</span></div></div>
       <div class="card"><div class="label">Mined (PoW)</div><div class="value num">${fmtCoin(stats.supply?.mined)}<span class="unit">${COIN_SYMBOL}</span></div><div class="sub">${pct(stats.mintedOfCap)} of 21M cap</div><div class="bar"><i style="width:${Math.min(100, (stats.mintedOfCap ?? 0) * 100)}%"></i></div></div>
-      <div class="card"><div class="label">Shielded supply</div><div class="value num">${stats.supply?.shieldedPercent === undefined ? '—' : fmtDecimal(stats.supply.shieldedPercent, 2)}<span class="unit">%</span></div><div class="sub">${fmtCoin(stats.supply?.shielded)} ${COIN_SYMBOL} private (Orchard pool — not post-quantum)</div><div class="bar"><i style="width:${Math.min(100, stats.supply?.shieldedPercent ?? 0)}%"></i></div></div>
+      <div class="card"><div class="label">Shielded supply</div><div class="value num">${stats.supply?.shieldedPercent === undefined ? '—' : fmtDecimal(stats.supply.shieldedPercent, 2)}<span class="unit">%</span></div><div class="sub">${esc(shieldedSupplySub(stats.supply))}</div><div class="bar"><i style="width:${Math.min(100, stats.supply?.shieldedPercent ?? 0)}%"></i></div></div>
       <div class="card"><div class="label">Finality depth</div><div class="value num">6</div><div class="sub">confirmation convention</div></div>
       <div class="card"><div class="label">Mempool</div><div class="value num">${fmtNum(stats.mempoolSize)}</div></div>
       <div class="card"><div class="label">Blocks indexed</div><div class="value num">${fmtNum(stats.blocksIndexed)}</div></div>
@@ -2229,12 +2244,18 @@ function minerReadinessBoard(blocks) {
 // Compact, prove-don't-claim assertions verifiable from served data only.
 function trustWidget(s, supply, genesisHash) {
   const total = safeBigInt(supply?.total ?? s?.supply?.total);
-  const shielded = safeBigInt(supply?.shielded ?? s?.shieldedInfo?.poolValue);
+  // BOTH pools hold shielded value: prefer the node's own combined figure,
+  // else sum the per-pool answers. Subtracting only v1 would report pool-v2
+  // value as TRANSPARENT — overstating the liquid supply by exactly v2.
+  const shielded = supply?.shieldedTotal !== undefined
+    ? safeBigInt(supply.shieldedTotal)
+    : safeBigInt(supply?.shielded ?? s?.shieldedInfo?.poolValue)
+      + safeBigInt(supply?.shieldedV2 ?? s?.shieldedV2Info?.poolValue);
   const conserved = total > 0n && shielded >= 0n && shielded <= total;
   const transparent = conserved ? total - shielded : 0n;
   const chips = [];
   if (total > 0n) {
-    chips.push(`<span class="trust-chip ${conserved ? 'ok' : 'warn'}" title="Transparent ${fmtCoin(transparent.toString())} + shielded ${fmtCoin(shielded.toString())} = circulating ${fmtCoin(total.toString())} ${COIN_SYMBOL}. The shielded pool is a subset of circulation, checked against the node's own totals.">${conserved ? '✓' : '!'} supply conserved</span>`);
+    chips.push(`<span class="trust-chip ${conserved ? 'ok' : 'warn'}" title="Transparent ${fmtCoin(transparent.toString())} + shielded ${fmtCoin(shielded.toString())} (pools v1+v2) = circulating ${fmtCoin(total.toString())} ${COIN_SYMBOL}. The shielded pools are a subset of circulation, checked against the node's own totals.">${conserved ? '✓' : '!'} supply conserved</span>`);
   }
   if (genesisHash) {
     chips.push(`<a class="trust-chip ok" href="#/block/0" title="Genesis is a hardcoded constant: ${esc(genesisHash)}. Click to open block #0.">✓ genesis frozen <span class="mono dim">${esc(shortHash(genesisHash, 6, 4))}</span></a>`);
@@ -2388,7 +2409,7 @@ function poolTurnstile() {
       <circle class="ts-housing" cx="60" cy="60" r="46" />
       ${[0, 90, 180, 270].map((a) => `<line class="ts-notch" x1="60" y1="9" x2="60" y2="17" transform="rotate(${a} 60 60)" />`).join('')}
       <g transform="translate(60 60)">
-        <g class="ts-arms" style="transform:rotate(${TURNSTILE.angle}deg)">
+        <g class="ts-arms" data-angle="${TURNSTILE.angle}" style="transform:rotate(${TURNSTILE.angle}deg)">
           ${[0, 90, 180, 270].map((a) => `<g transform="rotate(${a})"><line class="ts-arm" x1="0" y1="0" x2="0" y2="-40" /><circle class="ts-arm-tip" cx="0" cy="-40" r="4.5" /></g>`).join('')}
           <circle class="ts-hub" cx="0" cy="0" r="8" />
         </g>
@@ -2497,9 +2518,35 @@ function turnstileOnBlock(b) {
     return;
   }
   host.dataset.rev = String(TURNSTILE.rev);
-  // Rotate the existing rotor to the new resting angle (CSS-transitioned);
-  // everything else (last line, event log, lane highlight) updates as data.
-  arms.style.transform = `rotate(${TURNSTILE.angle}deg)`;
+  // Turn the existing rotor to its new resting angle. The motion is a
+  // mechanical ratchet — brief wind-back, fast sweep past the stop, settle —
+  // built with the native Web Animations API (fill:none, so the inline
+  // final-state transform below is the single source of truth). Under
+  // prefers-reduced-motion the rotor snaps to the same real angle instead.
+  const from = Number(arms.dataset.angle ?? 0);
+  const to = TURNSTILE.angle;
+  arms.dataset.angle = String(to);
+  arms.style.transform = `rotate(${to}deg)`;
+  if (!REDUCED_MOTION && typeof arms.animate === 'function' && to !== from) {
+    const d = Math.sign(to - from);
+    arms.animate([
+      { transform: `rotate(${from}deg)`, easing: 'cubic-bezier(0.5, 0, 0.7, 0.4)' },
+      { transform: `rotate(${from - d * 9}deg)`, offset: 0.16, easing: 'cubic-bezier(0.32, 0, 0.16, 1)' },
+      { transform: `rotate(${to + d * 7}deg)`, offset: 0.68, easing: 'cubic-bezier(0.34, 0.06, 0.28, 1)' },
+      { transform: `rotate(${to}deg)` },
+    ], { duration: 950 });
+    // The receiving/paying gate answers with a short lane pulse — same event,
+    // same real cause, no free-running loop.
+    const last0 = TURNSTILE.events[0];
+    const gate0 = last0 && $(`ts-gate-v${last0.pool}`);
+    if (gate0 && typeof gate0.animate === 'function') {
+      const tint = last0.pool === 2 ? 'rgba(82, 214, 141, 0.16)' : 'rgba(63, 111, 255, 0.16)';
+      gate0.animate(
+        [{ backgroundColor: tint, offset: 0.25 }],
+        { duration: 1100, easing: 'ease-out' },
+      );
+    }
+  }
   const lastEl = $('ts-last');
   if (lastEl) lastEl.innerHTML = turnstileLastHtml();
   const logEl = $('ts-log');
